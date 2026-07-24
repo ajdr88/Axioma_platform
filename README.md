@@ -34,10 +34,14 @@ corepack enable
 pnpm install
 
 docker compose up -d      # Neo4j, Postgres (host port 5433), MinIO, Redis
+cp .env.example .env      # apps/api's store connection settings (defaults already match compose)
 
 pnpm dev                  # apps/web on http://localhost:3000
-cargo run -p api          # apps/api on http://localhost:8080
+cargo run -p api          # apps/api on http://localhost:8080 — reads/writes Neo4j+Postgres+MinIO
 ```
+
+`cargo test -p api -- --ignored` runs the store integration tests against the live stack above
+(skipped by default so `cargo test --workspace` never needs a live stack, e.g. in CI).
 
 ## Monorepo layout
 
@@ -58,5 +62,8 @@ infrastructure/     Terraform/K8s (provider-parameterized) — not started
 
 ## Status
 
-Early scaffolding for **P1.1 Core Graph**. See [`CLAUDE.md`](CLAUDE.md) for the roadmap and
-non-negotiable architectural rules.
+Early **P1.1 Core Graph** work. `apps/api` is wired to real Neo4j (topology) + Postgres (element
+bodies) + MinIO (blob pointers) per the ADR-003 polyglot split, with one semantic-validation rule
+(containment acyclicity) enforced before every write. Still ahead: the rest of the validation rule
+set, Git-backed model versioning, auth, and import — see [`CLAUDE.md`](CLAUDE.md) for the full
+roadmap and non-negotiable architectural rules.

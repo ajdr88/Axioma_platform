@@ -17,6 +17,19 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 serde = { workspace = true }
 serde_json = { workspace = true }
+anyhow = "1"
+dotenvy = "0.15"
+
+# Store adapters (ADR-003 polyglot persistence).
+neo4rs = "0.8"
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "json",
+] }
+aws-sdk-s3 = "1"
+aws-config = "1"
 
 [dev-dependencies]
 http-body-util = "0.1"
