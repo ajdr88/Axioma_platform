@@ -1,0 +1,15 @@
+{
+  "name": "@axioma/shared-types",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "generate": "node scripts/generate.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

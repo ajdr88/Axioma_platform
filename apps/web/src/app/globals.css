@@ -1,0 +1,31 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+/* Pick up Tailwind classes used inside workspace packages that live outside this app's own
+   src/ tree — otherwise their utility classes get purged. */
+@source "../../../../packages/ui-components/src";
+@source "../../../../packages/diagram-engine/src";
+
+@theme {
+  /* "Structural Clarity" palette — docs/Axioma_implementation_v3.md §6.2. Keep in sync with
+     packages/ui-components/src/tokens.ts. */
+  --color-obsidian: #07070c;
+  --color-graphite: #7c7c86;
+  --color-cobalt: #052583;
+  --color-cobalt-glow: #3a5bff;
+  --color-paper: #f3f4f8;
+  --color-alert: #ff5c5c;
+
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+body {
+  background: var(--color-obsidian);
+  color: var(--color-paper);
+}
+
+/* React Flow ships its own background/controls chrome — restyle it to the obsidian ground. */
+.react-flow__attribution {
+  display: none;
+}

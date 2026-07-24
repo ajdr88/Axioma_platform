@@ -1,0 +1,36 @@
+# Node / pnpm
+node_modules/
+.pnpm-store/
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+.turbo/
+
+# Rust
+target/
+Cargo.lock.bak
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Claude Code local settings (machine-specific)
+.claude/
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker / local data volumes
+.docker-data/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
