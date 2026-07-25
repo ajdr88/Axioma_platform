@@ -1,9 +1,11 @@
 //! Topology store (ADR-003 / NFR-DATA-01): Neo4j holds elements and relationships only — no
 //! bodies, no blobs. See `super::postgres` and `super::objects` for those.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use neo4rs::{query, Graph as Neo4jConn};
-use sysml_core::{Edge, EdgeKind, Element, NodeKind, ValidationError};
+use sysml_core::{Edge, EdgeKind, Element, ElementId, NodeKind, ValidationError};
 
 #[derive(Clone)]
 pub struct Neo4jStore {
@@ -63,6 +65,17 @@ impl Neo4jStore {
         Ok(elements)
     }
 
+    /// Every existing element id mapped to its current `NodeKind` — used to detect a
+    /// kind-conflict (re-importing an id under a different kind) before writing anything.
+    pub async fn element_kinds(&self) -> Result<HashMap<ElementId, NodeKind>> {
+        Ok(self
+            .list_elements()
+            .await?
+            .into_iter()
+            .map(|el| (el.id, el.kind))
+            .collect())
+    }
+
     /// All existing `Contains` edges — enough to run
     /// [`sysml_core::would_create_containment_cycle`] without hydrating a full graph.
     pub async fn contains_edges(&self) -> Result<Vec<Edge>> {
@@ -120,5 +133,81 @@ impl Neo4jStore {
                     edge.source, edge.target
                 )
             })
+    }
+
+    /// Validates and writes a batch of elements + `Contains` edges atomically (import handlers,
+    /// FR-CORE-07): kind-conflict and containment-cycle checks run first, against existing state
+    /// *and* against the batch itself (so a batch that only cycles internally is also caught) —
+    /// nothing is written unless every check passes. The writes then run in a single Neo4j
+    /// transaction, explicitly rolled back on any failure, so a mid-batch error can't leave a
+    /// partial import (T-P1.1-02's "no partial write" standard, extended to a whole batch).
+    pub async fn import_elements_and_edges(
+        &self,
+        elements: &[Element],
+        contains: &[(ElementId, ElementId)],
+    ) -> Result<()> {
+        let existing_kinds = self.element_kinds().await?;
+        for element in elements {
+            sysml_core::check_kind_conflict(existing_kinds.get(&element.id).copied(), element)?;
+        }
+
+        let mut working_edges = self.contains_edges().await?;
+        for (parent, child) in contains {
+            if sysml_core::would_create_containment_cycle(&working_edges, parent, child) {
+                return Err(ValidationError::ContainmentCycle {
+                    parent: parent.clone(),
+                    child: child.clone(),
+                }
+                .into());
+            }
+            working_edges.push(Edge {
+                source: parent.clone(),
+                target: child.clone(),
+                kind: EdgeKind::Contains,
+            });
+        }
+
+        let mut txn = self
+            .conn
+            .start_txn()
+            .await
+            .context("starting import transaction")?;
+
+        for element in elements {
+            let label = element.kind.as_label();
+            let cypher = format!("MERGE (n:{label} {{id: $id}}) SET n.name = $name");
+            if let Err(err) = txn
+                .run(
+                    query(&cypher)
+                        .param("id", element.id.clone())
+                        .param("name", element.name.clone()),
+                )
+                .await
+            {
+                let _ = txn.rollback().await;
+                return Err(err).with_context(|| format!("importing element {}", element.id));
+            }
+        }
+
+        for (parent, child) in contains {
+            let rel_type = EdgeKind::Contains.as_rel_type();
+            let cypher = format!(
+                "MATCH (a {{id: $source}}), (b {{id: $target}}) MERGE (a)-[:{rel_type}]->(b)"
+            );
+            if let Err(err) = txn
+                .run(
+                    query(&cypher)
+                        .param("source", parent.clone())
+                        .param("target", child.clone()),
+                )
+                .await
+            {
+                let _ = txn.rollback().await;
+                return Err(err)
+                    .with_context(|| format!("importing containment edge {parent} -> {child}"));
+            }
+        }
+
+        txn.commit().await.context("committing import transaction")
     }
 }

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Representative ReqIF sample (turbofan pilot) — a handful of requirements, not the full
+  50-requirement Turbofan-Ref set from docs/Axioma_test_specification_v3.md §0 (that's test-data
+  scale-up work, not something this fixture needs to prove). Exercises the supported subset
+  documented in apps/api/src/import/reqif.rs: SPEC-OBJECT + ATTRIBUTE-VALUE-STRING only.
+-->
+<REQ-IF xmlns="http://www.omg.org/spec/ReqIF/20110401/reqif.xsd">
+  <CORE-CONTENT>
+    <REQ-IF-CONTENT>
+      <SPEC-OBJECTS>
+        <SPEC-OBJECT IDENTIFIER="REQ-THRUST-IMPORTED">
+          <VALUES>
+            <ATTRIBUTE-VALUE-STRING THE-VALUE="Engine shall provide at least 30,000 lbf takeoff thrust.">
+              <DEFINITION>
+                <ATTRIBUTE-DEFINITION-STRING-REF>Text</ATTRIBUTE-DEFINITION-STRING-REF>
+              </DEFINITION>
+            </ATTRIBUTE-VALUE-STRING>
+            <ATTRIBUTE-VALUE-STRING THE-VALUE="Test">
+              <DEFINITION>
+                <ATTRIBUTE-DEFINITION-STRING-REF>VerificationMethod</ATTRIBUTE-DEFINITION-STRING-REF>
+              </DEFINITION>
+            </ATTRIBUTE-VALUE-STRING>
+          </VALUES>
+        </SPEC-OBJECT>
+        <SPEC-OBJECT IDENTIFIER="REQ-SFC-IMPORTED">
+          <VALUES>
+            <ATTRIBUTE-VALUE-STRING THE-VALUE="Engine shall not exceed the specified cruise fuel consumption rate.">
+              <DEFINITION>
+                <ATTRIBUTE-DEFINITION-STRING-REF>Text</ATTRIBUTE-DEFINITION-STRING-REF>
+              </DEFINITION>
+            </ATTRIBUTE-VALUE-STRING>
+            <ATTRIBUTE-VALUE-STRING THE-VALUE="Analysis">
+              <DEFINITION>
+                <ATTRIBUTE-DEFINITION-STRING-REF>VerificationMethod</ATTRIBUTE-DEFINITION-STRING-REF>
+              </DEFINITION>
+            </ATTRIBUTE-VALUE-STRING>
+          </VALUES>
+        </SPEC-OBJECT>
+        <SPEC-OBJECT IDENTIFIER="REQ-OVERSPEED-IMPORTED">
+          <VALUES>
+            <ATTRIBUTE-VALUE-STRING THE-VALUE="Control system shall detect and mitigate turbine overspeed within 50ms.">
+              <DEFINITION>
+                <ATTRIBUTE-DEFINITION-STRING-REF>Text</ATTRIBUTE-DEFINITION-STRING-REF>
+              </DEFINITION>
+            </ATTRIBUTE-VALUE-STRING>
+          </VALUES>
+        </SPEC-OBJECT>
+      </SPEC-OBJECTS>
+    </REQ-IF-CONTENT>
+  </CORE-CONTENT>
+</REQ-IF>

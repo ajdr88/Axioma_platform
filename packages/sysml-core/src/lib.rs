@@ -115,7 +115,17 @@ pub struct Edge {
 /// covers containment acyclicity only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
-    ContainmentCycle { parent: ElementId, child: ElementId },
+    ContainmentCycle {
+        parent: ElementId,
+        child: ElementId,
+    },
+    /// An incoming element reuses the id of an existing element under a *different* `NodeKind` —
+    /// a type-legal-identity violation (FR-CORE-05), same rule family as endpoint type-legality.
+    KindConflict {
+        id: ElementId,
+        existing: NodeKind,
+        incoming: NodeKind,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -124,6 +134,14 @@ impl std::fmt::Display for ValidationError {
             ValidationError::ContainmentCycle { parent, child } => write!(
                 f,
                 "adding containment edge {parent} -> {child} would cycle the containment hierarchy"
+            ),
+            ValidationError::KindConflict {
+                id,
+                existing,
+                incoming,
+            } => write!(
+                f,
+                "element {id} already exists as {existing:?}, cannot import as {incoming:?}"
             ),
         }
     }
@@ -180,6 +198,22 @@ pub fn would_create_containment_cycle(existing: &[Edge], parent: &str, child: &s
     }
 
     false
+}
+
+/// Rejects re-importing an element id under a different `NodeKind` than it already has.
+/// `existing_kind` is the id's current kind, if it exists at all — pass `None` for a new id.
+pub fn check_kind_conflict(
+    existing_kind: Option<NodeKind>,
+    element: &Element,
+) -> Result<(), ValidationError> {
+    match existing_kind {
+        Some(existing) if existing != element.kind => Err(ValidationError::KindConflict {
+            id: element.id.clone(),
+            existing,
+            incoming: element.kind,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// An in-memory model graph. Real persistence is polyglot (Neo4j for topology, Postgres/JSONB
@@ -354,6 +388,31 @@ mod tests {
             "Engine",
             "Combustor"
         ));
+    }
+
+    #[test]
+    fn check_kind_conflict_allows_new_id_and_matching_kind() {
+        let el = structure("Turbine");
+        assert!(check_kind_conflict(None, &el).is_ok());
+        assert!(check_kind_conflict(Some(NodeKind::Structure), &el).is_ok());
+    }
+
+    #[test]
+    fn check_kind_conflict_rejects_mismatched_kind() {
+        let el = Element {
+            id: "Turbine".to_string(),
+            kind: NodeKind::Requirement,
+            name: "Turbine".to_string(),
+        };
+        let result = check_kind_conflict(Some(NodeKind::Structure), &el);
+        assert_eq!(
+            result,
+            Err(ValidationError::KindConflict {
+                id: "Turbine".to_string(),
+                existing: NodeKind::Structure,
+                incoming: NodeKind::Requirement,
+            })
+        );
     }
 
     #[test]

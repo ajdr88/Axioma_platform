@@ -1,0 +1,17 @@
+{
+  "elements": [
+    { "id": "Engine", "kind": "Structure", "name": "Engine" },
+    { "id": "FanLpCompression", "kind": "Structure", "name": "Fan & LP Compression" },
+    { "id": "CoreHpCompressor", "kind": "Structure", "name": "Core (HP) Compressor" },
+    { "id": "Combustor", "kind": "Structure", "name": "Combustor" },
+    { "id": "TurbineHpLp", "kind": "Structure", "name": "Turbine (HP & LP)" },
+    { "id": "ControlFadecEec", "kind": "Structure", "name": "Control (FADEC/EEC)" }
+  ],
+  "contains": [
+    { "parent": "Engine", "child": "FanLpCompression" },
+    { "parent": "Engine", "child": "CoreHpCompressor" },
+    { "parent": "Engine", "child": "Combustor" },
+    { "parent": "Engine", "child": "TurbineHpLp" },
+    { "parent": "Engine", "child": "ControlFadecEec" }
+  ]
+}

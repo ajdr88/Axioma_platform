@@ -31,5 +31,9 @@ sqlx = { version = "0.9", default-features = false, features = [
 aws-sdk-s3 = "1"
 aws-config = "1"
 
+# ReqIF import (§ import/reqif.rs) — read-only DOM, a better fit than a serde struct tree for
+# ReqIF's deeply-optional nested schema.
+roxmltree = "0.21"
+
 [dev-dependencies]
 http-body-util = "0.1"

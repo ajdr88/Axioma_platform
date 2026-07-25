@@ -1,0 +1,12 @@
+{
+  "elements": [
+    { "id": "CycleTestA", "kind": "Structure", "name": "Cycle Test A" },
+    { "id": "CycleTestB", "kind": "Structure", "name": "Cycle Test B" },
+    { "id": "CycleTestValidLeaf", "kind": "Structure", "name": "Should never be written" }
+  ],
+  "contains": [
+    { "parent": "CycleTestA", "child": "CycleTestB" },
+    { "parent": "CycleTestB", "child": "CycleTestA" },
+    { "parent": "CycleTestA", "child": "CycleTestValidLeaf" }
+  ]
+}

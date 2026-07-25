@@ -63,7 +63,10 @@ infrastructure/     Terraform/K8s (provider-parameterized) — not started
 ## Status
 
 Early **P1.1 Core Graph** work. `apps/api` is wired to real Neo4j (topology) + Postgres (element
-bodies) + MinIO (blob pointers) per the ADR-003 polyglot split, with one semantic-validation rule
-(containment acyclicity) enforced before every write. Still ahead: the rest of the validation rule
-set, Git-backed model versioning, auth, and import — see [`CLAUDE.md`](CLAUDE.md) for the full
-roadmap and non-negotiable architectural rules.
+bodies) + MinIO (blob pointers) per the ADR-003 polyglot split, with two semantic-validation rules
+(containment acyclicity, kind-conflict) enforced before every write. `POST /import/sysml-v2` and
+`POST /import/reqif` (FR-CORE-07) import a structural hierarchy / flat requirements list — each a
+deliberately restricted subset of the real OMG formats, documented in
+[`apps/api/src/import/`](apps/api/src/import/). Still ahead: the rest of the validation rule set,
+Git-backed model versioning, and auth — see [`CLAUDE.md`](CLAUDE.md) for the full roadmap and
+non-negotiable architectural rules.
