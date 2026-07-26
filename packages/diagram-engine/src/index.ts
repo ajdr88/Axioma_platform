@@ -1,5 +1,6 @@
 import { AxiomaBlockNode } from "./nodes/AxiomaBlockNode";
 
+export { computeGridLayout } from "./layout";
 export type {
   AxiomaBlockData,
   AxiomaBlockProperty,

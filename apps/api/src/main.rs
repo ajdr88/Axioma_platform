@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/metrics", get(metrics))
         .route("/api/v0/elements", get(list_elements))
         .route("/api/v0/elements/:id/body", get(get_element_body))
+        .route("/api/v0/contains", get(list_contains_edges))
         .route("/import/sysml-v2", post(import::sysml_v2::import_sysml_v2))
         .route("/import/reqif", post(import::reqif::import_reqif))
         .with_state(state)
@@ -165,6 +166,13 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 /// every element from the topology store (Neo4j).
 async fn list_elements(State(state): State<AppState>) -> Result<Json<Vec<Element>>, ApiError> {
     Ok(Json(state.neo4j.list_elements().await?))
+}
+
+/// Lists every `Contains` edge — this project's stand-in for a real traceability endpoint (impl
+/// §1.1 doesn't name this one specifically; `/api/v0/elements` is the same kind of stand-in).
+/// The frontend canvas needs both this and `list_elements` to draw the graph.
+async fn list_contains_edges(State(state): State<AppState>) -> Result<Json<Vec<Edge>>, ApiError> {
+    Ok(Json(state.neo4j.contains_edges().await?))
 }
 
 /// First real use of the document-store side of the split (NFR-DATA-02): the element's body
