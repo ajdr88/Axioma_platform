@@ -6,7 +6,7 @@ const API_URL = process.env.API_URL ?? "http://localhost:8080";
  * is needed on the Axum side.
  */
 export async function proxyRequest(
-  method: "GET" | "POST" | "PATCH" | "PUT",
+  method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
 ): Promise<Response> {

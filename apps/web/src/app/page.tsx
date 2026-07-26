@@ -1,17 +1,25 @@
 "use client";
 
-import { type AxiomaBlockData, computeGridLayout, nodeTypes } from "@axioma/diagram-engine";
+import {
+  type AxiomaBlockData,
+  type AxiomaEdgeData,
+  computeGridLayout,
+  edgeTypes,
+  nodeTypes,
+} from "@axioma/diagram-engine";
 import type { Edge as ApiEdge, Element as ApiElement } from "@axioma/shared-types";
 import { Button, Panel as GlassPanel } from "@axioma/ui-components";
 import {
   addEdge,
   Background,
   BackgroundVariant,
+  type Connection,
   Controls,
   type Edge as FlowEdge,
   type Node as FlowNode,
   ReactFlow,
   ReactFlowProvider,
+  reconnectEdge,
   useEdgesState,
   useNodesState,
 } from "@xyflow/react";
@@ -45,13 +53,20 @@ function toFlowNode(
   };
 }
 
-function toFlowEdge(edge: ApiEdge): FlowEdge {
+/** Single source of truth for edge ids — used both for edges loaded from the API and ones
+ * created live via `onConnect`/`onReconnect`, so an edge's id doesn't change across a reload. */
+function getEdgeId({ source, target }: { source: string; target: string }): string {
+  return `${source}-contains-${target}`;
+}
+
+function toFlowEdge(edge: ApiEdge): FlowEdge<AxiomaEdgeData> {
   return {
-    id: `${edge.source}-contains-${edge.target}`,
+    id: getEdgeId(edge),
     source: edge.source,
     target: edge.target,
-    type: "smoothstep",
+    type: "axiomaEdge",
     style: { stroke: "#7C7C86" },
+    data: {},
   };
 }
 
@@ -75,7 +90,7 @@ export default function Home() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode<AxiomaBlockData>>([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge<AxiomaEdgeData>>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -173,6 +188,19 @@ export default function Home() {
     setNodes((nds) => [...nds, newNode]);
   }
 
+  async function handleDisconnect(source: string, target: string) {
+    const res = await fetch("/api/contains", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ parent: source, child: target }),
+    });
+    if (!res.ok) {
+      showNotice(await readErrorMessage(res));
+      return;
+    }
+    setEdges((eds) => eds.filter((e) => !(e.source === source && e.target === target)));
+  }
+
   async function handleToggleActive(node: FlowNode<AxiomaBlockData>) {
     const nextActive = !(node.data.active ?? true);
     const res = await fetch(`/api/elements/${node.id}/active`, {
@@ -200,18 +228,30 @@ export default function Home() {
     },
   }));
 
+  const displayEdges = edges.map((edge) => ({
+    ...edge,
+    data: {
+      ...edge.data,
+      editable: editMode,
+      onDisconnect: () => handleDisconnect(edge.source, edge.target),
+    },
+  }));
+
   return (
     <div className="h-screen w-screen">
       <ReactFlowProvider>
         <ReactFlow
           nodes={displayNodes}
-          edges={edges}
+          edges={displayEdges}
           nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           nodesDraggable={editMode}
           nodesConnectable={editMode}
-          deleteKeyCode={null} // Delete is out of scope for this pass — see the plan's Context.
+          edgesReconnectable={editMode}
+          connectionRadius={40} // more forgiving than the 20px default — see the plan's Context.
+          deleteKeyCode={null} // Node delete is out of scope — disconnect uses the edge's own button.
           onNodeDragStop={(_event, node) => {
             fetch(`/api/elements/${node.id}/position`, {
               method: "PATCH",
@@ -221,7 +261,7 @@ export default function Home() {
           }}
           onNodeClick={(_event, node) => setSelectedNodeId(node.id)}
           onPaneClick={() => setSelectedNodeId(null)}
-          onConnect={async (connection) => {
+          onConnect={async (connection: Connection) => {
             if (!connection.source || !connection.target) {
               return;
             }
@@ -235,8 +275,38 @@ export default function Home() {
               return;
             }
             setEdges((eds) =>
-              addEdge({ ...connection, type: "smoothstep", style: { stroke: "#7C7C86" } }, eds),
+              addEdge(
+                { ...connection, type: "axiomaEdge", style: { stroke: "#7C7C86" } },
+                eds,
+                // Match toFlowEdge's id convention — addEdge defaults to its own "xy-edge__..."
+                // format, which would otherwise make a freshly-connected edge's id inconsistent
+                // with the same edge's id after a reload.
+                { getEdgeId },
+              ),
             );
+          }}
+          onReconnect={async (oldEdge, newConnection) => {
+            if (!newConnection.source || !newConnection.target) {
+              return;
+            }
+            // Create the new edge first, through the same validated path a fresh connect uses —
+            // a reconnect that would cycle is rejected exactly like one, leaving the old edge
+            // untouched rather than half-changed.
+            const createRes = await fetch("/api/contains", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ parent: newConnection.source, child: newConnection.target }),
+            });
+            if (!createRes.ok) {
+              showNotice(await readErrorMessage(createRes));
+              return;
+            }
+            await fetch("/api/contains", {
+              method: "DELETE",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ parent: oldEdge.source, child: oldEdge.target }),
+            });
+            setEdges((eds) => reconnectEdge(oldEdge, newConnection, eds, { getEdgeId }));
           }}
           fitView
           proOptions={{ hideAttribution: true }}

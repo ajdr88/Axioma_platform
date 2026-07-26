@@ -65,11 +65,19 @@ export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData })
     setDraftName(data.label);
   }
 
+  // Enlarged past React Flow's tiny default hit target, with an explicit hover/cursor affordance
+  // — only when Edit Mode is on, matching every other interaction this node gates. Otherwise
+  // connecting isn't possible at all (`nodesConnectable={editMode}` on the canvas), so the handle
+  // reads as inert rather than inviting a drag that won't do anything.
+  const handleClassName = data.editable
+    ? "!h-3.5 !w-3.5 !border-2 !border-obsidian !bg-cobalt-glow !cursor-crosshair transition-transform hover:!scale-125 hover:!bg-white"
+    : "!h-2 !w-2 !border-2 !border-obsidian !bg-graphite !cursor-default";
+
   return (
     <div
       className={`rounded-xl border bg-obsidian/80 p-0 shadow-2xl backdrop-blur-md ${originBorder[data.origin]} ${isActive ? "" : "opacity-50"}`}
     >
-      <Handle type="target" position={Position.Top} className="!bg-graphite" />
+      <Handle type="target" position={Position.Top} className={handleClassName} />
 
       <div className="flex items-center gap-2 rounded-t-xl border-b border-white/5 bg-cobalt-glow/10 p-3">
         <span className="h-2 w-2 rounded-full bg-cobalt-glow" aria-hidden />
@@ -131,7 +139,7 @@ export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData })
         ))}
       </div>
 
-      <Handle type="source" position={Position.Bottom} className="!bg-graphite" />
+      <Handle type="source" position={Position.Bottom} className={handleClassName} />
     </div>
   );
 }

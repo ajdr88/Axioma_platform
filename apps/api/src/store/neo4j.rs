@@ -182,6 +182,27 @@ impl Neo4jStore {
             })
     }
 
+    /// Removes a relationship between two nodes, matched by id and kind. No validation needed —
+    /// removing an edge can't create a cycle or a kind conflict, only heal one.
+    pub async fn delete_edge(&self, edge: &Edge) -> Result<()> {
+        let rel_type = edge.kind.as_rel_type();
+        let cypher =
+            format!("MATCH (a {{id: $source}})-[r:{rel_type}]->(b {{id: $target}}) DELETE r");
+        self.conn
+            .run(
+                query(&cypher)
+                    .param("source", edge.source.clone())
+                    .param("target", edge.target.clone()),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "deleting {rel_type} edge {} -> {}",
+                    edge.source, edge.target
+                )
+            })
+    }
+
     /// Validates and writes a batch of elements + `Contains` edges atomically (import handlers,
     /// FR-CORE-07): kind-conflict and containment-cycle checks run first, against existing state
     /// *and* against the batch itself (so a batch that only cycles internally is also caught) —

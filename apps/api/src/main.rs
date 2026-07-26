@@ -122,7 +122,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/v0/contains",
-            get(list_contains_edges).post(create_contains_edge),
+            get(list_contains_edges)
+                .post(create_contains_edge)
+                .delete(delete_contains_edge),
         )
         .route("/api/v0/positions", get(list_positions))
         .route("/import/sysml-v2", post(import::sysml_v2::import_sysml_v2))
@@ -293,6 +295,21 @@ async fn create_contains_edge(
     };
     state.neo4j.create_edge(&edge).await?;
     Ok(Json(edge))
+}
+
+/// Canvas disconnect (Edit Mode) — removes a `Contains` edge. No validation gate needed;
+/// removing an edge can only heal a cycle/conflict, never create one.
+async fn delete_contains_edge(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateContainsRequest>,
+) -> Result<StatusCode, ApiError> {
+    let edge = Edge {
+        source: payload.parent,
+        target: payload.child,
+        kind: EdgeKind::Contains,
+    };
+    state.neo4j.delete_edge(&edge).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, serde::Deserialize)]
