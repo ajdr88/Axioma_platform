@@ -33,13 +33,21 @@ architecture summary and [`docs/`](docs/) for the source-of-truth specs:
 corepack enable
 pnpm install
 
-docker compose up -d              # Neo4j, Postgres (host port 5433), MinIO, Redis
-cp .env.example .env               # apps/api's store connection settings (defaults match compose)
+cp .env.example .env                           # apps/api's store connection settings (defaults match compose)
 cp apps/web/.env.example apps/web/.env.local   # apps/web's API_URL (defaults to localhost:8080)
 
-pnpm dev                  # apps/web on http://localhost:3000
-cargo run -p api          # apps/api on http://localhost:8080 — reads/writes Neo4j+Postgres+MinIO
+pnpm dev:all
 ```
+
+`pnpm dev:all` is the one-command path: brings up the docker-compose stack (Neo4j, Postgres — host
+port 5433, MinIO, Redis) and waits for every container to report healthy, then runs `apps/api`
+(`http://localhost:8080`) and `apps/web` (`http://localhost:3000`) together, labeled/colored in one
+terminal via [`concurrently`](https://github.com/open-cli-tools/concurrently). Ctrl+C stops the api
+and web processes; the docker containers keep running (stop them separately with `docker compose
+down` when you're done for the day).
+
+Prefer to run things individually? `docker compose up -d`, then `cargo run -p api` and `pnpm dev`
+(the plain Turborepo `dev` task, web only) in separate terminals — exactly what `dev:all` automates.
 
 `cargo test -p api -- --ignored` runs the store integration tests against the live stack above
 (skipped by default so `cargo test --workspace` never needs a live stack, e.g. in CI).
