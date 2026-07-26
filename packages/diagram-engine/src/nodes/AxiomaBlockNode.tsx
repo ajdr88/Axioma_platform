@@ -1,4 +1,5 @@
 import { Handle, type NodeProps, Position } from "@xyflow/react";
+import { useState } from "react";
 
 export type Origin = "human" | "ai-suggested" | "ai-auto-merged";
 export type ValidationState = "unverified" | "solver-validated" | "test-validated";
@@ -14,6 +15,15 @@ export interface AxiomaBlockData extends Record<string, unknown> {
   origin: Origin;
   validation: ValidationState;
   suspect?: boolean;
+  /** Excluded from *future* system-optimization loops when false — keeps all its data, just
+   * visually marked. Defaults to `true` (most callers, e.g. imported data, don't set it). */
+  active?: boolean;
+  /** Whether Edit Mode is on — gates the double-click-to-rename interaction below. */
+  editable?: boolean;
+  onRename?: (name: string) => void;
+  /** Starts this node straight in rename mode (canvas "Add Node") — read once, as the initial
+   * state below; toggling it after mount has no further effect. */
+  autoFocusRename?: boolean;
   properties: AxiomaBlockProperty[];
 }
 
@@ -26,18 +36,82 @@ const originBorder: Record<Origin, string> = {
 /**
  * Custom React Flow node rendering the three orthogonal provenance signals from impl §6.3:
  * Origin (border style), Validation (corner badge), Staleness (Suspect pulse). Ported from the
- * component example in docs/Axioma_implementation_v3.md §6.4.
+ * component example in docs/Axioma_implementation_v3.md §6.4. Also renders the `active` flag
+ * (dimmed + tagged when deactivated) and an inline rename input, gated behind `data.editable`.
  */
 export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData }) {
+  const [isRenaming, setIsRenaming] = useState(data.autoFocusRename ?? false);
+  const [draftName, setDraftName] = useState(data.label);
+  const isActive = data.active ?? true;
+
+  function startRename() {
+    if (!data.editable) {
+      return;
+    }
+    setDraftName(data.label);
+    setIsRenaming(true);
+  }
+
+  function commitRename() {
+    setIsRenaming(false);
+    const trimmed = draftName.trim();
+    if (trimmed && trimmed !== data.label) {
+      data.onRename?.(trimmed);
+    }
+  }
+
+  function cancelRename() {
+    setIsRenaming(false);
+    setDraftName(data.label);
+  }
+
   return (
     <div
-      className={`rounded-xl border bg-obsidian/80 p-0 shadow-2xl backdrop-blur-md ${originBorder[data.origin]}`}
+      className={`rounded-xl border bg-obsidian/80 p-0 shadow-2xl backdrop-blur-md ${originBorder[data.origin]} ${isActive ? "" : "opacity-50"}`}
     >
       <Handle type="target" position={Position.Top} className="!bg-graphite" />
 
       <div className="flex items-center gap-2 rounded-t-xl border-b border-white/5 bg-cobalt-glow/10 p-3">
         <span className="h-2 w-2 rounded-full bg-cobalt-glow" aria-hidden />
-        <span className="text-sm font-semibold text-white/90">{data.label}</span>
+        {isRenaming ? (
+          <input
+            // biome-ignore lint/a11y/noAutofocus: focuses an input a user action just revealed, not page-load autofocus
+            autoFocus
+            value={draftName}
+            onChange={(event) => setDraftName(event.target.value)}
+            onFocus={(event) => event.target.select()}
+            onBlur={commitRename}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                commitRename();
+              } else if (event.key === "Escape") {
+                cancelRename();
+              }
+            }}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => event.stopPropagation()}
+            className="w-full rounded border border-cobalt-glow/40 bg-obsidian px-1 text-sm font-semibold text-white/90 outline-none"
+          />
+        ) : (
+          <button
+            type="button"
+            className="cursor-default bg-transparent p-0 text-left text-sm font-semibold text-white/90"
+            onDoubleClick={(event) => {
+              event.stopPropagation();
+              startRename();
+            }}
+          >
+            {data.label}
+          </button>
+        )}
+        {!isActive && (
+          <span
+            className="text-[9px] uppercase tracking-widest text-graphite"
+            title="Deactivated — excluded from future optimization loops, data preserved"
+          >
+            Deactivated
+          </span>
+        )}
         {data.validation !== "unverified" && (
           <span className="ml-auto text-xs text-cobalt-glow" title={data.validation}>
             &#10003;

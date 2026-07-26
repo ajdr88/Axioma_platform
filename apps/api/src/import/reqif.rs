@@ -121,6 +121,7 @@ pub async fn import_reqif(
                 id: req.identifier.clone(),
                 kind: NodeKind::Requirement,
                 name,
+                active: true,
             }
         })
         .collect();

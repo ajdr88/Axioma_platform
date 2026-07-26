@@ -30,6 +30,9 @@ export interface Element {
   id: string;
   kind: NodeKind;
   name: string;
+  /** Excluded from *future* system-optimization loops (Mode B, not built yet) when false. Keeps
+   * all its data either way — this is a visual/modeling marker, not a delete. */
+  active: boolean;
 }
 
 export interface Edge {

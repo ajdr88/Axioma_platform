@@ -35,5 +35,8 @@ aws-config = "1"
 # ReqIF's deeply-optional nested schema.
 roxmltree = "0.21"
 
+# Server-generated ids for canvas-created elements (POST /api/v0/elements).
+uuid = { version = "1", features = ["v4"] }
+
 [dev-dependencies]
 http-body-util = "0.1"

@@ -4,8 +4,26 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use neo4rs::{query, Graph as Neo4jConn};
+use neo4rs::{query, Graph as Neo4jConn, Row};
 use sysml_core::{Edge, EdgeKind, Element, ElementId, NodeKind, ValidationError};
+
+/// Shared by `list_elements` and `get_element` — both queries return the same four columns.
+fn row_to_element(row: &Row) -> Result<Element> {
+    let id: String = row.get("id").context("missing id")?;
+    let name: String = row.get("name").context("missing name")?;
+    let labels: Vec<String> = row.get("labels").context("missing labels")?;
+    let active: bool = row.get("active").context("missing active")?;
+    let kind = labels
+        .iter()
+        .find_map(|l| NodeKind::from_label(l))
+        .unwrap_or(NodeKind::Element);
+    Ok(Element {
+        id,
+        kind,
+        name,
+        active,
+    })
+}
 
 #[derive(Clone)]
 pub struct Neo4jStore {
@@ -27,40 +45,69 @@ impl Neo4jStore {
             .context("Neo4j ping failed")
     }
 
-    /// `MERGE`s an element node by id. Only `id`/`kind`(label)/`name` are stored here — bodies
-    /// and blobs live elsewhere (NFR-DATA-01).
+    /// `MERGE`s an element node by id. Only `id`/`kind`(label)/`name`/`active` are stored here —
+    /// bodies and blobs live elsewhere (NFR-DATA-01).
     pub async fn upsert_element(&self, element: &Element) -> Result<()> {
         let label = element.kind.as_label();
-        let cypher = format!("MERGE (n:{label} {{id: $id}}) SET n.name = $name");
+        let cypher =
+            format!("MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = $active");
         self.conn
             .run(
                 query(&cypher)
                     .param("id", element.id.clone())
-                    .param("name", element.name.clone()),
+                    .param("name", element.name.clone())
+                    .param("active", element.active),
             )
             .await
             .with_context(|| format!("upserting element {}", element.id))
+    }
+
+    /// Sets just the `active` flag (canvas deactivate/reactivate) — never touches `name`.
+    pub async fn set_active(&self, id: &str, active: bool) -> Result<()> {
+        self.conn
+            .run(
+                query("MATCH (n {id: $id}) SET n.active = $active")
+                    .param("id", id.to_string())
+                    .param("active", active),
+            )
+            .await
+            .with_context(|| format!("setting active={active} on element {id}"))
+    }
+
+    /// Single-element lookup — used by rename to preserve `kind`/`active` when only `name`
+    /// changes.
+    pub async fn get_element(&self, id: &str) -> Result<Option<Element>> {
+        let mut result = self
+            .conn
+            .execute(
+                query(
+                    "MATCH (n {id: $id}) RETURN n.id AS id, n.name AS name, labels(n) AS labels, \
+                     coalesce(n.active, true) AS active",
+                )
+                .param("id", id.to_string()),
+            )
+            .await
+            .with_context(|| format!("looking up element {id}"))?;
+
+        match result.next().await.context("reading element row")? {
+            Some(row) => Ok(Some(row_to_element(&row)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn list_elements(&self) -> Result<Vec<Element>> {
         let mut result = self
             .conn
             .execute(query(
-                "MATCH (n) RETURN n.id AS id, n.name AS name, labels(n) AS labels",
+                "MATCH (n) RETURN n.id AS id, n.name AS name, labels(n) AS labels, \
+                 coalesce(n.active, true) AS active",
             ))
             .await
             .context("listing elements")?;
 
         let mut elements = Vec::new();
         while let Some(row) = result.next().await.context("reading element row")? {
-            let id: String = row.get("id").context("missing id")?;
-            let name: String = row.get("name").context("missing name")?;
-            let labels: Vec<String> = row.get("labels").context("missing labels")?;
-            let kind = labels
-                .iter()
-                .find_map(|l| NodeKind::from_label(l))
-                .unwrap_or(NodeKind::Element);
-            elements.push(Element { id, kind, name });
+            elements.push(row_to_element(&row)?);
         }
         Ok(elements)
     }
@@ -175,12 +222,14 @@ impl Neo4jStore {
 
         for element in elements {
             let label = element.kind.as_label();
-            let cypher = format!("MERGE (n:{label} {{id: $id}}) SET n.name = $name");
+            let cypher =
+                format!("MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = $active");
             if let Err(err) = txn
                 .run(
                     query(&cypher)
                         .param("id", element.id.clone())
-                        .param("name", element.name.clone()),
+                        .param("name", element.name.clone())
+                        .param("active", element.active),
                 )
                 .await
             {

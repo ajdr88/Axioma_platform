@@ -33,8 +33,9 @@ architecture summary and [`docs/`](docs/) for the source-of-truth specs:
 corepack enable
 pnpm install
 
-docker compose up -d      # Neo4j, Postgres (host port 5433), MinIO, Redis
-cp .env.example .env      # apps/api's store connection settings (defaults already match compose)
+docker compose up -d              # Neo4j, Postgres (host port 5433), MinIO, Redis
+cp .env.example .env               # apps/api's store connection settings (defaults match compose)
+cp apps/web/.env.example apps/web/.env.local   # apps/web's API_URL (defaults to localhost:8080)
 
 pnpm dev                  # apps/web on http://localhost:3000
 cargo run -p api          # apps/api on http://localhost:8080 — reads/writes Neo4j+Postgres+MinIO
@@ -63,10 +64,17 @@ infrastructure/     Terraform/K8s (provider-parameterized) — not started
 ## Status
 
 Early **P1.1 Core Graph** work. `apps/api` is wired to real Neo4j (topology) + Postgres (element
-bodies) + MinIO (blob pointers) per the ADR-003 polyglot split, with two semantic-validation rules
-(containment acyclicity, kind-conflict) enforced before every write. `POST /import/sysml-v2` and
-`POST /import/reqif` (FR-CORE-07) import a structural hierarchy / flat requirements list — each a
-deliberately restricted subset of the real OMG formats, documented in
-[`apps/api/src/import/`](apps/api/src/import/). Still ahead: the rest of the validation rule set,
-Git-backed model versioning, and auth — see [`CLAUDE.md`](CLAUDE.md) for the full roadmap and
-non-negotiable architectural rules.
+bodies/canvas position) + MinIO (blob pointers) per the ADR-003 polyglot split, with two
+semantic-validation rules (containment acyclicity, kind-conflict) enforced before every write.
+`POST /import/sysml-v2` and `POST /import/reqif` (FR-CORE-07) import a structural hierarchy / flat
+requirements list — each a deliberately restricted subset of the real OMG formats, documented in
+[`apps/api/src/import/`](apps/api/src/import/).
+
+The canvas supports direct manual editing behind an **Edit Mode** toggle (top-left): add a node,
+rename it inline (double-click), drag to reposition (persisted), drag-connect two nodes into a
+validated `Contains` edge, deactivate/reactivate (keeps all data, just excluded from *future*
+system-optimization loops — Mode B doesn't exist yet), and edit an element's rationale/properties
+in the inspector panel. No delete yet (out of scope, see `CLAUDE.md`).
+
+Still ahead: the rest of the validation rule set, Git-backed model versioning, and auth — see
+[`CLAUDE.md`](CLAUDE.md) for the full roadmap and non-negotiable architectural rules.

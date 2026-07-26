@@ -101,6 +101,16 @@ pub struct Element {
     pub id: ElementId,
     pub kind: NodeKind,
     pub name: String,
+    /// Whether this element is considered in system-optimization loops (Mode B / `cem-core` —
+    /// Product 2, not built yet). Deactivating an element keeps all its data; it's a visual/
+    /// modeling marker today, with nothing yet to actually filter by. Defaults to `true` on
+    /// deserialize so data written before this field existed still parses.
+    #[serde(default = "default_active")]
+    pub active: bool,
+}
+
+fn default_active() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -271,6 +281,7 @@ mod tests {
             id: id.to_string(),
             kind: NodeKind::Structure,
             name: id.to_string(),
+            active: true,
         }
     }
 
@@ -342,6 +353,7 @@ mod tests {
             id: "REQ-THRUST".to_string(),
             kind: NodeKind::Requirement,
             name: "Thrust requirement".to_string(),
+            active: true,
         });
         graph.add_element(structure("Turbine"));
 
@@ -403,6 +415,7 @@ mod tests {
             id: "Turbine".to_string(),
             kind: NodeKind::Requirement,
             name: "Turbine".to_string(),
+            active: true,
         };
         let result = check_kind_conflict(Some(NodeKind::Structure), &el);
         assert_eq!(

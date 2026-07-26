@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -109,9 +109,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .route("/api/v0/elements", get(list_elements))
-        .route("/api/v0/elements/:id/body", get(get_element_body))
-        .route("/api/v0/contains", get(list_contains_edges))
+        .route("/api/v0/elements", get(list_elements).post(create_element))
+        .route("/api/v0/elements/:id", patch(rename_element))
+        .route("/api/v0/elements/:id/active", patch(set_element_active))
+        .route(
+            "/api/v0/elements/:id/body",
+            get(get_element_body).put(update_element_body),
+        )
+        .route(
+            "/api/v0/elements/:id/position",
+            patch(update_element_position),
+        )
+        .route(
+            "/api/v0/contains",
+            get(list_contains_edges).post(create_contains_edge),
+        )
+        .route("/api/v0/positions", get(list_positions))
         .route("/import/sysml-v2", post(import::sysml_v2::import_sysml_v2))
         .route("/import/reqif", post(import::reqif::import_reqif))
         .with_state(state)
@@ -191,6 +204,161 @@ async fn get_element_body(
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct CreateElementRequest {
+    name: String,
+}
+
+/// Canvas "Add Node" (Edit Mode) — always `kind: Structure`, `active: true`; the server
+/// generates the id, so there's no kind-conflict risk (it's always fresh).
+async fn create_element(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateElementRequest>,
+) -> Result<Json<Element>, ApiError> {
+    if payload.name.trim().is_empty() {
+        return Err(import::BadRequest("name must not be empty".to_string()).into());
+    }
+    let element = Element {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: NodeKind::Structure,
+        name: payload.name,
+        active: true,
+    };
+    state.neo4j.upsert_element(&element).await?;
+    Ok(Json(element))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RenameRequest {
+    name: String,
+}
+
+/// Canvas inline rename (Edit Mode) — preserves the element's existing `kind`/`active`.
+async fn rename_element(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<RenameRequest>,
+) -> Result<Response, ApiError> {
+    if payload.name.trim().is_empty() {
+        return Err(import::BadRequest("name must not be empty".to_string()).into());
+    }
+    let Some(existing) = state.neo4j.get_element(&id).await? else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no element {id}") })),
+        )
+            .into_response());
+    };
+    let updated = Element {
+        name: payload.name,
+        ..existing
+    };
+    state.neo4j.upsert_element(&updated).await?;
+    Ok(Json(updated).into_response())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetActiveRequest {
+    active: bool,
+}
+
+/// Canvas deactivate/reactivate (Edit Mode). Deactivating keeps every bit of the element's data —
+/// it only marks it as excluded from *future* system-optimization loops (Mode B, not built yet;
+/// see `sysml_core::Element::active`'s doc comment). Nothing filters by this yet.
+async fn set_element_active(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<SetActiveRequest>,
+) -> Result<StatusCode, ApiError> {
+    state.neo4j.set_active(&id, payload.active).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateContainsRequest {
+    parent: String,
+    child: String,
+}
+
+/// Canvas drag-to-connect (Edit Mode) — goes through the same validated
+/// `Neo4jStore::create_edge` the batch importers use (containment-acyclicity, FR-CORE-05).
+async fn create_contains_edge(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateContainsRequest>,
+) -> Result<Json<Edge>, ApiError> {
+    let edge = Edge {
+        source: payload.parent,
+        target: payload.child,
+        kind: EdgeKind::Contains,
+    };
+    state.neo4j.create_edge(&edge).await?;
+    Ok(Json(edge))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PositionRequest {
+    x: f64,
+    y: f64,
+}
+
+/// Canvas drag persistence (Edit Mode) — Postgres only, never touches Neo4j or the element's
+/// body/rationale (NFR-DATA-01: position is UI metadata, not topology).
+async fn update_element_position(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<PositionRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .postgres
+        .upsert_position(&id, payload.x, payload.y)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PositionEntry {
+    element_id: String,
+    x: f64,
+    y: f64,
+}
+
+async fn list_positions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<PositionEntry>>, ApiError> {
+    let positions = state
+        .postgres
+        .list_positions()
+        .await?
+        .into_iter()
+        .map(|(element_id, x, y)| PositionEntry { element_id, x, y })
+        .collect();
+    Ok(Json(positions))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpdateBodyRequest {
+    rationale: Option<String>,
+    properties: serde_json::Value,
+}
+
+/// Canvas properties-inspector save (Edit Mode) — the write side of `get_element_body`.
+async fn update_element_body(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateBodyRequest>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .postgres
+        .upsert_body(&ElementBody {
+            element_id: id,
+            rationale: payload.rationale,
+            properties: payload.properties,
+        })
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Seeds `Turbofan-Ref`'s P1.1 structural fixture (test spec §0) across all three stores:
 /// `Engine` composed of the five reference subsystems in Neo4j; `REQ-THRUST` with a 20 KB
 /// rationale body in Postgres (mirrors T-P1.1-04's setup); a placeholder geometry blob for
@@ -200,6 +368,7 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
         id: "Engine".to_string(),
         kind: NodeKind::Structure,
         name: "Engine".to_string(),
+        active: true,
     };
     state.neo4j.upsert_element(&engine).await?;
 
@@ -218,6 +387,7 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
                 id: id.to_string(),
                 kind: NodeKind::Structure,
                 name: name.to_string(),
+                active: true,
             })
             .await?;
         state
@@ -234,6 +404,7 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
         id: "REQ-THRUST".to_string(),
         kind: NodeKind::Requirement,
         name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
+        active: true,
     };
     state.neo4j.upsert_element(&req_thrust).await?;
     state
@@ -346,11 +517,13 @@ mod tests {
             id: "IntegrationTestEngine".to_string(),
             kind: NodeKind::Structure,
             name: "Integration Test Engine".to_string(),
+            active: true,
         };
         let turbine = Element {
             id: "IntegrationTestTurbine".to_string(),
             kind: NodeKind::Structure,
             name: "Integration Test Turbine".to_string(),
+            active: true,
         };
         neo4j.upsert_element(&engine).await.unwrap();
         neo4j.upsert_element(&turbine).await.unwrap();
@@ -413,13 +586,15 @@ mod tests {
             "the large body should be readable back from Postgres"
         );
 
-        // Neo4j's upsert_element only ever sets `id`/`name` — there is no path for the 20 KB
-        // rationale to leak into the graph, but assert it directly rather than by construction.
+        // Neo4j's upsert_element only ever sets `id`/`name`/`active` — there is no path for the
+        // 20 KB rationale to leak into the graph, but assert it directly rather than by
+        // construction.
         neo4j
             .upsert_element(&Element {
                 id: element_id.to_string(),
                 kind: NodeKind::Requirement,
                 name: "Integration test requirement".to_string(),
+                active: true,
             })
             .await
             .unwrap();
@@ -565,6 +740,7 @@ mod tests {
                 id: "KindConflictTest".to_string(),
                 kind: NodeKind::Structure,
                 name: "Originally a Structure".to_string(),
+                active: true,
             })
             .await
             .unwrap();
@@ -574,6 +750,7 @@ mod tests {
                 id: "KindConflictTest".to_string(),
                 kind: NodeKind::Requirement,
                 name: "Now claimed as a Requirement".to_string(),
+                active: true,
             }],
             contains: vec![],
         };
