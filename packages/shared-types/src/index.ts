@@ -24,7 +24,8 @@ export type EdgeKind =
   | "Causes"
   | "MitigatedBy"
   | "ValidatedBy"
-  | "Suspect";
+  | "Suspect"
+  | "Concerns";
 
 export interface Element {
   id: string;

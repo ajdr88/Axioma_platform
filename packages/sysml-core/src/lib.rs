@@ -72,6 +72,8 @@ pub enum EdgeKind {
     MitigatedBy,
     ValidatedBy,
     Suspect,
+    /// A `Stakeholder`'s link to a `Mission` or `Requirement` it owns (FR-MSN-02).
+    Concerns,
 }
 
 impl EdgeKind {
@@ -92,6 +94,7 @@ impl EdgeKind {
             EdgeKind::MitigatedBy => "MITIGATED_BY",
             EdgeKind::ValidatedBy => "VALIDATED_BY",
             EdgeKind::Suspect => "SUSPECT",
+            EdgeKind::Concerns => "CONCERNS",
         }
     }
 }
@@ -260,11 +263,11 @@ pub fn check_kind_conflict(
 }
 
 /// Rejects an edge whose source/target `NodeKind`s violate the relationship's type-legality rule
-/// (FR-CORE-05). Deliberately partial: today only `Satisfy` is constrained ("a Satisfy targets a
-/// Requirement, not a Block" — requirements.md §5.1, T-P1.1-02), because it's the only endpoint
-/// rule the docs concretely pin down. Every other `EdgeKind` is accepted between any two
-/// `NodeKind`s for now; extend the match arm as more rules are specified rather than guessing
-/// ahead of the spec.
+/// (FR-CORE-05). Deliberately partial: only rules the docs concretely pin down are encoded —
+/// `Satisfy` ("a Satisfy targets a Requirement, not a Block" — requirements.md §5.1, T-P1.1-02)
+/// and `Concerns` (a Stakeholder's link to a Mission/Requirement it owns — FR-MSN-02). Every other
+/// `EdgeKind` is accepted between any two `NodeKind`s for now; extend the match arm as more rules
+/// are specified rather than guessing ahead of the spec.
 pub fn check_relationship_endpoints(
     kind: EdgeKind,
     source: &str,
@@ -274,6 +277,10 @@ pub fn check_relationship_endpoints(
 ) -> Result<(), ValidationError> {
     let legal = match kind {
         EdgeKind::Satisfy => target_kind == NodeKind::Requirement,
+        EdgeKind::Concerns => {
+            source_kind == NodeKind::Stakeholder
+                && matches!(target_kind, NodeKind::Mission | NodeKind::Requirement)
+        }
         _ => true,
     };
     if legal {
@@ -519,6 +526,57 @@ mod tests {
             NodeKind::Control,
         )
         .is_ok());
+    }
+
+    /// FR-MSN-02: a Stakeholder's `Concerns` link may target a Mission or a Requirement.
+    #[test]
+    fn accepts_legal_concerns_endpoints() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Concerns,
+            "Chief-Engineer",
+            NodeKind::Stakeholder,
+            "MSN-CLIMB",
+            NodeKind::Mission,
+        )
+        .is_ok());
+        assert!(check_relationship_endpoints(
+            EdgeKind::Concerns,
+            "Chief-Engineer",
+            NodeKind::Stakeholder,
+            "REQ-THRUST",
+            NodeKind::Requirement,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_illegal_concerns_endpoints() {
+        // Wrong source kind.
+        assert_eq!(
+            check_relationship_endpoints(
+                EdgeKind::Concerns,
+                "Turbine",
+                NodeKind::Structure,
+                "MSN-CLIMB",
+                NodeKind::Mission,
+            ),
+            Err(ValidationError::IllegalEndpoint {
+                kind: EdgeKind::Concerns,
+                source: "Turbine".to_string(),
+                source_kind: NodeKind::Structure,
+                target: "MSN-CLIMB".to_string(),
+                target_kind: NodeKind::Mission,
+            })
+        );
+        // Wrong target kind.
+        assert!(check_relationship_endpoints(
+            EdgeKind::Concerns,
+            "Chief-Engineer",
+            NodeKind::Stakeholder,
+            "Turbine",
+            NodeKind::Structure,
+        )
+        .is_err());
     }
 
     #[test]

@@ -4,17 +4,13 @@ import type { AxiomaBlockData } from "@axioma/diagram-engine";
 import type { Edge as ApiEdge } from "@axioma/shared-types";
 import { Button, Panel } from "@axioma/ui-components";
 import type { Node as FlowNode } from "@xyflow/react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
+import { useElementBodies } from "@/lib/useElementBodies";
 
 /** FR-SAFE-02: "Configurable Severity x Likelihood scales (e.g. 5x5, MIL-STD-882 / ARP4761
  * conventions)". Fixed at 5x5 for this first pass — index+1 is the 1-5 score. */
 const SEVERITY_LEVELS = ["Negligible", "Minor", "Moderate", "Major", "Catastrophic"] as const;
 const LIKELIHOOD_LEVELS = ["Improbable", "Remote", "Occasional", "Probable", "Frequent"] as const;
-
-interface ElementBody {
-  rationale: string | null;
-  properties: Record<string, string>;
-}
 
 function scoreOf(levels: readonly string[], value: string | undefined): number {
   const index = levels.indexOf(value ?? "");
@@ -54,93 +50,17 @@ export function HazardRiskPanel({
   const hazards = useMemo(() => nodes.filter((n) => n.data.kind === "Hazard"), [nodes]);
   const structures = useMemo(() => nodes.filter((n) => n.data.kind === "Structure"), [nodes]);
 
-  const [bodies, setBodies] = useState<Record<string, ElementBody>>({});
   const [subsystemFilter, setSubsystemFilter] = useState<string>("all");
   const [newHazardName, setNewHazardName] = useState("");
   const [newHazardStructureId, setNewHazardStructureId] = useState("");
   const [newControlName, setNewControlName] = useState<Record<string, string>>({});
-  const [error, setError] = useState<string | null>(null);
 
   const controlIds = useMemo(() => mitigatedByEdges.map((e) => e.target), [mitigatedByEdges]);
   const trackedIds = useMemo(
-    () => [...hazards.map((h) => h.id), ...controlIds].join(","),
+    () => [...hazards.map((h) => h.id), ...controlIds],
     [hazards, controlIds],
   );
-
-  /** Mirrors `bodies` synchronously (not just after the next render) so `updateProperty` below
-   * always reads the latest write instead of a snapshot that may already be out of date — see
-   * its own doc comment. */
-  const bodiesRef = useRef<Record<string, ElementBody>>({});
-
-  useEffect(() => {
-    let cancelled = false;
-    async function loadBodies() {
-      // Hydrate each id's body exactly once. Re-fetching (and blindly overwriting) an id that's
-      // already cached would race an in-flight or just-landed `updateProperty` optimistic write
-      // for that same id — this GET reflects a snapshot from whenever it was issued, so if it
-      // resolves after a newer local write, it would silently roll that write back in the UI
-      // even though the server itself still has it (as happened when this used a full replace).
-      const ids = (trackedIds ? trackedIds.split(",") : []).filter(
-        (id) => !(id in bodiesRef.current),
-      );
-      if (ids.length === 0) {
-        return;
-      }
-      const entries = await Promise.all(
-        ids.map(async (id): Promise<[string, ElementBody]> => {
-          const res = await fetch(`/api/elements/${id}/body`);
-          if (!res.ok) {
-            return [id, { rationale: null, properties: {} }];
-          }
-          const body = await res.json();
-          return [id, { rationale: body.rationale ?? null, properties: body.properties ?? {} }];
-        }),
-      );
-      if (!cancelled) {
-        // Re-check the cache now, not just at fetch-issue time above: an `updateProperty` call
-        // for one of these ids may have landed while this fetch was in flight. That local write
-        // must win — applying this (now-stale) response on top of it would silently roll it back.
-        const freshEntries = entries.filter(([id]) => !(id in bodiesRef.current));
-        if (freshEntries.length > 0) {
-          bodiesRef.current = { ...bodiesRef.current, ...Object.fromEntries(freshEntries) };
-          setBodies((b) => ({ ...b, ...Object.fromEntries(freshEntries) }));
-        }
-      }
-    }
-    loadBodies();
-    return () => {
-      cancelled = true;
-    };
-  }, [trackedIds]);
-
-  /** `updateProperty` reads/writes `bodiesRef` (not `bodies` state) so two calls fired
-   * back-to-back — e.g. scoring severity then likelihood — each see the other's write
-   * immediately; reading component state directly would race, since both calls would close over
-   * the same pre-update snapshot and the PUT below replaces the whole property bag. */
-  async function updateProperty(elementId: string, patch: Record<string, string>) {
-    const previous = bodiesRef.current[elementId] ?? { rationale: null, properties: {} };
-    const nextBody: ElementBody = {
-      rationale: previous.rationale,
-      properties: { ...previous.properties, ...patch },
-    };
-    bodiesRef.current = { ...bodiesRef.current, [elementId]: nextBody };
-    setBodies((b) => ({ ...b, [elementId]: nextBody }));
-
-    const res = await fetch(`/api/elements/${elementId}/body`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(nextBody),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => null);
-      setError(err?.error ?? `save failed with status ${res.status}`);
-      // Roll back the optimistic write — only if nothing newer has landed on top of it since.
-      if (bodiesRef.current[elementId] === nextBody) {
-        bodiesRef.current = { ...bodiesRef.current, [elementId]: previous };
-        setBodies((b) => ({ ...b, [elementId]: previous }));
-      }
-    }
-  }
+  const { bodies, updateProperty, error } = useElementBodies(trackedIds);
 
   const visibleHazards = hazards.filter((hazard) => {
     if (subsystemFilter === "all") {

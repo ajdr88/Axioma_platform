@@ -26,6 +26,7 @@ import {
 import { useEffect, useState } from "react";
 import { ElementInspector } from "@/components/ElementInspector";
 import { HazardRiskPanel } from "@/components/HazardRiskPanel";
+import { MissionPlanningPanel } from "@/components/MissionPlanningPanel";
 
 type LoadStatus = "loading" | "error" | "ready";
 
@@ -91,6 +92,7 @@ export default function Home() {
   const [editMode, setEditMode] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [showHazardPanel, setShowHazardPanel] = useState(false);
+  const [showMissionPanel, setShowMissionPanel] = useState(false);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode<AxiomaBlockData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge<AxiomaEdgeData>>([]);
@@ -99,21 +101,32 @@ export default function Home() {
   const [causesEdges, setCausesEdges] = useState<ApiEdge[]>([]);
   /** source=Hazard, target=Control (FR-SAFE-01/03) — read by the Hazard/Risk panel. */
   const [mitigatedByEdges, setMitigatedByEdges] = useState<ApiEdge[]>([]);
+  /** source=Stakeholder, target=Mission or Requirement (FR-MSN-02) — read by the Mission
+   * Planning panel. */
+  const [concernsEdges, setConcernsEdges] = useState<ApiEdge[]>([]);
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
       try {
-        const [elementsRes, containsRes, positionsRes, causesRes, mitigatedByRes] =
+        const [elementsRes, containsRes, positionsRes, causesRes, mitigatedByRes, concernsRes] =
           await Promise.all([
             fetch("/api/elements"),
             fetch("/api/contains"),
             fetch("/api/positions"),
             fetch("/api/edges?kind=Causes"),
             fetch("/api/edges?kind=MitigatedBy"),
+            fetch("/api/edges?kind=Concerns"),
           ]);
-        for (const res of [elementsRes, containsRes, positionsRes, causesRes, mitigatedByRes]) {
+        for (const res of [
+          elementsRes,
+          containsRes,
+          positionsRes,
+          causesRes,
+          mitigatedByRes,
+          concernsRes,
+        ]) {
           if (!res.ok) {
             throw new Error(await readErrorMessage(res));
           }
@@ -123,6 +136,7 @@ export default function Home() {
         const positionEntries: PositionEntry[] = await positionsRes.json();
         const causes: ApiEdge[] = await causesRes.json();
         const mitigatedBy: ApiEdge[] = await mitigatedByRes.json();
+        const concerns: ApiEdge[] = await concernsRes.json();
         if (cancelled) {
           return;
         }
@@ -143,6 +157,7 @@ export default function Home() {
         setEdges(contains.map(toFlowEdge));
         setCausesEdges(causes);
         setMitigatedByEdges(mitigatedBy);
+        setConcernsEdges(concerns);
         setStatus("ready");
       } catch (error) {
         if (!cancelled) {
@@ -263,6 +278,48 @@ export default function Home() {
     ]);
   }
 
+  /** Mission Planning panel "+ Mission" — no links needed at creation time (FR-MSN-01). */
+  async function handleCreateMission(name: string) {
+    await createElement(name, "Mission");
+  }
+
+  /** Mission Planning panel "+ Stakeholder" — creates the Stakeholder, saves its concern text,
+   * then links it to the chosen Mission and Requirement via validated `Concerns` edges
+   * (FR-MSN-02), traversable from either end. */
+  async function handleCreateStakeholder(
+    name: string,
+    concern: string,
+    missionId: string,
+    requirementId: string,
+  ) {
+    const newNode = await createElement(name, "Stakeholder");
+    if (!newNode) {
+      return;
+    }
+    if (concern) {
+      await fetch(`/api/elements/${newNode.id}/body`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rationale: null, properties: { concern } }),
+      });
+    }
+    for (const targetId of [missionId, requirementId]) {
+      const res = await fetch("/api/edges", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: newNode.id, target: targetId, kind: "Concerns" }),
+      });
+      if (!res.ok) {
+        showNotice(await readErrorMessage(res));
+        continue;
+      }
+      setConcernsEdges((eds) => [
+        ...eds,
+        { source: newNode.id, target: targetId, kind: "Concerns" },
+      ]);
+    }
+  }
+
   async function handleDisconnect(source: string, target: string) {
     const res = await fetch("/api/contains", {
       method: "DELETE",
@@ -339,6 +396,7 @@ export default function Home() {
           onNodeClick={(_event, node) => {
             setSelectedNodeId(node.id);
             setShowHazardPanel(false);
+            setShowMissionPanel(false);
           }}
           onPaneClick={() => setSelectedNodeId(null)}
           onConnect={async (connection: Connection) => {
@@ -439,11 +497,23 @@ export default function Home() {
                 variant={showHazardPanel ? "primary" : "ghost"}
                 onClick={() => {
                   setShowHazardPanel((v) => !v);
+                  setShowMissionPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
               >
                 Hazard/Risk
+              </Button>
+              <Button
+                variant={showMissionPanel ? "primary" : "ghost"}
+                onClick={() => {
+                  setShowMissionPanel((v) => !v);
+                  setShowHazardPanel(false);
+                  setSelectedNodeId(null);
+                }}
+                className="!px-2 !py-1 text-xs"
+              >
+                Mission Planning
               </Button>
             </div>
           </GlassPanel>
@@ -465,6 +535,17 @@ export default function Home() {
               onClose={() => setShowHazardPanel(false)}
               onCreateHazard={handleCreateHazard}
               onCreateControl={handleCreateControl}
+            />
+          )}
+
+          {showMissionPanel && (
+            <MissionPlanningPanel
+              nodes={nodes}
+              concernsEdges={concernsEdges}
+              editMode={editMode}
+              onClose={() => setShowMissionPanel(false)}
+              onCreateMission={handleCreateMission}
+              onCreateStakeholder={handleCreateStakeholder}
             />
           )}
         </ReactFlow>
