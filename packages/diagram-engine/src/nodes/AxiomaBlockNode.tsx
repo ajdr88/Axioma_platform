@@ -1,3 +1,4 @@
+import type { NodeKind } from "@axioma/shared-types";
 import { Handle, type NodeProps, Position } from "@xyflow/react";
 import { useState } from "react";
 
@@ -12,12 +13,17 @@ export interface AxiomaBlockProperty {
 
 export interface AxiomaBlockData extends Record<string, unknown> {
   label: string;
+  /** Discriminates Hazard/Control accent styling below from every other kind (rendered plain). */
+  kind: NodeKind;
   origin: Origin;
   validation: ValidationState;
   suspect?: boolean;
   /** Excluded from *future* system-optimization loops when false — keeps all its data, just
    * visually marked. Defaults to `true` (most callers, e.g. imported data, don't set it). */
   active?: boolean;
+  /** True when a `Hazard` `causes`-edge targets this (Structure) node (FR-SAFE-01,
+   * T-P1.2-04's "the Turbine block shows a hazard indicator"). */
+  hasHazard?: boolean;
   /** Whether Edit Mode is on — gates the double-click-to-rename interaction below. */
   editable?: boolean;
   onRename?: (name: string) => void;
@@ -31,6 +37,13 @@ const originBorder: Record<Origin, string> = {
   human: "border-white/10",
   "ai-suggested": "border-dashed border-cobalt-glow/40",
   "ai-auto-merged": "border-dashed border-cobalt-glow/70 shadow-cobalt-glow/20",
+};
+
+/** Header-dot/header-band accent per `kind` — every other kind (Structure, Requirement, etc.)
+ * falls back to the default cobalt-glow treatment already in place before kind-awareness existed. */
+const kindAccent: Partial<Record<NodeKind, { dot: string; band: string }>> = {
+  Hazard: { dot: "bg-alert", band: "bg-alert/10" },
+  Control: { dot: "bg-cobalt-glow", band: "bg-cobalt-glow/20" },
 };
 
 /**
@@ -72,6 +85,7 @@ export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData })
   const handleClassName = data.editable
     ? "!h-3.5 !w-3.5 !border-2 !border-obsidian !bg-cobalt-glow !cursor-crosshair transition-transform hover:!scale-125 hover:!bg-white"
     : "!h-2 !w-2 !border-2 !border-obsidian !bg-graphite !cursor-default";
+  const accent = kindAccent[data.kind];
 
   return (
     <div
@@ -79,8 +93,16 @@ export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData })
     >
       <Handle type="target" position={Position.Top} className={handleClassName} />
 
-      <div className="flex items-center gap-2 rounded-t-xl border-b border-white/5 bg-cobalt-glow/10 p-3">
-        <span className="h-2 w-2 rounded-full bg-cobalt-glow" aria-hidden />
+      <div
+        className={`flex items-center gap-2 rounded-t-xl border-b border-white/5 p-3 ${accent?.band ?? "bg-cobalt-glow/10"}`}
+      >
+        <span className={`h-2 w-2 rounded-full ${accent?.dot ?? "bg-cobalt-glow"}`} aria-hidden />
+        {data.hasHazard && (
+          <span
+            className="h-2 w-2 rounded-full bg-alert"
+            title="Linked Hazard — see the Hazard/Risk panel"
+          />
+        )}
         {isRenaming ? (
           <input
             // biome-ignore lint/a11y/noAutofocus: focuses an input a user action just revealed, not page-load autofocus

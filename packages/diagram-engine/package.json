@@ -9,6 +9,7 @@
     "build": "tsc --noEmit"
   },
   "dependencies": {
+    "@axioma/shared-types": "workspace:*",
     "@xyflow/react": "^12.11.2"
   },
   "peerDependencies": {

@@ -63,6 +63,9 @@ importers:
 
   packages/diagram-engine:
     dependencies:
+      '@axioma/shared-types':
+        specifier: workspace:*
+        version: link:../shared-types
       '@xyflow/react':
         specifier: ^12.11.2
         version: 12.11.2(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)

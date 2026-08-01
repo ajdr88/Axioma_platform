@@ -120,9 +120,9 @@ pub struct Edge {
     pub kind: EdgeKind,
 }
 
-/// A single semantic-validation failure. The real layer (impl §4.2) also checks type-legal
-/// relationship endpoints, parametric consistency, and dangling-edge rejection — this seed
-/// covers containment acyclicity only.
+/// A single semantic-validation failure. The real layer (impl §4.2) also checks parametric
+/// consistency — no parametric model exists yet, so that rule has nothing to validate against
+/// and isn't represented here yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     ContainmentCycle {
@@ -135,6 +135,22 @@ pub enum ValidationError {
         id: ElementId,
         existing: NodeKind,
         incoming: NodeKind,
+    },
+    /// An edge's source/target kinds violate the relationship's type-legality rule (FR-CORE-05),
+    /// e.g. a `Satisfy` edge whose target isn't a `Requirement`. See
+    /// [`check_relationship_endpoints`].
+    IllegalEndpoint {
+        kind: EdgeKind,
+        source: ElementId,
+        source_kind: NodeKind,
+        target: ElementId,
+        target_kind: NodeKind,
+    },
+    /// An edge references an id that doesn't exist as an element (NFR-REL-01: "no edge
+    /// references a concurrently-deleted node").
+    DanglingEdge {
+        edge_kind: EdgeKind,
+        missing_id: ElementId,
     },
 }
 
@@ -152,6 +168,23 @@ impl std::fmt::Display for ValidationError {
             } => write!(
                 f,
                 "element {id} already exists as {existing:?}, cannot import as {incoming:?}"
+            ),
+            ValidationError::IllegalEndpoint {
+                kind,
+                source,
+                source_kind,
+                target,
+                target_kind,
+            } => write!(
+                f,
+                "{kind:?} edge {source} ({source_kind:?}) -> {target} ({target_kind:?}) violates the relationship's type-legality rule"
+            ),
+            ValidationError::DanglingEdge {
+                edge_kind,
+                missing_id,
+            } => write!(
+                f,
+                "cannot create {edge_kind:?} edge: element {missing_id} does not exist"
             ),
         }
     }
@@ -226,6 +259,36 @@ pub fn check_kind_conflict(
     }
 }
 
+/// Rejects an edge whose source/target `NodeKind`s violate the relationship's type-legality rule
+/// (FR-CORE-05). Deliberately partial: today only `Satisfy` is constrained ("a Satisfy targets a
+/// Requirement, not a Block" — requirements.md §5.1, T-P1.1-02), because it's the only endpoint
+/// rule the docs concretely pin down. Every other `EdgeKind` is accepted between any two
+/// `NodeKind`s for now; extend the match arm as more rules are specified rather than guessing
+/// ahead of the spec.
+pub fn check_relationship_endpoints(
+    kind: EdgeKind,
+    source: &str,
+    source_kind: NodeKind,
+    target: &str,
+    target_kind: NodeKind,
+) -> Result<(), ValidationError> {
+    let legal = match kind {
+        EdgeKind::Satisfy => target_kind == NodeKind::Requirement,
+        _ => true,
+    };
+    if legal {
+        Ok(())
+    } else {
+        Err(ValidationError::IllegalEndpoint {
+            kind,
+            source: source.to_string(),
+            source_kind,
+            target: target.to_string(),
+            target_kind,
+        })
+    }
+}
+
 /// An in-memory model graph. Real persistence is polyglot (Neo4j for topology, Postgres/JSONB
 /// for bodies, S3 for blobs, per ADR-003) — this type stands in for the topology store during
 /// early development.
@@ -252,8 +315,10 @@ impl Graph {
         self.elements.values()
     }
 
-    /// Adds an edge, enforcing containment acyclicity (FR-CORE-05, NFR-REL-02). Non-containment
-    /// edges are accepted unconditionally here — cycles across them are legal by design.
+    /// Adds an edge, enforcing containment acyclicity (FR-CORE-05, NFR-REL-02) and relationship
+    /// endpoint type-legality (see [`check_relationship_endpoints`]). Non-containment edges are
+    /// accepted unconditionally with respect to acyclicity — cycles across them are legal by
+    /// design.
     pub fn add_edge(&mut self, edge: Edge) -> Result<(), ValidationError> {
         if edge.kind.is_acyclicity_scoped()
             && would_create_containment_cycle(&self.edges, &edge.source, &edge.target)
@@ -262,6 +327,18 @@ impl Graph {
                 parent: edge.source,
                 child: edge.target,
             });
+        }
+        if let (Some(source_el), Some(target_el)) = (
+            self.elements.get(&edge.source),
+            self.elements.get(&edge.target),
+        ) {
+            check_relationship_endpoints(
+                edge.kind,
+                &edge.source,
+                source_el.kind,
+                &edge.target,
+                target_el.kind,
+            )?;
         }
         self.edges.push(edge);
         Ok(())
@@ -345,7 +422,9 @@ mod tests {
     }
 
     /// T-P1.1-03(b): non-containment cycles (e.g. Satisfy/Refine across the same pair) are
-    /// legal — traceability is expected to be cyclic (NFR-REL-02).
+    /// legal — traceability is expected to be cyclic (NFR-REL-02). Satisfy direction is
+    /// Structure->Requirement ("a Satisfy targets a Requirement, not a Block" — requirements.md
+    /// §5.1, T-P1.1-02); Refine stays kind-unconstrained for now.
     #[test]
     fn allows_non_containment_cycles() {
         let mut graph = Graph::new();
@@ -359,19 +438,87 @@ mod tests {
 
         graph
             .add_edge(Edge {
-                source: "REQ-THRUST".to_string(),
-                target: "Turbine".to_string(),
+                source: "Turbine".to_string(),
+                target: "REQ-THRUST".to_string(),
                 kind: EdgeKind::Satisfy,
             })
             .unwrap();
 
         let result = graph.add_edge(Edge {
-            source: "Turbine".to_string(),
-            target: "REQ-THRUST".to_string(),
+            source: "REQ-THRUST".to_string(),
+            target: "Turbine".to_string(),
             kind: EdgeKind::Refine,
         });
 
         assert!(result.is_ok());
+    }
+
+    /// T-P1.1-02: Satisfy must target a Requirement, not a Block — a Block satisfying another
+    /// Block (e.g. Combustor -> Turbine) is rejected.
+    #[test]
+    fn rejects_illegal_satisfy_endpoint() {
+        let mut graph = Graph::new();
+        graph.add_element(structure("Combustor"));
+        graph.add_element(structure("Turbine"));
+
+        let result = graph.add_edge(Edge {
+            source: "Combustor".to_string(),
+            target: "Turbine".to_string(),
+            kind: EdgeKind::Satisfy,
+        });
+
+        assert_eq!(
+            result,
+            Err(ValidationError::IllegalEndpoint {
+                kind: EdgeKind::Satisfy,
+                source: "Combustor".to_string(),
+                source_kind: NodeKind::Structure,
+                target: "Turbine".to_string(),
+                target_kind: NodeKind::Structure,
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_legal_satisfy_endpoint() {
+        let mut graph = Graph::new();
+        graph.add_element(structure("Turbine"));
+        graph.add_element(Element {
+            id: "REQ-THRUST".to_string(),
+            kind: NodeKind::Requirement,
+            name: "Thrust requirement".to_string(),
+            active: true,
+        });
+
+        let result = graph.add_edge(Edge {
+            source: "Turbine".to_string(),
+            target: "REQ-THRUST".to_string(),
+            kind: EdgeKind::Satisfy,
+        });
+
+        assert!(result.is_ok());
+    }
+
+    /// Causes/MitigatedBy (and every other kind besides Satisfy) are kind-unconstrained for
+    /// now — the docs don't pin down an endpoint rule for them yet.
+    #[test]
+    fn accepts_causes_and_mitigated_by_between_any_kinds() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Causes,
+            "Turbine",
+            NodeKind::Structure,
+            "HAZ-OVERSPEED",
+            NodeKind::Hazard,
+        )
+        .is_ok());
+        assert!(check_relationship_endpoints(
+            EdgeKind::MitigatedBy,
+            "HAZ-OVERSPEED",
+            NodeKind::Hazard,
+            "CTRL-CUTOFF",
+            NodeKind::Control,
+        )
+        .is_ok());
     }
 
     #[test]

@@ -7,7 +7,7 @@ import {
   edgeTypes,
   nodeTypes,
 } from "@axioma/diagram-engine";
-import type { Edge as ApiEdge, Element as ApiElement } from "@axioma/shared-types";
+import type { Edge as ApiEdge, Element as ApiElement, NodeKind } from "@axioma/shared-types";
 import { Button, Panel as GlassPanel } from "@axioma/ui-components";
 import {
   addEdge,
@@ -25,6 +25,7 @@ import {
 } from "@xyflow/react";
 import { useEffect, useState } from "react";
 import { ElementInspector } from "@/components/ElementInspector";
+import { HazardRiskPanel } from "@/components/HazardRiskPanel";
 
 type LoadStatus = "loading" | "error" | "ready";
 
@@ -44,11 +45,12 @@ function toFlowNode(
     position,
     data: {
       label: element.name,
+      kind: element.kind,
       // Placeholder — sysml_core::Element carries no provenance yet (FR-CORE-08 unimplemented).
       origin: "human",
       validation: "unverified",
       active: element.active,
-      properties: [{ id: "kind", name: "kind", type: element.kind }],
+      properties: [],
     },
   };
 }
@@ -88,21 +90,30 @@ export default function Home() {
   const [notice, setNotice] = useState<string | null>(null);
   const [editMode, setEditMode] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [showHazardPanel, setShowHazardPanel] = useState(false);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode<AxiomaBlockData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge<AxiomaEdgeData>>([]);
+  /** source=Structure, target=Hazard (FR-SAFE-01) — read by the hazard-indicator badge and the
+   * Hazard/Risk panel. */
+  const [causesEdges, setCausesEdges] = useState<ApiEdge[]>([]);
+  /** source=Hazard, target=Control (FR-SAFE-01/03) — read by the Hazard/Risk panel. */
+  const [mitigatedByEdges, setMitigatedByEdges] = useState<ApiEdge[]>([]);
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
       try {
-        const [elementsRes, containsRes, positionsRes] = await Promise.all([
-          fetch("/api/elements"),
-          fetch("/api/contains"),
-          fetch("/api/positions"),
-        ]);
-        for (const res of [elementsRes, containsRes, positionsRes]) {
+        const [elementsRes, containsRes, positionsRes, causesRes, mitigatedByRes] =
+          await Promise.all([
+            fetch("/api/elements"),
+            fetch("/api/contains"),
+            fetch("/api/positions"),
+            fetch("/api/edges?kind=Causes"),
+            fetch("/api/edges?kind=MitigatedBy"),
+          ]);
+        for (const res of [elementsRes, containsRes, positionsRes, causesRes, mitigatedByRes]) {
           if (!res.ok) {
             throw new Error(await readErrorMessage(res));
           }
@@ -110,6 +121,8 @@ export default function Home() {
         const elements: ApiElement[] = await elementsRes.json();
         const contains: ApiEdge[] = await containsRes.json();
         const positionEntries: PositionEntry[] = await positionsRes.json();
+        const causes: ApiEdge[] = await causesRes.json();
+        const mitigatedBy: ApiEdge[] = await mitigatedByRes.json();
         if (cancelled) {
           return;
         }
@@ -128,6 +141,8 @@ export default function Home() {
           ),
         );
         setEdges(contains.map(toFlowEdge));
+        setCausesEdges(causes);
+        setMitigatedByEdges(mitigatedBy);
         setStatus("ready");
       } catch (error) {
         if (!cancelled) {
@@ -165,18 +180,23 @@ export default function Home() {
     );
   }
 
-  async function handleAddNode() {
+  /** Shared by "+ Add Node" and the Hazard/Risk panel's Hazard/Control creation — POSTs the
+   * element, gives it a jittered starting position (so repeated adds don't stack exactly), and
+   * adds it to canvas state. Returns `null` (after showing a notice) on failure. */
+  async function createElement(
+    name: string,
+    kind: NodeKind,
+  ): Promise<FlowNode<AxiomaBlockData> | null> {
     const res = await fetch("/api/elements", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "New Element" }),
+      body: JSON.stringify({ name, kind }),
     });
     if (!res.ok) {
       showNotice(await readErrorMessage(res));
-      return;
+      return null;
     }
     const element: ApiElement = await res.json();
-    // Placed near the origin with a little jitter so repeated adds don't stack exactly.
     const position = { x: 40 + Math.random() * 80, y: 40 + Math.random() * 80 };
     await fetch(`/api/elements/${element.id}/position`, {
       method: "PATCH",
@@ -184,8 +204,63 @@ export default function Home() {
       body: JSON.stringify(position),
     });
     const newNode = toFlowNode(element, position);
-    newNode.data.autoFocusRename = true;
     setNodes((nds) => [...nds, newNode]);
+    return newNode;
+  }
+
+  async function handleAddNode() {
+    const newNode = await createElement("New Element", "Structure");
+    if (newNode) {
+      setNodes((nds) =>
+        nds.map((n) =>
+          n.id === newNode.id ? { ...n, data: { ...n.data, autoFocusRename: true } } : n,
+        ),
+      );
+    }
+  }
+
+  /** Hazard/Risk panel "+ Add Hazard" — creates the Hazard, then links it to its causing
+   * subsystem via a validated `Causes` edge (FR-SAFE-01). */
+  async function handleCreateHazard(name: string, causingStructureId: string) {
+    const newNode = await createElement(name, "Hazard");
+    if (!newNode) {
+      return;
+    }
+    const res = await fetch("/api/edges", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: causingStructureId, target: newNode.id, kind: "Causes" }),
+    });
+    if (!res.ok) {
+      showNotice(await readErrorMessage(res));
+      return;
+    }
+    setCausesEdges((eds) => [
+      ...eds,
+      { source: causingStructureId, target: newNode.id, kind: "Causes" },
+    ]);
+  }
+
+  /** Hazard/Risk panel "+ Control" — creates the Control, then links it to the hazard it
+   * mitigates via a validated `MitigatedBy` edge (FR-SAFE-03). */
+  async function handleCreateControl(hazardId: string, name: string) {
+    const newNode = await createElement(name, "Control");
+    if (!newNode) {
+      return;
+    }
+    const res = await fetch("/api/edges", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: hazardId, target: newNode.id, kind: "MitigatedBy" }),
+    });
+    if (!res.ok) {
+      showNotice(await readErrorMessage(res));
+      return;
+    }
+    setMitigatedByEdges((eds) => [
+      ...eds,
+      { source: hazardId, target: newNode.id, kind: "MitigatedBy" },
+    ]);
   }
 
   async function handleDisconnect(source: string, target: string) {
@@ -218,12 +293,14 @@ export default function Home() {
   }
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId) ?? null;
+  const hazardCauseIds = new Set(causesEdges.map((e) => e.source));
 
   const displayNodes = nodes.map((node) => ({
     ...node,
     data: {
       ...node.data,
       editable: editMode,
+      hasHazard: hazardCauseIds.has(node.id),
       onRename: (name: string) => handleRename(node.id, name),
     },
   }));
@@ -259,7 +336,10 @@ export default function Home() {
               body: JSON.stringify({ x: node.position.x, y: node.position.y }),
             }).catch((error) => console.error("failed to save node position", error));
           }}
-          onNodeClick={(_event, node) => setSelectedNodeId(node.id)}
+          onNodeClick={(_event, node) => {
+            setSelectedNodeId(node.id);
+            setShowHazardPanel(false);
+          }}
           onPaneClick={() => setSelectedNodeId(null)}
           onConnect={async (connection: Connection) => {
             if (!connection.source || !connection.target) {
@@ -355,6 +435,16 @@ export default function Home() {
                   {(selectedNode.data.active ?? true) ? "Deactivate" : "Reactivate"}
                 </Button>
               )}
+              <Button
+                variant={showHazardPanel ? "primary" : "ghost"}
+                onClick={() => {
+                  setShowHazardPanel((v) => !v);
+                  setSelectedNodeId(null);
+                }}
+                className="!px-2 !py-1 text-xs"
+              >
+                Hazard/Risk
+              </Button>
             </div>
           </GlassPanel>
 
@@ -363,6 +453,18 @@ export default function Home() {
               elementId={selectedNode.id}
               elementLabel={selectedNode.data.label}
               onClose={() => setSelectedNodeId(null)}
+            />
+          )}
+
+          {showHazardPanel && (
+            <HazardRiskPanel
+              nodes={nodes}
+              causesEdges={causesEdges}
+              mitigatedByEdges={mitigatedByEdges}
+              editMode={editMode}
+              onClose={() => setShowHazardPanel(false)}
+              onCreateHazard={handleCreateHazard}
+              onCreateControl={handleCreateControl}
             />
           )}
         </ReactFlow>

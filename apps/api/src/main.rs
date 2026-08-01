@@ -8,7 +8,7 @@ mod import;
 mod store;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -126,6 +126,10 @@ async fn main() -> anyhow::Result<()> {
                 .post(create_contains_edge)
                 .delete(delete_contains_edge),
         )
+        .route(
+            "/api/v0/edges",
+            get(list_edges).post(create_edge).delete(delete_edge),
+        )
         .route("/api/v0/positions", get(list_positions))
         .route("/import/sysml-v2", post(import::sysml_v2::import_sysml_v2))
         .route("/import/reqif", post(import::reqif::import_reqif))
@@ -209,9 +213,13 @@ async fn get_element_body(
 #[derive(Debug, serde::Deserialize)]
 struct CreateElementRequest {
     name: String,
+    /// Defaults to `Structure` when omitted — preserves the existing canvas "+ Add Node" button
+    /// behavior untouched for callers that don't care about kind.
+    #[serde(default)]
+    kind: Option<NodeKind>,
 }
 
-/// Canvas "Add Node" (Edit Mode) — always `kind: Structure`, `active: true`; the server
+/// Canvas "Add Node"/"Add Hazard"/"Add Control" (Edit Mode) — `active: true`; the server
 /// generates the id, so there's no kind-conflict risk (it's always fresh).
 async fn create_element(
     State(state): State<AppState>,
@@ -222,7 +230,7 @@ async fn create_element(
     }
     let element = Element {
         id: uuid::Uuid::new_v4().to_string(),
-        kind: NodeKind::Structure,
+        kind: payload.kind.unwrap_or(NodeKind::Structure),
         name: payload.name,
         active: true,
     };
@@ -307,6 +315,57 @@ async fn delete_contains_edge(
         source: payload.parent,
         target: payload.child,
         kind: EdgeKind::Contains,
+    };
+    state.neo4j.delete_edge(&edge).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EdgeKindQuery {
+    kind: EdgeKind,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateEdgeRequest {
+    source: String,
+    target: String,
+    kind: EdgeKind,
+}
+
+/// Generic edge listing for every kind besides `Contains` (which keeps its own
+/// `/api/v0/contains` route) — e.g. the Hazard/Risk panel's `Causes`/`MitigatedBy` edges.
+async fn list_edges(
+    State(state): State<AppState>,
+    Query(params): Query<EdgeKindQuery>,
+) -> Result<Json<Vec<Edge>>, ApiError> {
+    Ok(Json(state.neo4j.edges_of_kind(params.kind).await?))
+}
+
+/// Generic edge creation — goes through the same validated `Neo4jStore::create_edge` as
+/// `create_contains_edge` (dangling-endpoint rejection, endpoint type-legality, and
+/// containment-acyclicity when `kind` is `Contains`).
+async fn create_edge(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateEdgeRequest>,
+) -> Result<Json<Edge>, ApiError> {
+    let edge = Edge {
+        source: payload.source,
+        target: payload.target,
+        kind: payload.kind,
+    };
+    state.neo4j.create_edge(&edge).await?;
+    Ok(Json(edge))
+}
+
+/// Generic edge removal — no validation gate needed, same reasoning as `delete_contains_edge`.
+async fn delete_edge(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateEdgeRequest>,
+) -> Result<StatusCode, ApiError> {
+    let edge = Edge {
+        source: payload.source,
+        target: payload.target,
+        kind: payload.kind,
     };
     state.neo4j.delete_edge(&edge).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -563,6 +622,86 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "the containment cycle should be rejected");
+    }
+
+    /// T-P1.1-02 against the real store: a `Satisfy` edge must target a Requirement, not a
+    /// Block — Combustor -> Turbine (both Structures) is rejected, with no partial write.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn satisfy_endpoint_rejected_against_neo4j() {
+        let (neo4j, _postgres, _objects) = connect_test_stores().await;
+
+        let combustor = Element {
+            id: "IntegrationTestCombustor".to_string(),
+            kind: NodeKind::Structure,
+            name: "Integration Test Combustor".to_string(),
+            active: true,
+        };
+        let turbine = Element {
+            id: "IntegrationTestSatisfyTurbine".to_string(),
+            kind: NodeKind::Structure,
+            name: "Integration Test Turbine".to_string(),
+            active: true,
+        };
+        neo4j.upsert_element(&combustor).await.unwrap();
+        neo4j.upsert_element(&turbine).await.unwrap();
+
+        let result = neo4j
+            .create_edge(&Edge {
+                source: combustor.id.clone(),
+                target: turbine.id.clone(),
+                kind: EdgeKind::Satisfy,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "Satisfy targeting a Block, not a Requirement, should be rejected"
+        );
+
+        let satisfy_edges = neo4j.edges_of_kind(EdgeKind::Satisfy).await.unwrap();
+        assert!(
+            !satisfy_edges
+                .iter()
+                .any(|e| e.source == combustor.id && e.target == turbine.id),
+            "no partial write: the rejected Satisfy edge must not appear on read-back"
+        );
+    }
+
+    /// An edge referencing a nonexistent element id is rejected outright — it must not silently
+    /// no-op (the underlying Cypher `MATCH` simply matches zero rows and would otherwise report
+    /// success with nothing written).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn dangling_edge_rejected_against_neo4j() {
+        let (neo4j, _postgres, _objects) = connect_test_stores().await;
+
+        let engine = Element {
+            id: "IntegrationTestDanglingEngine".to_string(),
+            kind: NodeKind::Structure,
+            name: "Integration Test Engine".to_string(),
+            active: true,
+        };
+        neo4j.upsert_element(&engine).await.unwrap();
+
+        let result = neo4j
+            .create_edge(&Edge {
+                source: engine.id.clone(),
+                target: "IntegrationTestDoesNotExist".to_string(),
+                kind: EdgeKind::Contains,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "an edge to a nonexistent element must be rejected, not silently no-op"
+        );
+
+        let contains_edges = neo4j.contains_edges().await.unwrap();
+        assert!(
+            !contains_edges
+                .iter()
+                .any(|e| e.source == engine.id && e.target == "IntegrationTestDoesNotExist"),
+            "no partial write: the rejected edge must not appear on read-back"
+        );
     }
 
     /// T-P1.1-04: a large body lives in Postgres, a blob is referenced from the object store by

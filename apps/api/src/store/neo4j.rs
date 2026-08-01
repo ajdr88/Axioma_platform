@@ -123,36 +123,63 @@ impl Neo4jStore {
             .collect())
     }
 
-    /// All existing `Contains` edges — enough to run
-    /// [`sysml_core::would_create_containment_cycle`] without hydrating a full graph.
-    pub async fn contains_edges(&self) -> Result<Vec<Edge>> {
+    /// All existing edges of one kind — enough to run
+    /// [`sysml_core::would_create_containment_cycle`] (for `Contains`) without hydrating a full
+    /// graph, and to list a relationship kind (e.g. `Causes`/`MitigatedBy`) for the API.
+    pub async fn edges_of_kind(&self, kind: EdgeKind) -> Result<Vec<Edge>> {
+        let rel_type = kind.as_rel_type();
+        let cypher = format!("MATCH (a)-[:{rel_type}]->(b) RETURN a.id AS source, b.id AS target");
         let mut result = self
             .conn
-            .execute(query(
-                "MATCH (a)-[:CONTAINS]->(b) RETURN a.id AS source, b.id AS target",
-            ))
+            .execute(query(&cypher))
             .await
-            .context("listing containment edges")?;
+            .with_context(|| format!("listing {rel_type} edges"))?;
 
         let mut edges = Vec::new();
-        while let Some(row) = result
-            .next()
-            .await
-            .context("reading containment edge row")?
-        {
+        while let Some(row) = result.next().await.context("reading edge row")? {
             edges.push(Edge {
                 source: row.get("source").context("missing source")?,
                 target: row.get("target").context("missing target")?,
-                kind: EdgeKind::Contains,
+                kind,
             });
         }
         Ok(edges)
     }
 
+    /// All existing `Contains` edges — enough to run
+    /// [`sysml_core::would_create_containment_cycle`] without hydrating a full graph.
+    pub async fn contains_edges(&self) -> Result<Vec<Edge>> {
+        self.edges_of_kind(EdgeKind::Contains).await
+    }
+
     /// Creates a relationship between two already-`upsert_element`ed nodes, matched by id.
-    /// `Contains` edges are validated against the current containment hierarchy first
-    /// (FR-CORE-05, NFR-REL-02) — every other edge kind is legal to cycle (§5.7/NFR-REL-02).
+    /// Rejects a dangling edge (either endpoint not an existing element, NFR-REL-01) and an
+    /// endpoint-type violation ([`sysml_core::check_relationship_endpoints`], FR-CORE-05) before
+    /// checking containment acyclicity (FR-CORE-05, NFR-REL-02, `Contains`-only) — every other
+    /// edge kind is legal to cycle (§5.7/NFR-REL-02).
     pub async fn create_edge(&self, edge: &Edge) -> Result<()> {
+        let source_el =
+            self.get_element(&edge.source)
+                .await?
+                .ok_or_else(|| ValidationError::DanglingEdge {
+                    edge_kind: edge.kind,
+                    missing_id: edge.source.clone(),
+                })?;
+        let target_el =
+            self.get_element(&edge.target)
+                .await?
+                .ok_or_else(|| ValidationError::DanglingEdge {
+                    edge_kind: edge.kind,
+                    missing_id: edge.target.clone(),
+                })?;
+        sysml_core::check_relationship_endpoints(
+            edge.kind,
+            &edge.source,
+            source_el.kind,
+            &edge.target,
+            target_el.kind,
+        )?;
+
         if edge.kind.is_acyclicity_scoped() {
             let existing = self.contains_edges().await?;
             if sysml_core::would_create_containment_cycle(&existing, &edge.source, &edge.target) {
