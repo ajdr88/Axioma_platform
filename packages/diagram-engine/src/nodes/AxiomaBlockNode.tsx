@@ -103,14 +103,17 @@ export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData })
 
   return (
     <div
-      className={`rounded-xl border bg-obsidian/80 p-0 shadow-2xl backdrop-blur-md ${originBorder[data.origin]} ${isActive ? "" : "opacity-50"}`}
+      className={`h-full w-full overflow-hidden rounded-xl border bg-obsidian/80 p-0 shadow-2xl backdrop-blur-md ${originBorder[data.origin]} ${isActive ? "" : "opacity-50"}`}
     >
       <Handle type="target" position={Position.Top} className={handleClassName} />
 
       <div
         className={`flex items-center gap-2 rounded-t-xl border-b border-white/5 p-3 ${accent?.band ?? "bg-cobalt-glow/10"}`}
       >
-        <span className={`h-2 w-2 rounded-full ${accent?.dot ?? "bg-cobalt-glow"}`} aria-hidden />
+        <span
+          className={`h-2 w-2 flex-shrink-0 rounded-full ${accent?.dot ?? "bg-cobalt-glow"}`}
+          aria-hidden
+        />
         {data.hasHazard && (
           <span
             className="h-2 w-2 rounded-full bg-alert"
@@ -134,12 +137,13 @@ export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData })
             }}
             onMouseDown={(event) => event.stopPropagation()}
             onClick={(event) => event.stopPropagation()}
-            className="w-full rounded border border-cobalt-glow/40 bg-obsidian px-1 text-sm font-semibold text-white/90 outline-none"
+            className="min-w-0 flex-1 rounded border border-cobalt-glow/40 bg-obsidian px-1 text-sm font-semibold text-white/90 outline-none"
           />
         ) : (
           <button
             type="button"
-            className="cursor-default bg-transparent p-0 text-left text-sm font-semibold text-white/90"
+            title={data.label}
+            className="min-w-0 flex-1 truncate cursor-default bg-transparent p-0 text-left text-sm font-semibold text-white/90"
             onDoubleClick={(event) => {
               event.stopPropagation();
               startRename();

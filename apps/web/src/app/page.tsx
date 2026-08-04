@@ -3,8 +3,10 @@
 import {
   type AxiomaBlockData,
   type AxiomaEdgeData,
-  computeGridLayout,
+  computeElkLayout,
   edgeTypes,
+  NODE_HEIGHT,
+  NODE_WIDTH,
   nodeTypes,
 } from "@axioma/diagram-engine";
 import type {
@@ -49,6 +51,11 @@ function toFlowNode(
     id: element.id,
     type: "axiomaBlock",
     position,
+    // Fixed footprint (matches AxiomaBlockNode's actual rendered size, see dimensions.ts) — ELK
+    // auto-layout computes overlap-avoidance against this same box, so it must stay equal to
+    // what's really on screen.
+    width: NODE_WIDTH,
+    height: NODE_HEIGHT,
     data: {
       label: element.name,
       kind: element.kind,
@@ -152,13 +159,14 @@ export default function Home() {
         const storedPositions = new Map(
           positionEntries.map((p) => [p.elementId, { x: p.x, y: p.y }]),
         );
-        const gridPositions = computeGridLayout(elements, contains);
+        const allEdgePairs = [...contains, ...causes, ...mitigatedBy, ...concerns];
+        const elkPositions = await computeElkLayout(elements, allEdgePairs);
 
         setNodes(
           elements.map((element) =>
             toFlowNode(
               element,
-              storedPositions.get(element.id) ?? gridPositions.get(element.id) ?? { x: 0, y: 0 },
+              storedPositions.get(element.id) ?? elkPositions.get(element.id) ?? { x: 0, y: 0 },
             ),
           ),
         );
@@ -374,6 +382,41 @@ export default function Home() {
     );
   }
 
+  /** "Auto-Layout" toolbar button (T-P1.2-03) — recomputes ELK layout over every currently
+   * loaded node and edge (any kind), applies the new positions, and persists each one through
+   * the same `PATCH .../position` path drag-to-move already uses. */
+  async function handleAutoLayout() {
+    const allEdgePairs = [
+      ...edges.map((e) => ({ source: e.source, target: e.target })),
+      ...causesEdges,
+      ...mitigatedByEdges,
+      ...concernsEdges,
+    ];
+    const positions = await computeElkLayout(
+      nodes.map((n) => ({ id: n.id })),
+      allEdgePairs,
+    );
+    setNodes((nds) =>
+      nds.map((n) => {
+        const position = positions.get(n.id);
+        return position ? { ...n, position } : n;
+      }),
+    );
+    await Promise.all(
+      nodes.map((n) => {
+        const position = positions.get(n.id);
+        if (!position) {
+          return Promise.resolve();
+        }
+        return fetch(`/api/elements/${n.id}/position`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(position),
+        });
+      }),
+    );
+  }
+
   const selectedNode = nodes.find((n) => n.id === selectedNodeId) ?? null;
   const hazardCauseIds = new Set(causesEdges.map((e) => e.source));
   const visibleNodes =
@@ -523,6 +566,11 @@ export default function Home() {
               {editMode && (
                 <Button variant="ghost" onClick={handleAddNode} className="!px-2 !py-1 text-xs">
                   + Add Node
+                </Button>
+              )}
+              {editMode && (
+                <Button variant="ghost" onClick={handleAutoLayout} className="!px-2 !py-1 text-xs">
+                  Auto-Layout
                 </Button>
               )}
               {editMode && selectedNode && (

@@ -1,9 +1,10 @@
 import { AxiomaEdge } from "./edges/AxiomaEdge";
 import { AxiomaBlockNode } from "./nodes/AxiomaBlockNode";
 
+export { NODE_HEIGHT, NODE_WIDTH } from "./dimensions";
 export type { AxiomaEdgeData } from "./edges/AxiomaEdge";
 export { AxiomaEdge } from "./edges/AxiomaEdge";
-export { computeGridLayout } from "./layout";
+export { computeElkLayout } from "./layout";
 export type {
   AxiomaBlockData,
   AxiomaBlockProperty,

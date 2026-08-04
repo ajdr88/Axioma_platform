@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@axioma/shared-types": "workspace:*",
-    "@xyflow/react": "^12.11.2"
+    "@xyflow/react": "^12.11.2",
+    "elkjs": "^0.9.3"
   },
   "peerDependencies": {
     "react": "^19.0.0"
