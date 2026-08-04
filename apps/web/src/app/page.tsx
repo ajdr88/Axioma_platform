@@ -3,6 +3,7 @@
 import {
   type AxiomaBlockData,
   type AxiomaEdgeData,
+  computeClusteredNodes,
   computeElkLayout,
   edgeTypes,
   NODE_HEIGHT,
@@ -24,13 +25,18 @@ import {
   Controls,
   type Edge as FlowEdge,
   type Node as FlowNode,
+  type OnEdgesChange,
+  type OnNodesChange,
   ReactFlow,
   ReactFlowProvider,
+  type Rect,
   reconnectEdge,
   useEdgesState,
   useNodesState,
+  useOnViewportChange,
+  useReactFlow,
 } from "@xyflow/react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ElementInspector } from "@/components/ElementInspector";
 import { HazardRiskPanel } from "@/components/HazardRiskPanel";
 import { MissionPlanningPanel } from "@/components/MissionPlanningPanel";
@@ -418,33 +424,217 @@ export default function Home() {
   }
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId) ?? null;
-  const hazardCauseIds = new Set(causesEdges.map((e) => e.source));
-  const visibleNodes =
-    originFilter === "all" ? nodes : nodes.filter((n) => n.data.origin === originFilter);
 
-  const displayNodes = visibleNodes.map((node) => ({
-    ...node,
-    data: {
-      ...node.data,
-      editable: editMode,
-      hasHazard: hazardCauseIds.has(node.id),
-      onRename: (name: string) => handleRename(node.id, name),
-      // Clears the one-shot autoFocusRename flag from persisted state right after it's consumed
-      // — see AxiomaBlockNode's doc comment. Without this, a later remount of this same node
-      // (e.g. it gets filtered out of the canvas by the origin filter and back in) would
-      // re-enter rename mode from a stale `true` flag.
-      onAutoFocusRenameConsumed: () => {
-        setNodes((nds) =>
-          nds.map((n) =>
-            n.id === node.id ? { ...n, data: { ...n.data, autoFocusRename: false } } : n,
-          ),
-        );
-      },
+  return (
+    // `Canvas` needs `useOnViewportChange`/`useReactFlow` (NFR-PERF-01 canvas virtualization —
+    // `fitView`/`fitBounds` move the viewport WITHOUT firing `onMove`/`onMoveEnd`, so those
+    // props alone can't track the real transform; a real bug hit and fixed during this work),
+    // both of which require being a descendant of `ReactFlowProvider`, hence this split.
+    <ReactFlowProvider>
+      <Canvas
+        status={status}
+        errorMessage={errorMessage}
+        notice={notice}
+        editMode={editMode}
+        setEditMode={setEditMode}
+        selectedNode={selectedNode}
+        setSelectedNodeId={setSelectedNodeId}
+        showHazardPanel={showHazardPanel}
+        setShowHazardPanel={setShowHazardPanel}
+        showMissionPanel={showMissionPanel}
+        setShowMissionPanel={setShowMissionPanel}
+        originFilter={originFilter}
+        setOriginFilter={setOriginFilter}
+        nodes={nodes}
+        setNodes={setNodes}
+        onNodesChange={onNodesChange}
+        edges={edges}
+        setEdges={setEdges}
+        onEdgesChange={onEdgesChange}
+        showNotice={showNotice}
+        causesEdges={causesEdges}
+        mitigatedByEdges={mitigatedByEdges}
+        concernsEdges={concernsEdges}
+        handleRename={handleRename}
+        handleAddNode={handleAddNode}
+        handleAutoLayout={handleAutoLayout}
+        handleToggleActive={handleToggleActive}
+        handleSetOrigin={handleSetOrigin}
+        handleDisconnect={handleDisconnect}
+        handleCreateHazard={handleCreateHazard}
+        handleCreateControl={handleCreateControl}
+        handleCreateMission={handleCreateMission}
+        handleCreateStakeholder={handleCreateStakeholder}
+      />
+    </ReactFlowProvider>
+  );
+}
+
+interface CanvasProps {
+  status: LoadStatus;
+  errorMessage: string;
+  notice: string | null;
+  editMode: boolean;
+  setEditMode: React.Dispatch<React.SetStateAction<boolean>>;
+  selectedNode: FlowNode<AxiomaBlockData> | null;
+  setSelectedNodeId: (id: string | null) => void;
+  showHazardPanel: boolean;
+  setShowHazardPanel: React.Dispatch<React.SetStateAction<boolean>>;
+  showMissionPanel: boolean;
+  setShowMissionPanel: React.Dispatch<React.SetStateAction<boolean>>;
+  originFilter: Origin | "all";
+  setOriginFilter: (filter: Origin | "all") => void;
+  nodes: FlowNode<AxiomaBlockData>[];
+  setNodes: (updater: (nds: FlowNode<AxiomaBlockData>[]) => FlowNode<AxiomaBlockData>[]) => void;
+  onNodesChange: OnNodesChange<FlowNode<AxiomaBlockData>>;
+  edges: FlowEdge<AxiomaEdgeData>[];
+  setEdges: (updater: (eds: FlowEdge<AxiomaEdgeData>[]) => FlowEdge<AxiomaEdgeData>[]) => void;
+  onEdgesChange: OnEdgesChange<FlowEdge<AxiomaEdgeData>>;
+  showNotice: (message: string) => void;
+  causesEdges: ApiEdge[];
+  mitigatedByEdges: ApiEdge[];
+  concernsEdges: ApiEdge[];
+  handleRename: (nodeId: string, name: string) => Promise<void>;
+  handleAddNode: () => Promise<void>;
+  handleAutoLayout: () => Promise<void>;
+  handleToggleActive: (node: FlowNode<AxiomaBlockData>) => Promise<void>;
+  handleSetOrigin: (node: FlowNode<AxiomaBlockData>, origin: Origin) => Promise<void>;
+  handleDisconnect: (source: string, target: string) => Promise<void>;
+  handleCreateHazard: (name: string, causingStructureId: string) => Promise<void>;
+  handleCreateControl: (hazardId: string, name: string) => Promise<void>;
+  handleCreateMission: (name: string) => Promise<void>;
+  handleCreateStakeholder: (
+    name: string,
+    concern: string,
+    missionId: string,
+    requirementId: string,
+  ) => Promise<void>;
+}
+
+function Canvas({
+  status,
+  errorMessage,
+  notice,
+  editMode,
+  setEditMode,
+  selectedNode,
+  setSelectedNodeId,
+  showHazardPanel,
+  setShowHazardPanel,
+  showMissionPanel,
+  setShowMissionPanel,
+  originFilter,
+  setOriginFilter,
+  nodes,
+  setNodes,
+  onNodesChange,
+  edges,
+  setEdges,
+  onEdgesChange,
+  showNotice,
+  causesEdges,
+  mitigatedByEdges,
+  concernsEdges,
+  handleRename,
+  handleAddNode,
+  handleAutoLayout,
+  handleToggleActive,
+  handleSetOrigin,
+  handleDisconnect,
+  handleCreateHazard,
+  handleCreateControl,
+  handleCreateMission,
+  handleCreateStakeholder,
+}: CanvasProps) {
+  const canvasWrapperRef = useRef<HTMLDivElement>(null);
+  const reactFlowInstance = useReactFlow<FlowNode<AxiomaBlockData>, FlowEdge<AxiomaEdgeData>>();
+  /** NFR-PERF-01 / T-P1.2-02 canvas virtualization — tracks the real current pan/zoom, including
+   * programmatic changes (`fitView` on mount, `fitBounds` on cluster-expand), so
+   * `computeClusteredNodes` always sees the transform actually on screen. */
+  const [viewport, setViewport] = useState({ x: 0, y: 0, zoom: 1 });
+  useOnViewportChange({
+    onChange: (v) => setViewport(v),
+  });
+
+  /** Pans/zooms to a clicked cluster's bounding box, bringing it on-screen so the next
+   * viewport-intersection check un-clusters it back into real nodes. */
+  const handleExpandSubsystem = useCallback(
+    (bbox: Rect) => {
+      reactFlowInstance.fitBounds(bbox, { padding: 0.2, duration: 300 });
     },
-  }));
+    [reactFlowInstance],
+  );
 
-  const visibleNodeIds = new Set(visibleNodes.map((n) => n.id));
-  const displayEdges = edges
+  const hazardCauseIds = new Set(causesEdges.map((e) => e.source));
+  const realNodeIds = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes]);
+  const visibleNodes = useMemo(
+    () => (originFilter === "all" ? nodes : nodes.filter((n) => n.data.origin === originFilter)),
+    [nodes, originFilter],
+  );
+
+  const viewportBounds: Rect = useMemo(
+    () => ({
+      x: -viewport.x / viewport.zoom,
+      y: -viewport.y / viewport.zoom,
+      width: (canvasWrapperRef.current?.clientWidth ?? 1) / viewport.zoom,
+      height: (canvasWrapperRef.current?.clientHeight ?? 1) / viewport.zoom,
+    }),
+    [viewport],
+  );
+
+  // Real dependencies only — `computeClusteredNodes` builds fresh node/data objects for every
+  // off-screen subsystem's cluster, so without memoization those objects get new identity on
+  // every render even when nothing relevant changed. React Flow treats that as new nodes and
+  // remounts them, which re-triggers dimension measurement, which (via `onNodesChange`) sets
+  // state again and forces another render — an infinite loop discovered via a real DOM
+  // mutation-observer check during this work (a genuine bug, not just a perf nice-to-have).
+  const containsEdgesForClustering = useMemo(
+    () => edges.map((e) => ({ source: e.source, target: e.target })),
+    [edges],
+  );
+  const clusteredNodes = useMemo(
+    () =>
+      computeClusteredNodes(
+        visibleNodes,
+        containsEdgesForClustering,
+        viewportBounds,
+        handleExpandSubsystem,
+      ),
+    [visibleNodes, containsEdgesForClustering, viewportBounds, handleExpandSubsystem],
+  );
+
+  const displayNodes = clusteredNodes.map((node) => {
+    if (node.type === "subsystemCluster") {
+      return node;
+    }
+    return {
+      ...node,
+      data: {
+        ...node.data,
+        editable: editMode,
+        hasHazard: hazardCauseIds.has(node.id),
+        onRename: (name: string) => handleRename(node.id, name),
+        // Clears the one-shot autoFocusRename flag from persisted state right after it's
+        // consumed — see AxiomaBlockNode's doc comment. Without this, a later remount of this
+        // same node (e.g. it gets filtered out of the canvas by the origin filter, or clustered
+        // away and back, and back in) would re-enter rename mode from a stale `true` flag.
+        onAutoFocusRenameConsumed: () => {
+          setNodes((nds) =>
+            nds.map((n) =>
+              n.id === node.id ? { ...n, data: { ...n.data, autoFocusRename: false } } : n,
+            ),
+          );
+        },
+      },
+    };
+  });
+
+  // Edges to/from a clustered-away node are hidden entirely, not rerouted to its cluster — the
+  // cluster is a summary, not a real graph endpoint.
+  const visibleNodeIds = new Set(
+    clusteredNodes.filter((n) => n.type !== "subsystemCluster").map((n) => n.id),
+  );
+  const displayEdges: FlowEdge<AxiomaEdgeData>[] = edges
     .filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target))
     .map((edge) => ({
       ...edge,
@@ -456,212 +646,244 @@ export default function Home() {
     }));
 
   return (
-    <div className="h-screen w-screen">
-      <ReactFlowProvider>
-        <ReactFlow
-          nodes={displayNodes}
-          edges={displayEdges}
-          nodeTypes={nodeTypes}
-          edgeTypes={edgeTypes}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          nodesDraggable={editMode}
-          nodesConnectable={editMode}
-          edgesReconnectable={editMode}
-          connectionRadius={40} // more forgiving than the 20px default — see the plan's Context.
-          deleteKeyCode={null} // Node delete is out of scope — disconnect uses the edge's own button.
-          onNodeDragStop={(_event, node) => {
-            fetch(`/api/elements/${node.id}/position`, {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ x: node.position.x, y: node.position.y }),
-            }).catch((error) => console.error("failed to save node position", error));
-          }}
-          onNodeClick={(_event, node) => {
-            setSelectedNodeId(node.id);
-            setShowHazardPanel(false);
-            setShowMissionPanel(false);
-          }}
-          onPaneClick={() => setSelectedNodeId(null)}
-          onConnect={async (connection: Connection) => {
-            if (!connection.source || !connection.target) {
-              return;
-            }
-            const res = await fetch("/api/contains", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ parent: connection.source, child: connection.target }),
-            });
-            if (!res.ok) {
-              showNotice(await readErrorMessage(res));
-              return;
-            }
-            setEdges((eds) =>
-              addEdge(
-                { ...connection, type: "axiomaEdge", style: { stroke: "#7C7C86" } },
-                eds,
-                // Match toFlowEdge's id convention — addEdge defaults to its own "xy-edge__..."
-                // format, which would otherwise make a freshly-connected edge's id inconsistent
-                // with the same edge's id after a reload.
-                { getEdgeId },
-              ),
-            );
-          }}
-          onReconnect={async (oldEdge, newConnection) => {
-            if (!newConnection.source || !newConnection.target) {
-              return;
-            }
-            // Create the new edge first, through the same validated path a fresh connect uses —
-            // a reconnect that would cycle is rejected exactly like one, leaving the old edge
-            // untouched rather than half-changed.
-            const createRes = await fetch("/api/contains", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ parent: newConnection.source, child: newConnection.target }),
-            });
-            if (!createRes.ok) {
-              showNotice(await readErrorMessage(createRes));
-              return;
-            }
-            await fetch("/api/contains", {
-              method: "DELETE",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ parent: oldEdge.source, child: oldEdge.target }),
-            });
-            setEdges((eds) => reconnectEdge(oldEdge, newConnection, eds, { getEdgeId }));
-          }}
-          fitView
-          proOptions={{ hideAttribution: true }}
-        >
-          <Background variant={BackgroundVariant.Dots} color="#7C7C86" gap={24} size={1} />
-          <Controls className="!bg-obsidian/80 !border-white/10 [&_button]:!bg-transparent [&_button]:!fill-white/70 [&_button]:!border-white/10" />
+    <div className="h-screen w-screen" ref={canvasWrapperRef}>
+      <ReactFlow
+        // `displayNodes` is a runtime union of AxiomaBlockData and SubsystemClusterData nodes
+        // (each correctly rendered per `nodeTypes`' `type` discriminant) — React Flow's own
+        // generics assume one node-data type per instance, so the two are reconciled here
+        // rather than trying to force a single generic across genuinely different node shapes.
+        nodes={displayNodes as FlowNode<AxiomaBlockData>[]}
+        edges={displayEdges}
+        nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
+        // Synthetic `subsystemCluster` nodes aren't in `nodes` state — React Flow still measures
+        // and reports dimension-change events for them (they're real rendered nodes from its
+        // point of view). `useNodesState`'s `onNodesChange` calls `setNodes` unconditionally,
+        // even for a changes array that ends up empty after filtering to known ids — a new (if
+        // content-equal) array reference still re-renders `Canvas`, which rebuilds the cluster
+        // node objects fresh, which get remeasured, which fires the change again: an infinite
+        // loop, confirmed via a DOM mutation-observer check (~40 remounts/sec) during this work.
+        // Filtering to real-node ids AND skipping the call entirely when nothing real remains
+        // breaks the cycle at its source.
+        onNodesChange={(changes) => {
+          const filtered = changes.filter((c) => !("id" in c) || realNodeIds.has(c.id));
+          if (filtered.length > 0) {
+            onNodesChange(filtered);
+          }
+        }}
+        onEdgesChange={onEdgesChange}
+        // Deliberately NOT using React Flow's `onlyRenderVisibleElements` here: it DOM-culls
+        // strictly by exact pixel-viewport intersection with no margin (confirmed in
+        // `@xyflow/system`'s `getNodesInside`), and applies uniformly to every node — including
+        // `subsystemCluster` placeholders. Since a cluster's whole purpose is representing a
+        // subsystem that's off-screen, its own position is (by construction) usually outside the
+        // exact viewport too, so this prop would silently hide the very placeholder a user needs
+        // to click to navigate back to it, breaking `SubsystemClusterNode`'s click-to-expand.
+        // `computeClusteredNodes` is the real render-count lever for NFR-PERF-01 (shrinks the
+        // array itself, not just what's painted from it) — sufficient on its own.
+        nodesDraggable={editMode}
+        nodesConnectable={editMode}
+        edgesReconnectable={editMode}
+        connectionRadius={40} // more forgiving than the 20px default — see the plan's Context.
+        deleteKeyCode={null} // Node delete is out of scope — disconnect uses the edge's own button.
+        onNodeDragStop={(_event, node) => {
+          fetch(`/api/elements/${node.id}/position`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ x: node.position.x, y: node.position.y }),
+          }).catch((error) => console.error("failed to save node position", error));
+        }}
+        onNodeClick={(_event, node) => {
+          setSelectedNodeId(node.id);
+          setShowHazardPanel(false);
+          setShowMissionPanel(false);
+        }}
+        onPaneClick={() => setSelectedNodeId(null)}
+        onConnect={async (connection: Connection) => {
+          if (!connection.source || !connection.target) {
+            return;
+          }
+          const res = await fetch("/api/contains", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ parent: connection.source, child: connection.target }),
+          });
+          if (!res.ok) {
+            showNotice(await readErrorMessage(res));
+            return;
+          }
+          setEdges((eds) =>
+            addEdge(
+              { ...connection, type: "axiomaEdge", style: { stroke: "#7C7C86" } },
+              eds,
+              // Match toFlowEdge's id convention — addEdge defaults to its own "xy-edge__..."
+              // format, which would otherwise make a freshly-connected edge's id inconsistent
+              // with the same edge's id after a reload.
+              { getEdgeId },
+            ),
+          );
+        }}
+        onReconnect={async (oldEdge, newConnection) => {
+          if (!newConnection.source || !newConnection.target) {
+            return;
+          }
+          // Create the new edge first, through the same validated path a fresh connect uses —
+          // a reconnect that would cycle is rejected exactly like one, leaving the old edge
+          // untouched rather than half-changed.
+          const createRes = await fetch("/api/contains", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ parent: newConnection.source, child: newConnection.target }),
+          });
+          if (!createRes.ok) {
+            showNotice(await readErrorMessage(createRes));
+            return;
+          }
+          await fetch("/api/contains", {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ parent: oldEdge.source, child: oldEdge.target }),
+          });
+          setEdges((eds) => reconnectEdge(oldEdge, newConnection, eds, { getEdgeId }));
+        }}
+        fitView
+        // React Flow's default `minZoom` (0.5) caps the maximum flow-area a viewport can ever
+        // show to 2x its pixel size — nowhere near enough to fit the NFR-PERF-01 target of
+        // 10,000+ simultaneously-visible elements (confirmed via the large-fixture test during
+        // this work: even after 30 zoom-out ticks, the transform never moved past scale 0.5).
+        // Lower enough to comfortably fit a dense 10,000-element region at a real ELK-scale
+        // layout density.
+        minZoom={0.01}
+        proOptions={{ hideAttribution: true }}
+      >
+        <Background variant={BackgroundVariant.Dots} color="#7C7C86" gap={24} size={1} />
+        <Controls className="!bg-obsidian/80 !border-white/10 [&_button]:!bg-transparent [&_button]:!fill-white/70 [&_button]:!border-white/10" />
 
-          <GlassPanel className="absolute left-4 top-4 z-10 w-64 px-4 py-3">
-            <p className="text-sm font-semibold tracking-[0.2em] text-white/90">AXIOMA</p>
-            {status === "loading" && (
-              <p className="mt-0.5 font-mono text-[10px] uppercase tracking-widest text-white/40">
-                Loading model…
-              </p>
-            )}
-            {status === "error" && (
-              <p className="mt-0.5 font-mono text-[10px] uppercase tracking-widest text-alert">
-                {errorMessage}
-              </p>
-            )}
-            {status === "ready" && (
-              <p className="mt-0.5 font-mono text-[10px] uppercase tracking-widest text-white/40">
-                {nodes.length} elements &middot; {edges.length} containment edges
-              </p>
-            )}
-            {notice && <p className="mt-2 text-xs text-alert">{notice}</p>}
+        <GlassPanel className="absolute left-4 top-4 z-10 w-64 px-4 py-3">
+          <p className="text-sm font-semibold tracking-[0.2em] text-white/90">AXIOMA</p>
+          {status === "loading" && (
+            <p className="mt-0.5 font-mono text-[10px] uppercase tracking-widest text-white/40">
+              Loading model…
+            </p>
+          )}
+          {status === "error" && (
+            <p className="mt-0.5 font-mono text-[10px] uppercase tracking-widest text-alert">
+              {errorMessage}
+            </p>
+          )}
+          {status === "ready" && (
+            <p className="mt-0.5 font-mono text-[10px] uppercase tracking-widest text-white/40">
+              {nodes.length} elements &middot; {edges.length} containment edges
+            </p>
+          )}
+          {notice && <p className="mt-2 text-xs text-alert">{notice}</p>}
 
-            <div className="mt-3 flex flex-wrap gap-1.5">
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            <Button
+              variant={editMode ? "primary" : "ghost"}
+              onClick={() => setEditMode((v) => !v)}
+              className="!px-2 !py-1 text-xs"
+            >
+              Edit Mode: {editMode ? "On" : "Off"}
+            </Button>
+            {editMode && (
+              <Button variant="ghost" onClick={handleAddNode} className="!px-2 !py-1 text-xs">
+                + Add Node
+              </Button>
+            )}
+            {editMode && (
+              <Button variant="ghost" onClick={handleAutoLayout} className="!px-2 !py-1 text-xs">
+                Auto-Layout
+              </Button>
+            )}
+            {editMode && selectedNode && (
               <Button
-                variant={editMode ? "primary" : "ghost"}
-                onClick={() => setEditMode((v) => !v)}
+                variant="ghost"
+                onClick={() => handleToggleActive(selectedNode)}
                 className="!px-2 !py-1 text-xs"
               >
-                Edit Mode: {editMode ? "On" : "Off"}
+                {(selectedNode.data.active ?? true) ? "Deactivate" : "Reactivate"}
               </Button>
-              {editMode && (
-                <Button variant="ghost" onClick={handleAddNode} className="!px-2 !py-1 text-xs">
-                  + Add Node
-                </Button>
-              )}
-              {editMode && (
-                <Button variant="ghost" onClick={handleAutoLayout} className="!px-2 !py-1 text-xs">
-                  Auto-Layout
-                </Button>
-              )}
-              {editMode && selectedNode && (
-                <Button
-                  variant="ghost"
-                  onClick={() => handleToggleActive(selectedNode)}
-                  className="!px-2 !py-1 text-xs"
-                >
-                  {(selectedNode.data.active ?? true) ? "Deactivate" : "Reactivate"}
-                </Button>
-              )}
-              {editMode && selectedNode && (
-                <select
-                  id="origin-picker"
-                  value={selectedNode.data.origin}
-                  onChange={(event) => handleSetOrigin(selectedNode, event.target.value as Origin)}
-                  className="rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
-                >
-                  <option value="Human">Human</option>
-                  <option value="AiSuggested">AI-suggested</option>
-                  <option value="AiAutoMerged">AI-auto-merged</option>
-                </select>
-              )}
+            )}
+            {editMode && selectedNode && (
               <select
-                id="origin-filter"
-                value={originFilter}
-                onChange={(event) => setOriginFilter(event.target.value as Origin | "all")}
+                id="origin-picker"
+                value={selectedNode.data.origin}
+                onChange={(event) => handleSetOrigin(selectedNode, event.target.value as Origin)}
                 className="rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
               >
-                <option value="all">All origins</option>
-                <option value="Human">Human only</option>
-                <option value="AiSuggested">AI-suggested only</option>
-                <option value="AiAutoMerged">AI-auto-merged only</option>
+                <option value="Human">Human</option>
+                <option value="AiSuggested">AI-suggested</option>
+                <option value="AiAutoMerged">AI-auto-merged</option>
               </select>
-              <Button
-                variant={showHazardPanel ? "primary" : "ghost"}
-                onClick={() => {
-                  setShowHazardPanel((v) => !v);
-                  setShowMissionPanel(false);
-                  setSelectedNodeId(null);
-                }}
-                className="!px-2 !py-1 text-xs"
-              >
-                Hazard/Risk
-              </Button>
-              <Button
-                variant={showMissionPanel ? "primary" : "ghost"}
-                onClick={() => {
-                  setShowMissionPanel((v) => !v);
-                  setShowHazardPanel(false);
-                  setSelectedNodeId(null);
-                }}
-                className="!px-2 !py-1 text-xs"
-              >
-                Mission Planning
-              </Button>
-            </div>
-          </GlassPanel>
+            )}
+            <select
+              id="origin-filter"
+              value={originFilter}
+              onChange={(event) => setOriginFilter(event.target.value as Origin | "all")}
+              className="rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
+            >
+              <option value="all">All origins</option>
+              <option value="Human">Human only</option>
+              <option value="AiSuggested">AI-suggested only</option>
+              <option value="AiAutoMerged">AI-auto-merged only</option>
+            </select>
+            <Button
+              variant={showHazardPanel ? "primary" : "ghost"}
+              onClick={() => {
+                setShowHazardPanel((v) => !v);
+                setShowMissionPanel(false);
+                setSelectedNodeId(null);
+              }}
+              className="!px-2 !py-1 text-xs"
+            >
+              Hazard/Risk
+            </Button>
+            <Button
+              variant={showMissionPanel ? "primary" : "ghost"}
+              onClick={() => {
+                setShowMissionPanel((v) => !v);
+                setShowHazardPanel(false);
+                setSelectedNodeId(null);
+              }}
+              className="!px-2 !py-1 text-xs"
+            >
+              Mission Planning
+            </Button>
+          </div>
+        </GlassPanel>
 
-          {selectedNode && (
-            <ElementInspector
-              elementId={selectedNode.id}
-              elementLabel={selectedNode.data.label}
-              onClose={() => setSelectedNodeId(null)}
-            />
-          )}
+        {selectedNode && (
+          <ElementInspector
+            elementId={selectedNode.id}
+            elementLabel={selectedNode.data.label}
+            onClose={() => setSelectedNodeId(null)}
+          />
+        )}
 
-          {showHazardPanel && (
-            <HazardRiskPanel
-              nodes={nodes}
-              causesEdges={causesEdges}
-              mitigatedByEdges={mitigatedByEdges}
-              editMode={editMode}
-              onClose={() => setShowHazardPanel(false)}
-              onCreateHazard={handleCreateHazard}
-              onCreateControl={handleCreateControl}
-            />
-          )}
+        {showHazardPanel && (
+          <HazardRiskPanel
+            nodes={nodes}
+            causesEdges={causesEdges}
+            mitigatedByEdges={mitigatedByEdges}
+            editMode={editMode}
+            onClose={() => setShowHazardPanel(false)}
+            onCreateHazard={handleCreateHazard}
+            onCreateControl={handleCreateControl}
+          />
+        )}
 
-          {showMissionPanel && (
-            <MissionPlanningPanel
-              nodes={nodes}
-              concernsEdges={concernsEdges}
-              editMode={editMode}
-              onClose={() => setShowMissionPanel(false)}
-              onCreateMission={handleCreateMission}
-              onCreateStakeholder={handleCreateStakeholder}
-            />
-          )}
-        </ReactFlow>
-      </ReactFlowProvider>
+        {showMissionPanel && (
+          <MissionPlanningPanel
+            nodes={nodes}
+            concernsEdges={concernsEdges}
+            editMode={editMode}
+            onClose={() => setShowMissionPanel(false)}
+            onCreateMission={handleCreateMission}
+            onCreateStakeholder={handleCreateStakeholder}
+          />
+        )}
+      </ReactFlow>
     </div>
   );
 }
