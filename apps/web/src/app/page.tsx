@@ -60,6 +60,17 @@ interface PositionEntry {
   y: number;
 }
 
+interface Project {
+  id: string;
+  name: string;
+}
+
+/** Every read/write in this file is scoped to the current project (roadmap: Git-backed model
+ * versioning) — `/api/projects/:projectId/...` mirrors `apps/api`'s own route restructuring. */
+function apiPath(projectId: string, path: string): string {
+  return `/api/projects/${projectId}${path}`;
+}
+
 function toFlowNode(
   element: ApiElement,
   position: { x: number; y: number },
@@ -126,6 +137,12 @@ export default function Home() {
   /** FR-CORE-08 / T-P1.2-06's "AI-suggested only" filter — "all" shows every origin. */
   const [originFilter, setOriginFilter] = useState<Origin | "all">("all");
 
+  /** Roadmap: Git-backed model versioning — every read/write is scoped to one project. Defaults
+   * to the first project returned by `/api/projects` (the seeded "Turbofan Reference" one on a
+   * fresh install); switching projects re-runs the load effect below from scratch. */
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectId, setProjectId] = useState<string | null>(null);
+
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode<AxiomaBlockData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge<AxiomaEdgeData>>([]);
   /** source=Structure, target=Hazard (FR-SAFE-01) — read by the hazard-indicator badge and the
@@ -140,16 +157,57 @@ export default function Home() {
   useEffect(() => {
     let cancelled = false;
 
+    async function loadProjects() {
+      try {
+        const res = await fetch("/api/projects");
+        if (!res.ok) {
+          throw new Error(await readErrorMessage(res));
+        }
+        const list: Project[] = await res.json();
+        if (cancelled) {
+          return;
+        }
+        setProjects(list);
+        if (list.length > 0) {
+          setProjectId(list[0].id);
+        } else {
+          setErrorMessage("No projects exist yet.");
+          setStatus("error");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setErrorMessage(error instanceof Error ? error.message : "failed to load projects");
+          setStatus("error");
+        }
+      }
+    }
+
+    loadProjects();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!projectId) {
+      return;
+    }
+    // Captured as its own const so the closure below keeps TypeScript's non-null narrowing —
+    // `projectId` itself is still `string | null` from the effect's own perspective.
+    const currentProjectId = projectId;
+    let cancelled = false;
+
     async function load() {
+      setStatus("loading");
       try {
         const [elementsRes, containsRes, positionsRes, causesRes, mitigatedByRes, concernsRes] =
           await Promise.all([
-            fetch("/api/elements"),
-            fetch("/api/contains"),
-            fetch("/api/positions"),
-            fetch("/api/edges?kind=Causes"),
-            fetch("/api/edges?kind=MitigatedBy"),
-            fetch("/api/edges?kind=Concerns"),
+            fetch(apiPath(currentProjectId, "/elements")),
+            fetch(apiPath(currentProjectId, "/contains")),
+            fetch(apiPath(currentProjectId, "/positions")),
+            fetch(apiPath(currentProjectId, "/edges?kind=Causes")),
+            fetch(apiPath(currentProjectId, "/edges?kind=MitigatedBy")),
+            fetch(apiPath(currentProjectId, "/edges?kind=Concerns")),
           ]);
         for (const res of [
           elementsRes,
@@ -205,8 +263,9 @@ export default function Home() {
       cancelled = true;
     };
     // setNodes/setEdges (from useNodesState/useEdgesState) are stable across renders — safe to
-    // list without turning this into a run-on-every-render effect.
-  }, [setNodes, setEdges]);
+    // list without turning this into a run-on-every-render effect. `projectId` is the real
+    // trigger — switching projects re-runs this from scratch.
+  }, [projectId, setNodes, setEdges]);
 
   function showNotice(message: string) {
     setNotice(message);
@@ -214,7 +273,10 @@ export default function Home() {
   }
 
   async function handleRename(nodeId: string, name: string) {
-    const res = await fetch(`/api/elements/${nodeId}`, {
+    if (!projectId) {
+      return;
+    }
+    const res = await fetch(apiPath(projectId, `/elements/${nodeId}`), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
@@ -235,7 +297,10 @@ export default function Home() {
     name: string,
     kind: NodeKind,
   ): Promise<FlowNode<AxiomaBlockData> | null> {
-    const res = await fetch("/api/elements", {
+    if (!projectId) {
+      return null;
+    }
+    const res = await fetch(apiPath(projectId, "/elements"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, kind }),
@@ -246,7 +311,7 @@ export default function Home() {
     }
     const element: ApiElement = await res.json();
     const position = { x: 40 + Math.random() * 80, y: 40 + Math.random() * 80 };
-    await fetch(`/api/elements/${element.id}/position`, {
+    await fetch(apiPath(projectId, `/elements/${element.id}/position`), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(position),
@@ -271,10 +336,10 @@ export default function Home() {
    * subsystem via a validated `Causes` edge (FR-SAFE-01). */
   async function handleCreateHazard(name: string, causingStructureId: string) {
     const newNode = await createElement(name, "Hazard");
-    if (!newNode) {
+    if (!newNode || !projectId) {
       return;
     }
-    const res = await fetch("/api/edges", {
+    const res = await fetch(apiPath(projectId, "/edges"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ source: causingStructureId, target: newNode.id, kind: "Causes" }),
@@ -293,10 +358,10 @@ export default function Home() {
    * mitigates via a validated `MitigatedBy` edge (FR-SAFE-03). */
   async function handleCreateControl(hazardId: string, name: string) {
     const newNode = await createElement(name, "Control");
-    if (!newNode) {
+    if (!newNode || !projectId) {
       return;
     }
-    const res = await fetch("/api/edges", {
+    const res = await fetch(apiPath(projectId, "/edges"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ source: hazardId, target: newNode.id, kind: "MitigatedBy" }),
@@ -326,18 +391,18 @@ export default function Home() {
     requirementId: string,
   ) {
     const newNode = await createElement(name, "Stakeholder");
-    if (!newNode) {
+    if (!newNode || !projectId) {
       return;
     }
     if (concern) {
-      await fetch(`/api/elements/${newNode.id}/body`, {
+      await fetch(apiPath(projectId, `/elements/${newNode.id}/body`), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ rationale: null, properties: { concern } }),
       });
     }
     for (const targetId of [missionId, requirementId]) {
-      const res = await fetch("/api/edges", {
+      const res = await fetch(apiPath(projectId, "/edges"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source: newNode.id, target: targetId, kind: "Concerns" }),
@@ -354,7 +419,10 @@ export default function Home() {
   }
 
   async function handleDisconnect(source: string, target: string) {
-    const res = await fetch("/api/contains", {
+    if (!projectId) {
+      return;
+    }
+    const res = await fetch(apiPath(projectId, "/contains"), {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ parent: source, child: target }),
@@ -367,8 +435,11 @@ export default function Home() {
   }
 
   async function handleToggleActive(node: FlowNode<AxiomaBlockData>) {
+    if (!projectId) {
+      return;
+    }
     const nextActive = !(node.data.active ?? true);
-    const res = await fetch(`/api/elements/${node.id}/active`, {
+    const res = await fetch(apiPath(projectId, `/elements/${node.id}/active`), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ active: nextActive }),
@@ -385,7 +456,10 @@ export default function Home() {
   /** FR-CORE-08 provenance scaffolding (T-P1.2-06) — the UI trigger for "mark as ai-suggested
    * via the API": a picker next to Deactivate/Reactivate on the selected node. */
   async function handleSetOrigin(node: FlowNode<AxiomaBlockData>, origin: Origin) {
-    const res = await fetch(`/api/elements/${node.id}/origin`, {
+    if (!projectId) {
+      return;
+    }
+    const res = await fetch(apiPath(projectId, `/elements/${node.id}/origin`), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ origin }),
@@ -403,6 +477,9 @@ export default function Home() {
    * loaded node and edge (any kind), applies the new positions, and persists each one through
    * the same `PATCH .../position` path drag-to-move already uses. */
   async function handleAutoLayout() {
+    if (!projectId) {
+      return;
+    }
     const allEdgePairs = [
       ...edges.map((e) => ({ source: e.source, target: e.target })),
       ...causesEdges,
@@ -425,13 +502,32 @@ export default function Home() {
         if (!position) {
           return Promise.resolve();
         }
-        return fetch(`/api/elements/${n.id}/position`, {
+        return fetch(apiPath(projectId, `/elements/${n.id}/position`), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(position),
         });
       }),
     );
+  }
+
+  /** Project switcher "+ New Project" — creates an empty project and switches to it. No inline
+   * rename UI for the project itself yet (out of scope for this pass, same trim as the
+   * branch/commit/diff UI below); a default name is enough to get a second, genuinely separate
+   * project to switch between. */
+  async function handleCreateProject() {
+    const res = await fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: `New Project ${projects.length + 1}` }),
+    });
+    if (!res.ok) {
+      showNotice(await readErrorMessage(res));
+      return;
+    }
+    const project: Project = await res.json();
+    setProjects((ps) => [...ps, project]);
+    setProjectId(project.id);
   }
 
   const selectedNode = nodes.find((n) => n.id === selectedNodeId) ?? null;
@@ -446,6 +542,10 @@ export default function Home() {
         status={status}
         errorMessage={errorMessage}
         notice={notice}
+        projects={projects}
+        projectId={projectId}
+        setProjectId={setProjectId}
+        handleCreateProject={handleCreateProject}
         editMode={editMode}
         setEditMode={setEditMode}
         selectedNode={selectedNode}
@@ -485,6 +585,10 @@ interface CanvasProps {
   status: LoadStatus;
   errorMessage: string;
   notice: string | null;
+  projects: Project[];
+  projectId: string | null;
+  setProjectId: (id: string) => void;
+  handleCreateProject: () => Promise<void>;
   editMode: boolean;
   setEditMode: React.Dispatch<React.SetStateAction<boolean>>;
   selectedNode: FlowNode<AxiomaBlockData> | null;
@@ -526,6 +630,10 @@ function Canvas({
   status,
   errorMessage,
   notice,
+  projects,
+  projectId,
+  setProjectId,
+  handleCreateProject,
   editMode,
   setEditMode,
   selectedNode,
@@ -711,7 +819,10 @@ function Canvas({
           connectionRadius={40} // more forgiving than the 20px default — see the plan's Context.
           deleteKeyCode={null} // Node delete is out of scope — disconnect uses the edge's own button.
           onNodeDragStop={(_event, node) => {
-            fetch(`/api/elements/${node.id}/position`, {
+            if (!projectId) {
+              return;
+            }
+            fetch(apiPath(projectId, `/elements/${node.id}/position`), {
               method: "PATCH",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ x: node.position.x, y: node.position.y }),
@@ -724,10 +835,10 @@ function Canvas({
           }}
           onPaneClick={() => setSelectedNodeId(null)}
           onConnect={async (connection: Connection) => {
-            if (!connection.source || !connection.target) {
+            if (!connection.source || !connection.target || !projectId) {
               return;
             }
-            const res = await fetch("/api/contains", {
+            const res = await fetch(apiPath(projectId, "/contains"), {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ parent: connection.source, child: connection.target }),
@@ -748,13 +859,13 @@ function Canvas({
             );
           }}
           onReconnect={async (oldEdge, newConnection) => {
-            if (!newConnection.source || !newConnection.target) {
+            if (!newConnection.source || !newConnection.target || !projectId) {
               return;
             }
             // Create the new edge first, through the same validated path a fresh connect uses —
             // a reconnect that would cycle is rejected exactly like one, leaving the old edge
             // untouched rather than half-changed.
-            const createRes = await fetch("/api/contains", {
+            const createRes = await fetch(apiPath(projectId, "/contains"), {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ parent: newConnection.source, child: newConnection.target }),
@@ -763,7 +874,7 @@ function Canvas({
               showNotice(await readErrorMessage(createRes));
               return;
             }
-            await fetch("/api/contains", {
+            await fetch(apiPath(projectId, "/contains"), {
               method: "DELETE",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ parent: oldEdge.source, child: oldEdge.target }),
@@ -801,6 +912,27 @@ function Canvas({
               </p>
             )}
             {notice && <p className="mt-2 text-xs text-alert">{notice}</p>}
+
+            {/* Roadmap: Git-backed model versioning — every project is its own independent
+             * graph. No branch/commit/diff UI here yet (that's the CEM proposal-review
+             * surface's job later, P2.2); this is just create/switch. */}
+            <div className="mt-2 flex items-center gap-1.5">
+              <select
+                id="project-switcher"
+                value={projectId ?? ""}
+                onChange={(event) => setProjectId(event.target.value)}
+                className="min-w-0 flex-1 rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
+              >
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+              <Button variant="ghost" onClick={handleCreateProject} className="!px-2 !py-1 text-xs">
+                + New Project
+              </Button>
+            </div>
 
             <div className="mt-3 flex flex-wrap gap-1.5">
               <Button

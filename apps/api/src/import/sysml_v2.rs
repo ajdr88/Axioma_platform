@@ -11,7 +11,10 @@
 //! Validation (kind-conflict, containment-acyclicity) and the atomic write both happen inside
 //! [`crate::store::Neo4jStore::import_elements_and_edges`] — nothing here re-implements that.
 
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use sysml_core::Element;
 
@@ -38,6 +41,7 @@ pub struct ImportSummary {
 
 pub async fn import_sysml_v2(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
     Json(payload): Json<SysmlV2ImportRequest>,
 ) -> Result<Json<ImportSummary>, ApiError> {
     let contains: Vec<(String, String)> = payload
@@ -48,7 +52,7 @@ pub async fn import_sysml_v2(
 
     state
         .neo4j
-        .import_elements_and_edges(&payload.elements, &contains)
+        .import_elements_and_edges(&project_id, &payload.elements, &contains)
         .await?;
 
     Ok(Json(ImportSummary {

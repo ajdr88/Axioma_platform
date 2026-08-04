@@ -17,6 +17,10 @@ use tower_lsp::{Client, LanguageServer};
 
 struct DocumentState {
     uri: Option<Url>,
+    /// Resolved once, lazily, on the first `refresh_snapshot` call (`ApiClient::
+    /// resolve_project_id`) — see the plan's deliberate scope trim: this connection stays
+    /// pointed at one project for its whole lifetime.
+    project_id: Option<String>,
     elements: Vec<Element>,
     contains: Vec<Edge>,
 }
@@ -50,6 +54,7 @@ impl Backend {
             api,
             state: Mutex::new(DocumentState {
                 uri: None,
+                project_id: None,
                 elements: Vec::new(),
                 contains: Vec::new(),
             }),
@@ -173,7 +178,24 @@ impl Backend {
             return;
         }
 
-        match self.api.apply_ops(&ops).await {
+        let project_id = match self.resolved_project_id().await {
+            Ok(id) => id,
+            Err(err) => {
+                let diagnostic = Diagnostic {
+                    range: full_document_range(),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("axioma-textual".to_string()),
+                    message: format!("could not resolve a project to apply this edit to: {err}"),
+                    ..Default::default()
+                };
+                self.client
+                    .publish_diagnostics(uri, vec![diagnostic], None)
+                    .await;
+                return;
+            }
+        };
+
+        match self.api.apply_ops(&project_id, &ops).await {
             Ok(result) if result.ok => {
                 self.clear_diagnostics(&uri).await;
                 self.refresh_snapshot(Some(uri)).await;
@@ -210,11 +232,35 @@ impl Backend {
         }
     }
 
+    /// Resolves (and caches) which project this connection talks to — see the plan's deliberate
+    /// scope trim in the module doc comment: one project for this connection's whole lifetime.
+    async fn resolved_project_id(&self) -> anyhow::Result<String> {
+        let cached = { self.state.lock().unwrap().project_id.clone() };
+        if let Some(id) = cached {
+            return Ok(id);
+        }
+        let id = self.api.resolve_project_id().await?;
+        self.state.lock().unwrap().project_id = Some(id.clone());
+        Ok(id)
+    }
+
     /// Re-fetches the graph snapshot from `apps/api` and stores it — used after `didOpen` and
     /// after a successful apply (ids may have changed, e.g. a `Create`'s temp id → real id).
     async fn refresh_snapshot(&self, uri: Option<Url>) {
-        let elements = self.api.fetch_elements().await.unwrap_or_default();
-        let contains = self.api.fetch_contains().await.unwrap_or_default();
+        let Ok(project_id) = self.resolved_project_id().await else {
+            tracing::error!("could not resolve a project to load");
+            return;
+        };
+        let elements = self
+            .api
+            .fetch_elements(&project_id)
+            .await
+            .unwrap_or_default();
+        let contains = self
+            .api
+            .fetch_contains(&project_id)
+            .await
+            .unwrap_or_default();
         {
             let mut state = self.state.lock().unwrap();
             state.elements = elements;

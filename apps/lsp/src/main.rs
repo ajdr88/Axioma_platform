@@ -28,6 +28,10 @@ use tower_lsp::{LspService, Server};
 #[derive(Clone)]
 struct AppState {
     api_base_url: String,
+    /// Roadmap: Git-backed model versioning — every read/write is project-scoped now. This
+    /// server stays pointed at one project (env-var override, else `apps/api`'s first project)
+    /// per the plan's deliberate scope trim; see `api_client`'s doc comment.
+    project_id_override: Option<String>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -46,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         api_base_url: env_or("API_BASE_URL", "http://localhost:8080"),
+        project_id_override: std::env::var("LSP_PROJECT_ID").ok(),
     };
 
     let app = Router::new()
@@ -63,7 +68,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
-    let api = ApiClient::new(state.api_base_url);
+    let api = ApiClient::new(state.api_base_url, state.project_id_override);
     let (service, socket_handle) = LspService::build(|client| Backend::new(client, api))
         .custom_method("axioma/elementChanged", Backend::element_changed)
         .finish();

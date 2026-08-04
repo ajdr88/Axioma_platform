@@ -1,14 +1,18 @@
 //! `api` — the Axum REST surface (impl §2.1). Wires the polyglot persistence split (ADR-003):
-//! Neo4j for topology, Postgres for element bodies, MinIO/S3 for blob pointers. The full REST
-//! surface (impl §1) — Projects/Commits, query-budget enforcement, CEM/safety/mission endpoints —
-//! is still follow-on work; this covers the AX-101/AX-105/AX-106 onboarding scope plus a first
-//! real read/write path per store.
+//! Neo4j for topology, Postgres for element bodies, MinIO/S3 for blob pointers, plus a fourth,
+//! abstract Postgres-backed Commit/Branch/Project store for Git-backed model versioning
+//! (roadmap: P1.1, T-P1.1-05 — see `store::versioning`'s doc comment for why this isn't a
+//! literal git repo). The full REST surface (impl §1) — query-budget enforcement, CEM/safety/
+//! mission endpoints — is still follow-on work; this covers the AX-101/AX-105/AX-106 onboarding
+//! scope, a first real read/write path per store, and the Projects/Commits/Elements structuring
+//! nouns impl §1 names, made real rather than a `/api/v0/elements` stand-in.
 
 mod import;
 mod store;
 
 use std::collections::HashMap;
 
+use anyhow::Context;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -18,15 +22,37 @@ use axum::{
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use store::neo4j::ApplyOpsOutcome;
-use store::{Neo4jStore, ObjectStore, PostgresStore};
+use store::versioning::{Branch, DiffEntry, Project, Snapshot, SnapshotEdge, MAIN_BRANCH};
+use store::{Neo4jStore, ObjectStore, PostgresStore, VersioningStore};
 use sysml_core::{Edge, EdgeKind, Element, ElementBody, NodeKind, Origin, ValidationError};
 use sysml_textual::GraphOp;
+
+/// Every mutating endpoint in this file commits/audits under this actor — there's no auth system
+/// yet ("no cross-session locking, single-user assumption is explicit and intentional" already
+/// governs canvas Edit Mode); the one endpoint T-P1.1-05 actually cares about the actor for
+/// (the branch-scoped property edit) accepts an explicit override instead.
+const DEFAULT_ACTOR: &str = "local-user";
+
+/// Every `EdgeKind` — used to build a full versioning snapshot across every relationship kind,
+/// not just `Contains`.
+const ALL_EDGE_KINDS: [EdgeKind; 9] = [
+    EdgeKind::Contains,
+    EdgeKind::Satisfy,
+    EdgeKind::Verify,
+    EdgeKind::Refine,
+    EdgeKind::Causes,
+    EdgeKind::MitigatedBy,
+    EdgeKind::ValidatedBy,
+    EdgeKind::Suspect,
+    EdgeKind::Concerns,
+];
 
 #[derive(Clone)]
 struct AppState {
     neo4j: Neo4jStore,
     postgres: PostgresStore,
     objects: ObjectStore,
+    versioning: VersioningStore,
     prometheus_handle: PrometheusHandle,
 }
 
@@ -86,11 +112,12 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let postgres = PostgresStore::connect(&env_or(
+    let database_url = env_or(
         "DATABASE_URL",
         "postgres://axioma:axioma-dev@localhost:5433/axioma",
-    ))
-    .await?;
+    );
+    let postgres = PostgresStore::connect(&database_url).await?;
+    let versioning = VersioningStore::connect(&database_url).await?;
 
     let objects = ObjectStore::connect(
         &env_or("S3_ENDPOINT", "http://localhost:9000"),
@@ -104,41 +131,77 @@ async fn main() -> anyhow::Result<()> {
         neo4j,
         postgres,
         objects,
+        versioning,
         prometheus_handle,
     };
 
-    seed_turbofan_ref(&state).await?;
+    ensure_seeded(&state).await?;
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .route("/api/v0/elements", get(list_elements).post(create_element))
-        .route("/api/v0/elements/:id", patch(rename_element))
-        .route("/api/v0/elements/:id/active", patch(set_element_active))
-        .route("/api/v0/elements/:id/origin", patch(set_element_origin))
+        .route("/api/v0/projects", get(list_projects).post(create_project))
+        .route("/api/v0/projects/:projectId", get(get_project))
         .route(
-            "/api/v0/elements/:id/body",
+            "/api/v0/projects/:projectId/branches",
+            get(list_branches).post(create_branch),
+        )
+        .route(
+            "/api/v0/projects/:projectId/branches/:branch/elements/:elementId/body",
+            patch(branch_update_element_body),
+        )
+        .route(
+            "/api/v0/projects/:projectId/commits/:commitId/diff",
+            get(diff_commit),
+        )
+        .route(
+            "/api/v0/projects/:projectId/elements",
+            get(list_elements).post(create_element),
+        )
+        .route(
+            "/api/v0/projects/:projectId/elements/:id",
+            patch(rename_element),
+        )
+        .route(
+            "/api/v0/projects/:projectId/elements/:id/active",
+            patch(set_element_active),
+        )
+        .route(
+            "/api/v0/projects/:projectId/elements/:id/origin",
+            patch(set_element_origin),
+        )
+        .route(
+            "/api/v0/projects/:projectId/elements/:id/body",
             get(get_element_body).put(update_element_body),
         )
         .route(
-            "/api/v0/elements/:id/position",
+            "/api/v0/projects/:projectId/elements/:id/position",
             patch(update_element_position),
         )
         .route(
-            "/api/v0/contains",
+            "/api/v0/projects/:projectId/contains",
             get(list_contains_edges)
                 .post(create_contains_edge)
                 .delete(delete_contains_edge),
         )
         .route(
-            "/api/v0/edges",
+            "/api/v0/projects/:projectId/edges",
             get(list_edges).post(create_edge).delete(delete_edge),
         )
-        .route("/api/v0/positions", get(list_positions))
-        .route("/api/v0/text-model/apply", post(apply_text_model))
-        .route("/import/sysml-v2", post(import::sysml_v2::import_sysml_v2))
-        .route("/import/reqif", post(import::reqif::import_reqif))
+        .route("/api/v0/projects/:projectId/positions", get(list_positions))
+        .route(
+            "/api/v0/projects/:projectId/text-model/apply",
+            post(apply_text_model),
+        )
+        .route(
+            "/api/v0/projects/:projectId/import/sysml-v2",
+            post(import::sysml_v2::import_sysml_v2),
+        )
+        .route(
+            "/api/v0/projects/:projectId/import/reqif",
+            post(import::reqif::import_reqif),
+        )
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
@@ -156,7 +219,7 @@ async fn healthz() -> impl IntoResponse {
     StatusCode::OK
 }
 
-/// Readiness — pings all three stores; 200 only if every one responds.
+/// Readiness — pings all four stores; 200 only if every one responds.
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     let mut failed = Vec::new();
     if state.neo4j.ping().await.is_err() {
@@ -167,6 +230,9 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     }
     if state.objects.ping().await.is_err() {
         failed.push("objects");
+    }
+    if state.versioning.ping().await.is_err() {
+        failed.push("versioning");
     }
 
     if failed.is_empty() {
@@ -187,26 +253,302 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     state.prometheus_handle.render()
 }
 
-/// Stand-in for the real `GET /projects/{id}/commits/{id}/elements` endpoint (impl §1.1) — lists
-/// every element from the topology store (Neo4j).
-async fn list_elements(State(state): State<AppState>) -> Result<Json<Vec<Element>>, ApiError> {
-    Ok(Json(state.neo4j.list_elements().await?))
+// ---------------------------------------------------------------------------
+// Projects / branches / commits / diff (roadmap: Git-backed model versioning)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateProjectRequest {
+    name: String,
 }
 
-/// Lists every `Contains` edge — this project's stand-in for a real traceability endpoint (impl
-/// §1.1 doesn't name this one specifically; `/api/v0/elements` is the same kind of stand-in).
-/// The frontend canvas needs both this and `list_elements` to draw the graph.
-async fn list_contains_edges(State(state): State<AppState>) -> Result<Json<Vec<Edge>>, ApiError> {
-    Ok(Json(state.neo4j.contains_edges().await?))
+async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Project>>, ApiError> {
+    Ok(Json(state.versioning.list_projects().await?))
+}
+
+async fn create_project(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateProjectRequest>,
+) -> Result<Json<Project>, ApiError> {
+    if payload.name.trim().is_empty() {
+        return Err(import::BadRequest("name must not be empty".to_string()).into());
+    }
+    Ok(Json(state.versioning.create_project(&payload.name).await?))
+}
+
+async fn get_project(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Response, ApiError> {
+    match state.versioning.get_project(&project_id).await? {
+        Some(project) => Ok(Json(project).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no project {project_id}") })),
+        )
+            .into_response()),
+    }
+}
+
+async fn list_branches(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Vec<Branch>>, ApiError> {
+    Ok(Json(state.versioning.list_branches(&project_id).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateBranchRequest {
+    name: String,
+    #[serde(default)]
+    from_commit: Option<String>,
+}
+
+/// Creates a branch pointing at `fromCommit` (defaults to `main`'s head) — a lightweight
+/// pointer, not a live checkout; see `store::versioning`'s doc comment.
+async fn create_branch(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(payload): Json<CreateBranchRequest>,
+) -> Result<Json<Branch>, ApiError> {
+    if payload.name.trim().is_empty() {
+        return Err(import::BadRequest("name must not be empty".to_string()).into());
+    }
+    Ok(Json(
+        state
+            .versioning
+            .create_branch(&project_id, &payload.name, payload.from_commit.as_deref())
+            .await?,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BranchEditBodyRequest {
+    #[serde(default)]
+    rationale: Option<String>,
+    properties: serde_json::Value,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default = "default_commit_message")]
+    message: String,
+}
+
+fn default_commit_message() -> String {
+    "Update element properties".to_string()
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitResponse {
+    commit_id: String,
+    diff: Vec<DiffEntry>,
+}
+
+/// T-P1.1-05's Action, made real: applies a property edit to a *copy* of a branch's current
+/// snapshot and commits the result — never touches the live graph (only `main` is ever live; see
+/// `store::versioning`'s doc comment). Returns the new commit's id and its diff (old/new values)
+/// directly, so a caller doesn't need a separate diff request just to see what changed.
+async fn branch_update_element_body(
+    State(state): State<AppState>,
+    Path((project_id, branch_name, element_id)): Path<(String, String, String)>,
+    Json(payload): Json<BranchEditBodyRequest>,
+) -> Result<Response, ApiError> {
+    let Some(branch) = state
+        .versioning
+        .get_branch(&project_id, &branch_name)
+        .await?
+    else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no branch {branch_name}") })),
+        )
+            .into_response());
+    };
+    let Some(head_commit_id) = branch.head_commit_id.clone() else {
+        return Err(import::BadRequest(format!(
+            "branch {branch_name} has no commits yet — branch it from a commit first"
+        ))
+        .into());
+    };
+    let (_, mut snapshot) = state
+        .versioning
+        .get_commit(&head_commit_id)
+        .await?
+        .context("branch head commit not found")?;
+
+    let actor = payload
+        .actor
+        .clone()
+        .unwrap_or_else(|| DEFAULT_ACTOR.to_string());
+    let old_properties = snapshot
+        .bodies
+        .get(&element_id)
+        .and_then(|b| b.get("properties"))
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut diff_entries = Vec::new();
+    if let Some(new_properties) = payload.properties.as_object() {
+        for (key, new_val) in new_properties {
+            let old_val = old_properties
+                .get(key)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if &old_val != new_val {
+                diff_entries.push(DiffEntry::PropertyChanged {
+                    element_id: element_id.clone(),
+                    property: key.clone(),
+                    old: old_val,
+                    new: new_val.clone(),
+                });
+            }
+        }
+    }
+
+    snapshot.bodies.insert(
+        element_id.clone(),
+        serde_json::json!({ "rationale": payload.rationale, "properties": payload.properties }),
+    );
+
+    let commit = state
+        .versioning
+        .commit(
+            &project_id,
+            &branch,
+            &actor,
+            &payload.message,
+            &diff_entries,
+            &snapshot,
+        )
+        .await?;
+    for entry in &diff_entries {
+        state
+            .versioning
+            .record_audit(&project_id, &actor, entry)
+            .await?;
+    }
+
+    Ok(Json(CommitResponse {
+        commit_id: commit.id,
+        diff: diff_entries,
+    })
+    .into_response())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiffQuery {
+    against: String,
+}
+
+/// Property-level + structural diff between any two commits — works for any pair, including a
+/// branch's tip against `main`'s head (T-P1.1-05's "diff against main").
+async fn diff_commit(
+    State(state): State<AppState>,
+    Path((_project_id, commit_id)): Path<(String, String)>,
+    Query(params): Query<DiffQuery>,
+) -> Result<Json<Vec<DiffEntry>>, ApiError> {
+    Ok(Json(
+        state
+            .versioning
+            .diff_commits(&commit_id, &params.against)
+            .await?,
+    ))
+}
+
+/// Gathers a project's full current state (every element, every edge kind, every body) into one
+/// versioning snapshot — canvas position is deliberately excluded (UI metadata, not modeling
+/// content, NFR-DATA-01).
+async fn build_snapshot(state: &AppState, project_id: &str) -> anyhow::Result<Snapshot> {
+    let elements = state.neo4j.list_elements(project_id).await?;
+    let mut edges = Vec::new();
+    for kind in ALL_EDGE_KINDS {
+        for edge in state.neo4j.edges_of_kind(project_id, kind).await? {
+            edges.push(SnapshotEdge {
+                source: edge.source,
+                target: edge.target,
+                kind: edge.kind,
+            });
+        }
+    }
+    let bodies = state.postgres.list_bodies(project_id).await?;
+    Ok(Snapshot {
+        elements,
+        edges,
+        bodies,
+    })
+}
+
+/// Every existing mutating endpoint (except position drags — UI metadata, not modeling content)
+/// calls this after its own write succeeds: snapshots the project's new state, commits it onto
+/// `main`, and records an audit-log entry per diff entry. Makes CLAUDE.md's "every model write
+/// must be traceable to a Git-style commit — never a silent mutation" literally true, not just
+/// aspirational. A no-op if `diff_entries` is empty (e.g. a rename to the same name).
+async fn record_commit(
+    state: &AppState,
+    project_id: &str,
+    actor: &str,
+    message: &str,
+    diff_entries: Vec<DiffEntry>,
+) -> anyhow::Result<()> {
+    if diff_entries.is_empty() {
+        return Ok(());
+    }
+    let branch = state
+        .versioning
+        .get_branch(project_id, MAIN_BRANCH)
+        .await?
+        .context("project has no main branch")?;
+    let snapshot = build_snapshot(state, project_id).await?;
+    state
+        .versioning
+        .commit(
+            project_id,
+            &branch,
+            actor,
+            message,
+            &diff_entries,
+            &snapshot,
+        )
+        .await?;
+    for entry in &diff_entries {
+        state
+            .versioning
+            .record_audit(project_id, actor, entry)
+            .await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Elements / edges / bodies / positions (project-scoped)
+// ---------------------------------------------------------------------------
+
+/// Stand-in for the real `GET /projects/{id}/commits/{id}/elements` endpoint (impl §1.1) — lists
+/// every element in a project from the topology store (Neo4j). Always reads `main`'s live state
+/// (there's no "checked out branch" concept — see `store::versioning`'s doc comment).
+async fn list_elements(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Vec<Element>>, ApiError> {
+    Ok(Json(state.neo4j.list_elements(&project_id).await?))
+}
+
+/// Lists every `Contains` edge in a project — this project's stand-in for a real traceability
+/// endpoint. The frontend canvas needs both this and `list_elements` to draw the graph.
+async fn list_contains_edges(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Vec<Edge>>, ApiError> {
+    Ok(Json(state.neo4j.contains_edges(&project_id).await?))
 }
 
 /// First real use of the document-store side of the split (NFR-DATA-02): the element's body
 /// (rationale, large/structured properties) lives in Postgres, never in the graph.
 async fn get_element_body(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path((project_id, id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    match state.postgres.get_body(&id).await? {
+    match state.postgres.get_body(&project_id, &id).await? {
         Some(body) => Ok((StatusCode::OK, Json(body)).into_response()),
         None => Ok((
             StatusCode::NOT_FOUND,
@@ -229,6 +571,7 @@ struct CreateElementRequest {
 /// generates the id, so there's no kind-conflict risk (it's always fresh).
 async fn create_element(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
     Json(payload): Json<CreateElementRequest>,
 ) -> Result<Json<Element>, ApiError> {
     if payload.name.trim().is_empty() {
@@ -241,7 +584,19 @@ async fn create_element(
         active: true,
         origin: Origin::Human,
     };
-    state.neo4j.upsert_element(&element).await?;
+    state.neo4j.upsert_element(&project_id, &element).await?;
+    record_commit(
+        &state,
+        &project_id,
+        DEFAULT_ACTOR,
+        "Create element",
+        vec![DiffEntry::ElementCreated {
+            element_id: element.id.clone(),
+            kind: element.kind,
+            name: element.name.clone(),
+        }],
+    )
+    .await?;
     Ok(Json(element))
 }
 
@@ -253,13 +608,13 @@ struct RenameRequest {
 /// Canvas inline rename (Edit Mode) — preserves the element's existing `kind`/`active`.
 async fn rename_element(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path((project_id, id)): Path<(String, String)>,
     Json(payload): Json<RenameRequest>,
 ) -> Result<Response, ApiError> {
     if payload.name.trim().is_empty() {
         return Err(import::BadRequest("name must not be empty".to_string()).into());
     }
-    let Some(existing) = state.neo4j.get_element(&id).await? else {
+    let Some(existing) = state.neo4j.get_element(&project_id, &id).await? else {
         return Ok((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("no element {id}") })),
@@ -268,9 +623,26 @@ async fn rename_element(
     };
     let updated = Element {
         name: payload.name,
-        ..existing
+        ..existing.clone()
     };
-    state.neo4j.rename_element(&id, &updated.name).await?;
+    state
+        .neo4j
+        .rename_element(&project_id, &id, &updated.name)
+        .await?;
+    if existing.name != updated.name {
+        record_commit(
+            &state,
+            &project_id,
+            DEFAULT_ACTOR,
+            "Rename element",
+            vec![DiffEntry::ElementRenamed {
+                element_id: id.clone(),
+                old_name: existing.name.clone(),
+                new_name: updated.name.clone(),
+            }],
+        )
+        .await?;
+    }
     Ok(Json(updated).into_response())
 }
 
@@ -284,10 +656,24 @@ struct SetActiveRequest {
 /// see `sysml_core::Element::active`'s doc comment). Nothing filters by this yet.
 async fn set_element_active(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path((project_id, id)): Path<(String, String)>,
     Json(payload): Json<SetActiveRequest>,
 ) -> Result<StatusCode, ApiError> {
-    state.neo4j.set_active(&id, payload.active).await?;
+    state
+        .neo4j
+        .set_active(&project_id, &id, payload.active)
+        .await?;
+    record_commit(
+        &state,
+        &project_id,
+        DEFAULT_ACTOR,
+        "Set element active flag",
+        vec![DiffEntry::ElementActiveChanged {
+            element_id: id,
+            active: payload.active,
+        }],
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -300,10 +686,24 @@ struct SetOriginRequest {
 /// `set_element_active` exactly — never touches `name`/`active`.
 async fn set_element_origin(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path((project_id, id)): Path<(String, String)>,
     Json(payload): Json<SetOriginRequest>,
 ) -> Result<StatusCode, ApiError> {
-    state.neo4j.set_origin(&id, payload.origin).await?;
+    state
+        .neo4j
+        .set_origin(&project_id, &id, payload.origin)
+        .await?;
+    record_commit(
+        &state,
+        &project_id,
+        DEFAULT_ACTOR,
+        "Set element origin",
+        vec![DiffEntry::ElementOriginChanged {
+            element_id: id,
+            origin: payload.origin,
+        }],
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -317,6 +717,7 @@ struct CreateContainsRequest {
 /// `Neo4jStore::create_edge` the batch importers use (containment-acyclicity, FR-CORE-05).
 async fn create_contains_edge(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
     Json(payload): Json<CreateContainsRequest>,
 ) -> Result<Json<Edge>, ApiError> {
     let edge = Edge {
@@ -324,7 +725,19 @@ async fn create_contains_edge(
         target: payload.child,
         kind: EdgeKind::Contains,
     };
-    state.neo4j.create_edge(&edge).await?;
+    state.neo4j.create_edge(&project_id, &edge).await?;
+    record_commit(
+        &state,
+        &project_id,
+        DEFAULT_ACTOR,
+        "Create containment edge",
+        vec![DiffEntry::EdgeCreated {
+            source: edge.source.clone(),
+            target: edge.target.clone(),
+            kind: edge.kind,
+        }],
+    )
+    .await?;
     Ok(Json(edge))
 }
 
@@ -332,6 +745,7 @@ async fn create_contains_edge(
 /// removing an edge can only heal a cycle/conflict, never create one.
 async fn delete_contains_edge(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
     Json(payload): Json<CreateContainsRequest>,
 ) -> Result<StatusCode, ApiError> {
     let edge = Edge {
@@ -339,7 +753,19 @@ async fn delete_contains_edge(
         target: payload.child,
         kind: EdgeKind::Contains,
     };
-    state.neo4j.delete_edge(&edge).await?;
+    state.neo4j.delete_edge(&project_id, &edge).await?;
+    record_commit(
+        &state,
+        &project_id,
+        DEFAULT_ACTOR,
+        "Delete containment edge",
+        vec![DiffEntry::EdgeDeleted {
+            source: edge.source.clone(),
+            target: edge.target.clone(),
+            kind: edge.kind,
+        }],
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -356,12 +782,16 @@ struct CreateEdgeRequest {
 }
 
 /// Generic edge listing for every kind besides `Contains` (which keeps its own
-/// `/api/v0/contains` route) — e.g. the Hazard/Risk panel's `Causes`/`MitigatedBy` edges.
+/// `/api/v0/projects/:projectId/contains` route) — e.g. the Hazard/Risk panel's
+/// `Causes`/`MitigatedBy` edges.
 async fn list_edges(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
     Query(params): Query<EdgeKindQuery>,
 ) -> Result<Json<Vec<Edge>>, ApiError> {
-    Ok(Json(state.neo4j.edges_of_kind(params.kind).await?))
+    Ok(Json(
+        state.neo4j.edges_of_kind(&project_id, params.kind).await?,
+    ))
 }
 
 /// Generic edge creation — goes through the same validated `Neo4jStore::create_edge` as
@@ -369,6 +799,7 @@ async fn list_edges(
 /// containment-acyclicity when `kind` is `Contains`).
 async fn create_edge(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
     Json(payload): Json<CreateEdgeRequest>,
 ) -> Result<Json<Edge>, ApiError> {
     let edge = Edge {
@@ -376,13 +807,26 @@ async fn create_edge(
         target: payload.target,
         kind: payload.kind,
     };
-    state.neo4j.create_edge(&edge).await?;
+    state.neo4j.create_edge(&project_id, &edge).await?;
+    record_commit(
+        &state,
+        &project_id,
+        DEFAULT_ACTOR,
+        "Create edge",
+        vec![DiffEntry::EdgeCreated {
+            source: edge.source.clone(),
+            target: edge.target.clone(),
+            kind: edge.kind,
+        }],
+    )
+    .await?;
     Ok(Json(edge))
 }
 
 /// Generic edge removal — no validation gate needed, same reasoning as `delete_contains_edge`.
 async fn delete_edge(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
     Json(payload): Json<CreateEdgeRequest>,
 ) -> Result<StatusCode, ApiError> {
     let edge = Edge {
@@ -390,7 +834,19 @@ async fn delete_edge(
         target: payload.target,
         kind: payload.kind,
     };
-    state.neo4j.delete_edge(&edge).await?;
+    state.neo4j.delete_edge(&project_id, &edge).await?;
+    record_commit(
+        &state,
+        &project_id,
+        DEFAULT_ACTOR,
+        "Delete edge",
+        vec![DiffEntry::EdgeDeleted {
+            source: edge.source.clone(),
+            target: edge.target.clone(),
+            kind: edge.kind,
+        }],
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -401,15 +857,16 @@ struct PositionRequest {
 }
 
 /// Canvas drag persistence (Edit Mode) — Postgres only, never touches Neo4j or the element's
-/// body/rationale (NFR-DATA-01: position is UI metadata, not topology).
+/// body/rationale (NFR-DATA-01: position is UI metadata, not topology). Deliberately excluded
+/// from commit/audit history for the same reason.
 async fn update_element_position(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path((project_id, id)): Path<(String, String)>,
     Json(payload): Json<PositionRequest>,
 ) -> Result<StatusCode, ApiError> {
     state
         .postgres
-        .upsert_position(&id, payload.x, payload.y)
+        .upsert_position(&project_id, &id, payload.x, payload.y)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -424,10 +881,11 @@ struct PositionEntry {
 
 async fn list_positions(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
 ) -> Result<Json<Vec<PositionEntry>>, ApiError> {
     let positions = state
         .postgres
-        .list_positions()
+        .list_positions(&project_id)
         .await?
         .into_iter()
         .map(|(element_id, x, y)| PositionEntry { element_id, x, y })
@@ -441,20 +899,58 @@ struct UpdateBodyRequest {
     properties: serde_json::Value,
 }
 
-/// Canvas properties-inspector save (Edit Mode) — the write side of `get_element_body`.
+/// Canvas properties-inspector save (Edit Mode) — the write side of `get_element_body`. Diffs
+/// against the previous body property-by-property so the resulting commit reports exactly what
+/// changed, the same shape T-P1.1-05 expects from the branch-scoped edit endpoint.
 async fn update_element_body(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path((project_id, id)): Path<(String, String)>,
     Json(payload): Json<UpdateBodyRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let old_body = state.postgres.get_body(&project_id, &id).await?;
+    let old_properties = old_body
+        .as_ref()
+        .and_then(|b| b.get("properties"))
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut diff_entries = Vec::new();
+    if let Some(new_properties) = payload.properties.as_object() {
+        for (key, new_val) in new_properties {
+            let old_val = old_properties
+                .get(key)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if &old_val != new_val {
+                diff_entries.push(DiffEntry::PropertyChanged {
+                    element_id: id.clone(),
+                    property: key.clone(),
+                    old: old_val,
+                    new: new_val.clone(),
+                });
+            }
+        }
+    }
+
     state
         .postgres
-        .upsert_body(&ElementBody {
-            element_id: id,
-            rationale: payload.rationale,
-            properties: payload.properties,
-        })
+        .upsert_body(
+            &project_id,
+            &ElementBody {
+                element_id: id.clone(),
+                rationale: payload.rationale,
+                properties: payload.properties,
+            },
+        )
         .await?;
+    record_commit(
+        &state,
+        &project_id,
+        DEFAULT_ACTOR,
+        "Update element properties",
+        diff_entries,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -487,14 +983,31 @@ struct OpErrorResponse {
 /// a `500` via `ApiError`.
 async fn apply_text_model(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
     Json(payload): Json<ApplyTextModelRequest>,
 ) -> Result<Json<ApplyTextModelResponse>, ApiError> {
-    match state.neo4j.apply_graph_ops(&payload.ops).await? {
-        ApplyOpsOutcome::Applied { id_map } => Ok(Json(ApplyTextModelResponse {
-            ok: true,
-            id_map: Some(id_map),
-            errors: None,
-        })),
+    match state
+        .neo4j
+        .apply_graph_ops(&project_id, &payload.ops)
+        .await?
+    {
+        ApplyOpsOutcome::Applied { id_map } => {
+            record_commit(
+                &state,
+                &project_id,
+                DEFAULT_ACTOR,
+                "Apply text edit",
+                vec![DiffEntry::TextModelApplied {
+                    ops: payload.ops.clone(),
+                }],
+            )
+            .await?;
+            Ok(Json(ApplyTextModelResponse {
+                ok: true,
+                id_map: Some(id_map),
+                errors: None,
+            }))
+        }
         ApplyOpsOutcome::Rejected { errors } => Ok(Json(ApplyTextModelResponse {
             ok: false,
             id_map: None,
@@ -511,11 +1024,40 @@ async fn apply_text_model(
     }
 }
 
-/// Seeds `Turbofan-Ref`'s P1.1 structural fixture (test spec §0) across all three stores:
-/// `Engine` composed of the five reference subsystems in Neo4j; `REQ-THRUST` with a 20 KB
-/// rationale body in Postgres (mirrors T-P1.1-04's setup); a placeholder geometry blob for
-/// `TurbineHpLp`, with only its pointer recorded — never the bytes (NFR-DATA-02).
-async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
+/// If no project exists yet, creates the "Turbofan Reference" project and seeds it — a restart
+/// against an already-seeded database skips this (same idempotency the fixture's own
+/// `MERGE`-based upserts already relied on, just gated on project existence instead of running
+/// unconditionally every boot).
+async fn ensure_seeded(state: &AppState) -> anyhow::Result<()> {
+    if state.versioning.count_projects().await? > 0 {
+        return Ok(());
+    }
+    let project = state
+        .versioning
+        .create_project("Turbofan Reference")
+        .await?;
+    seed_turbofan_ref(state, &project.id).await?;
+    record_commit(
+        state,
+        &project.id,
+        DEFAULT_ACTOR,
+        "Seed Turbofan-Ref fixture",
+        vec![DiffEntry::ElementCreated {
+            element_id: "Engine".to_string(),
+            kind: NodeKind::Structure,
+            name: "Engine".to_string(),
+        }],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Seeds `Turbofan-Ref`'s P1.1 structural fixture (test spec §0) across all three polyglot
+/// stores, scoped to one project: `Engine` composed of the five reference subsystems in Neo4j;
+/// `REQ-THRUST` with a 20 KB rationale body in Postgres (mirrors T-P1.1-04's setup); a
+/// placeholder geometry blob for `TurbineHpLp`, with only its pointer recorded — never the bytes
+/// (NFR-DATA-02).
+async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result<()> {
     let engine = Element {
         id: "Engine".to_string(),
         kind: NodeKind::Structure,
@@ -523,7 +1065,7 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
         active: true,
         origin: Origin::Human,
     };
-    state.neo4j.upsert_element(&engine).await?;
+    state.neo4j.upsert_element(project_id, &engine).await?;
 
     let subsystems = [
         ("FanLpCompression", "Fan & LP Compression"),
@@ -536,21 +1078,27 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
     for (id, name) in subsystems {
         state
             .neo4j
-            .upsert_element(&Element {
-                id: id.to_string(),
-                kind: NodeKind::Structure,
-                name: name.to_string(),
-                active: true,
-                origin: Origin::Human,
-            })
+            .upsert_element(
+                project_id,
+                &Element {
+                    id: id.to_string(),
+                    kind: NodeKind::Structure,
+                    name: name.to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
             .await?;
         state
             .neo4j
-            .create_edge(&Edge {
-                source: "Engine".to_string(),
-                target: id.to_string(),
-                kind: EdgeKind::Contains,
-            })
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: "Engine".to_string(),
+                    target: id.to_string(),
+                    kind: EdgeKind::Contains,
+                },
+            )
             .await?;
     }
 
@@ -561,16 +1109,19 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
         active: true,
         origin: Origin::Human,
     };
-    state.neo4j.upsert_element(&req_thrust).await?;
+    state.neo4j.upsert_element(project_id, &req_thrust).await?;
     state
         .postgres
-        .upsert_body(&ElementBody {
-            element_id: "REQ-THRUST".to_string(),
-            // Stand-in for a real rationale document — sized to match test spec T-P1.1-04's
-            // 20 KB fixture, proving large text never lands in Neo4j.
-            rationale: Some("x".repeat(20_000)),
-            properties: serde_json::json!({}),
-        })
+        .upsert_body(
+            project_id,
+            &ElementBody {
+                element_id: "REQ-THRUST".to_string(),
+                // Stand-in for a real rationale document — sized to match test spec T-P1.1-04's
+                // 20 KB fixture, proving large text never lands in Neo4j.
+                rationale: Some("x".repeat(20_000)),
+                properties: serde_json::json!({}),
+            },
+        )
         .await?;
 
     let pointer = state
@@ -582,11 +1133,14 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
         .await?;
     state
         .postgres
-        .upsert_body(&ElementBody {
-            element_id: "TurbineHpLp".to_string(),
-            rationale: None,
-            properties: serde_json::json!({ "geometryPointer": pointer }),
-        })
+        .upsert_body(
+            project_id,
+            &ElementBody {
+                element_id: "TurbineHpLp".to_string(),
+                rationale: None,
+                properties: serde_json::json!({ "geometryPointer": pointer }),
+            },
+        )
         .await?;
 
     Ok(())
@@ -599,7 +1153,7 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    async fn connect_test_stores() -> (Neo4jStore, PostgresStore, ObjectStore) {
+    async fn connect_test_stores() -> (Neo4jStore, PostgresStore, ObjectStore, VersioningStore) {
         let neo4j = Neo4jStore::connect(
             &env_or("NEO4J_URI", "bolt://localhost:7687"),
             &env_or("NEO4J_USER", "neo4j"),
@@ -608,12 +1162,16 @@ mod tests {
         .await
         .expect("connect to Neo4j — is `docker compose up -d` running?");
 
-        let postgres = PostgresStore::connect(&env_or(
+        let database_url = env_or(
             "DATABASE_URL",
             "postgres://axioma:axioma-dev@localhost:5433/axioma",
-        ))
-        .await
-        .expect("connect to Postgres — is `docker compose up -d` running?");
+        );
+        let postgres = PostgresStore::connect(&database_url)
+            .await
+            .expect("connect to Postgres — is `docker compose up -d` running?");
+        let versioning = VersioningStore::connect(&database_url)
+            .await
+            .expect("connect to Postgres (versioning) — is `docker compose up -d` running?");
 
         let objects = ObjectStore::connect(
             &env_or("S3_ENDPOINT", "http://localhost:9000"),
@@ -624,7 +1182,15 @@ mod tests {
         .await
         .expect("connect to object store — is `docker compose up -d` running?");
 
-        (neo4j, postgres, objects)
+        (neo4j, postgres, objects, versioning)
+    }
+
+    /// A fresh project per test — real isolation, no cross-test id collisions to worry about.
+    async fn test_project(versioning: &VersioningStore, name: &str) -> Project {
+        versioning
+            .create_project(&format!("{name}-{}", uuid::Uuid::new_v4()))
+            .await
+            .expect("creating a test project")
     }
 
     /// The Prometheus recorder is a process-global singleton — installing it more than once
@@ -642,11 +1208,12 @@ mod tests {
     }
 
     async fn test_app_state() -> AppState {
-        let (neo4j, postgres, objects) = connect_test_stores().await;
+        let (neo4j, postgres, objects, versioning) = connect_test_stores().await;
         AppState {
             neo4j,
             postgres,
             objects,
+            versioning,
             prometheus_handle: shared_prometheus_handle(),
         }
     }
@@ -654,11 +1221,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires `docker compose up -d`"]
     async fn readyz_ok_when_stores_healthy() {
-        let (neo4j, postgres, objects) = connect_test_stores().await;
+        let (neo4j, postgres, objects, versioning) = connect_test_stores().await;
 
         assert!(neo4j.ping().await.is_ok());
         assert!(postgres.ping().await.is_ok());
         assert!(objects.ping().await.is_ok());
+        assert!(versioning.ping().await.is_ok());
     }
 
     /// T-P1.1-03(a) against the real store: making an element a containment child of its own
@@ -666,7 +1234,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires `docker compose up -d`"]
     async fn containment_cycle_rejected_against_neo4j() {
-        let (neo4j, _postgres, _objects) = connect_test_stores().await;
+        let (neo4j, _postgres, _objects, versioning) = connect_test_stores().await;
+        let project = test_project(&versioning, "cycle").await;
 
         let engine = Element {
             id: "IntegrationTestEngine".to_string(),
@@ -682,24 +1251,30 @@ mod tests {
             active: true,
             origin: Origin::Human,
         };
-        neo4j.upsert_element(&engine).await.unwrap();
-        neo4j.upsert_element(&turbine).await.unwrap();
+        neo4j.upsert_element(&project.id, &engine).await.unwrap();
+        neo4j.upsert_element(&project.id, &turbine).await.unwrap();
 
         neo4j
-            .create_edge(&Edge {
-                source: engine.id.clone(),
-                target: turbine.id.clone(),
-                kind: EdgeKind::Contains,
-            })
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: engine.id.clone(),
+                    target: turbine.id.clone(),
+                    kind: EdgeKind::Contains,
+                },
+            )
             .await
             .expect("Engine contains Turbine should succeed");
 
         let result = neo4j
-            .create_edge(&Edge {
-                source: turbine.id.clone(),
-                target: engine.id.clone(),
-                kind: EdgeKind::Contains,
-            })
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: turbine.id.clone(),
+                    target: engine.id.clone(),
+                    kind: EdgeKind::Contains,
+                },
+            )
             .await;
 
         assert!(result.is_err(), "the containment cycle should be rejected");
@@ -710,7 +1285,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires `docker compose up -d`"]
     async fn satisfy_endpoint_rejected_against_neo4j() {
-        let (neo4j, _postgres, _objects) = connect_test_stores().await;
+        let (neo4j, _postgres, _objects, versioning) = connect_test_stores().await;
+        let project = test_project(&versioning, "satisfy").await;
 
         let combustor = Element {
             id: "IntegrationTestCombustor".to_string(),
@@ -726,22 +1302,28 @@ mod tests {
             active: true,
             origin: Origin::Human,
         };
-        neo4j.upsert_element(&combustor).await.unwrap();
-        neo4j.upsert_element(&turbine).await.unwrap();
+        neo4j.upsert_element(&project.id, &combustor).await.unwrap();
+        neo4j.upsert_element(&project.id, &turbine).await.unwrap();
 
         let result = neo4j
-            .create_edge(&Edge {
-                source: combustor.id.clone(),
-                target: turbine.id.clone(),
-                kind: EdgeKind::Satisfy,
-            })
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: combustor.id.clone(),
+                    target: turbine.id.clone(),
+                    kind: EdgeKind::Satisfy,
+                },
+            )
             .await;
         assert!(
             result.is_err(),
             "Satisfy targeting a Block, not a Requirement, should be rejected"
         );
 
-        let satisfy_edges = neo4j.edges_of_kind(EdgeKind::Satisfy).await.unwrap();
+        let satisfy_edges = neo4j
+            .edges_of_kind(&project.id, EdgeKind::Satisfy)
+            .await
+            .unwrap();
         assert!(
             !satisfy_edges
                 .iter()
@@ -756,7 +1338,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires `docker compose up -d`"]
     async fn dangling_edge_rejected_against_neo4j() {
-        let (neo4j, _postgres, _objects) = connect_test_stores().await;
+        let (neo4j, _postgres, _objects, versioning) = connect_test_stores().await;
+        let project = test_project(&versioning, "dangling").await;
 
         let engine = Element {
             id: "IntegrationTestDanglingEngine".to_string(),
@@ -765,21 +1348,24 @@ mod tests {
             active: true,
             origin: Origin::Human,
         };
-        neo4j.upsert_element(&engine).await.unwrap();
+        neo4j.upsert_element(&project.id, &engine).await.unwrap();
 
         let result = neo4j
-            .create_edge(&Edge {
-                source: engine.id.clone(),
-                target: "IntegrationTestDoesNotExist".to_string(),
-                kind: EdgeKind::Contains,
-            })
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: engine.id.clone(),
+                    target: "IntegrationTestDoesNotExist".to_string(),
+                    kind: EdgeKind::Contains,
+                },
+            )
             .await;
         assert!(
             result.is_err(),
             "an edge to a nonexistent element must be rejected, not silently no-op"
         );
 
-        let contains_edges = neo4j.contains_edges().await.unwrap();
+        let contains_edges = neo4j.contains_edges(&project.id).await.unwrap();
         assert!(
             !contains_edges
                 .iter()
@@ -793,7 +1379,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires `docker compose up -d`"]
     async fn set_origin_persists_against_neo4j() {
-        let (neo4j, _postgres, _objects) = connect_test_stores().await;
+        let (neo4j, _postgres, _objects, versioning) = connect_test_stores().await;
+        let project = test_project(&versioning, "origin").await;
 
         let element = Element {
             id: "IntegrationTestOriginBlock".to_string(),
@@ -802,10 +1389,10 @@ mod tests {
             active: true,
             origin: Origin::Human,
         };
-        neo4j.upsert_element(&element).await.unwrap();
+        neo4j.upsert_element(&project.id, &element).await.unwrap();
         assert_eq!(
             neo4j
-                .get_element(&element.id)
+                .get_element(&project.id, &element.id)
                 .await
                 .unwrap()
                 .unwrap()
@@ -814,10 +1401,14 @@ mod tests {
         );
 
         neo4j
-            .set_origin(&element.id, Origin::AiSuggested)
+            .set_origin(&project.id, &element.id, Origin::AiSuggested)
             .await
             .unwrap();
-        let reloaded = neo4j.get_element(&element.id).await.unwrap().unwrap();
+        let reloaded = neo4j
+            .get_element(&project.id, &element.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(reloaded.origin, Origin::AiSuggested);
         assert_eq!(reloaded.name, element.name);
         assert!(reloaded.active);
@@ -828,16 +1419,20 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires `docker compose up -d`"]
     async fn polyglot_split_body_not_in_graph() {
-        let (neo4j, postgres, objects) = connect_test_stores().await;
+        let (neo4j, postgres, objects, versioning) = connect_test_stores().await;
+        let project = test_project(&versioning, "polyglot").await;
         let element_id = "IntegrationTestReq";
         let rationale = "x".repeat(20_000);
 
         postgres
-            .upsert_body(&ElementBody {
-                element_id: element_id.to_string(),
-                rationale: Some(rationale),
-                properties: serde_json::json!({}),
-            })
+            .upsert_body(
+                &project.id,
+                &ElementBody {
+                    element_id: element_id.to_string(),
+                    rationale: Some(rationale),
+                    properties: serde_json::json!({}),
+                },
+            )
             .await
             .unwrap();
 
@@ -851,7 +1446,7 @@ mod tests {
         );
 
         let stored = postgres
-            .get_body(element_id)
+            .get_body(&project.id, element_id)
             .await
             .unwrap()
             .expect("body should exist in Postgres");
@@ -861,20 +1456,23 @@ mod tests {
             "the large body should be readable back from Postgres"
         );
 
-        // Neo4j's upsert_element only ever sets `id`/`name`/`active`/`origin` — there is no path
-        // for the 20 KB rationale to leak into the graph, but assert it directly rather than by
-        // construction.
+        // Neo4j's upsert_element only ever sets `id`/`name`/`active`/`origin`/`project_id` —
+        // there is no path for the 20 KB rationale to leak into the graph, but assert it
+        // directly rather than by construction.
         neo4j
-            .upsert_element(&Element {
-                id: element_id.to_string(),
-                kind: NodeKind::Requirement,
-                name: "Integration test requirement".to_string(),
-                active: true,
-                origin: Origin::Human,
-            })
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: element_id.to_string(),
+                    kind: NodeKind::Requirement,
+                    name: "Integration test requirement".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
             .await
             .unwrap();
-        let elements = neo4j.list_elements().await.unwrap();
+        let elements = neo4j.list_elements(&project.id).await.unwrap();
         let node = elements
             .iter()
             .find(|e| e.id == element_id)
@@ -891,18 +1489,23 @@ mod tests {
     #[ignore = "requires `docker compose up -d`"]
     async fn import_sysml_v2_reproduces_turbofan_hierarchy() {
         let state = test_app_state().await;
+        let project = test_project(&state.versioning, "import-sysml").await;
         let fixture = include_str!("../tests/fixtures/sample-sysml-v2.json");
         let payload: import::sysml_v2::SysmlV2ImportRequest =
             serde_json::from_str(fixture).unwrap();
 
-        let response = import::sysml_v2::import_sysml_v2(State(state.clone()), Json(payload))
-            .await
-            .expect("import should succeed")
-            .0;
+        let response = import::sysml_v2::import_sysml_v2(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(payload),
+        )
+        .await
+        .expect("import should succeed")
+        .0;
         assert_eq!(response.elements_imported, 6);
         assert_eq!(response.edges_imported, 5);
 
-        let elements = state.neo4j.list_elements().await.unwrap();
+        let elements = state.neo4j.list_elements(&project.id).await.unwrap();
         for id in [
             "Engine",
             "FanLpCompression",
@@ -917,7 +1520,7 @@ mod tests {
             );
         }
 
-        let contains = state.neo4j.contains_edges().await.unwrap();
+        let contains = state.neo4j.contains_edges(&project.id).await.unwrap();
         for child in [
             "FanLpCompression",
             "CoreHpCompressor",
@@ -940,14 +1543,20 @@ mod tests {
     #[ignore = "requires `docker compose up -d`"]
     async fn import_sysml_v2_rejects_cycle_with_no_partial_write() {
         let state = test_app_state().await;
+        let project = test_project(&state.versioning, "import-cycle").await;
         let fixture = include_str!("../tests/fixtures/sample-sysml-v2-cycle.json");
         let payload: import::sysml_v2::SysmlV2ImportRequest =
             serde_json::from_str(fixture).unwrap();
 
-        let result = import::sysml_v2::import_sysml_v2(State(state.clone()), Json(payload)).await;
+        let result = import::sysml_v2::import_sysml_v2(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(payload),
+        )
+        .await;
         assert!(result.is_err(), "the self-cyclic batch should be rejected");
 
-        let elements = state.neo4j.list_elements().await.unwrap();
+        let elements = state.neo4j.list_elements(&project.id).await.unwrap();
         for id in ["CycleTestA", "CycleTestB", "CycleTestValidLeaf"] {
             assert!(
                 !elements.iter().any(|e| e.id == id),
@@ -962,17 +1571,22 @@ mod tests {
     #[ignore = "requires `docker compose up -d`"]
     async fn import_reqif_reproduces_requirement_text_and_attributes() {
         let state = test_app_state().await;
+        let project = test_project(&state.versioning, "import-reqif").await;
         let fixture = include_str!("../tests/fixtures/sample.reqif");
 
-        let response = import::reqif::import_reqif(State(state.clone()), fixture.to_string())
-            .await
-            .expect("import should succeed")
-            .0;
+        let response = import::reqif::import_reqif(
+            State(state.clone()),
+            Path(project.id.clone()),
+            fixture.to_string(),
+        )
+        .await
+        .expect("import should succeed")
+        .0;
         assert_eq!(response.requirements_imported, 3);
 
         let body = state
             .postgres
-            .get_body("REQ-THRUST-IMPORTED")
+            .get_body(&project.id, "REQ-THRUST-IMPORTED")
             .await
             .unwrap()
             .expect("body should exist");
@@ -985,7 +1599,7 @@ mod tests {
             "Test"
         );
 
-        let elements = state.neo4j.list_elements().await.unwrap();
+        let elements = state.neo4j.list_elements(&project.id).await.unwrap();
         assert!(elements
             .iter()
             .any(|e| e.id == "REQ-THRUST-IMPORTED" && e.kind == NodeKind::Requirement));
@@ -997,9 +1611,11 @@ mod tests {
     #[ignore = "requires `docker compose up -d`"]
     async fn import_reqif_rejects_missing_identifier() {
         let state = test_app_state().await;
+        let project = test_project(&state.versioning, "import-malformed").await;
         let fixture = include_str!("../tests/fixtures/sample-malformed.reqif");
 
-        let result = import::reqif::import_reqif(State(state), fixture.to_string()).await;
+        let result =
+            import::reqif::import_reqif(State(state), Path(project.id), fixture.to_string()).await;
         assert!(result.is_err(), "missing IDENTIFIER should be rejected");
     }
 
@@ -1009,16 +1625,20 @@ mod tests {
     #[ignore = "requires `docker compose up -d`"]
     async fn import_rejects_kind_conflict() {
         let state = test_app_state().await;
+        let project = test_project(&state.versioning, "kind-conflict").await;
 
         state
             .neo4j
-            .upsert_element(&Element {
-                id: "KindConflictTest".to_string(),
-                kind: NodeKind::Structure,
-                name: "Originally a Structure".to_string(),
-                active: true,
-                origin: Origin::Human,
-            })
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "KindConflictTest".to_string(),
+                    kind: NodeKind::Structure,
+                    name: "Originally a Structure".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
             .await
             .unwrap();
 
@@ -1033,7 +1653,156 @@ mod tests {
             contains: vec![],
         };
 
-        let result = import::sysml_v2::import_sysml_v2(State(state), Json(payload)).await;
+        let result =
+            import::sysml_v2::import_sysml_v2(State(state), Path(project.id), Json(payload)).await;
         assert!(result.is_err(), "the kind conflict should be rejected");
+    }
+
+    /// T-P1.1-05 — the acceptance test this whole feature exists for: branch a project, change
+    /// one property on the branch, commit, and diff the branch's tip against `main`'s head.
+    /// PASS: the diff reports exactly the one changed property with old/new values, and the
+    /// write lands in the audit log with actor/timestamp/diff (checked via `record_audit`'s
+    /// insert succeeding — the row's shape is asserted directly against `DiffEntry`).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn branch_commit_and_diff_against_main_reports_exactly_one_property_change() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "branch-diff").await;
+
+        let fan = Element {
+            id: "Fan".to_string(),
+            kind: NodeKind::Structure,
+            name: "Fan".to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(&project.id, &fan).await.unwrap();
+        state
+            .postgres
+            .upsert_body(
+                &project.id,
+                &ElementBody {
+                    element_id: "Fan".to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "mass": "120kg" }),
+                },
+            )
+            .await
+            .unwrap();
+
+        // `main`'s first commit — establishes the baseline `diff` is computed against.
+        record_commit(
+            &state,
+            &project.id,
+            "test-actor",
+            "Seed Fan",
+            vec![DiffEntry::ElementCreated {
+                element_id: "Fan".to_string(),
+                kind: NodeKind::Structure,
+                name: "Fan".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+        let main = state
+            .versioning
+            .get_branch(&project.id, MAIN_BRANCH)
+            .await
+            .unwrap()
+            .unwrap();
+        let main_head = main.head_commit_id.clone().unwrap();
+
+        let branch = state
+            .versioning
+            .create_branch(&project.id, "lightweight-fan", None)
+            .await
+            .unwrap();
+
+        let response = branch_update_element_body(
+            State(state.clone()),
+            Path((project.id.clone(), branch.name.clone(), "Fan".to_string())),
+            Json(BranchEditBodyRequest {
+                rationale: None,
+                properties: serde_json::json!({ "mass": "95kg" }),
+                actor: Some("test-actor".to_string()),
+                message: "Lighten the fan".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let branch_after = state
+            .versioning
+            .get_branch(&project.id, "lightweight-fan")
+            .await
+            .unwrap()
+            .unwrap();
+        let branch_head = branch_after
+            .head_commit_id
+            .expect("branch should have a commit now");
+
+        let diff = state
+            .versioning
+            .diff_commits(&branch_head, &main_head)
+            .await
+            .unwrap();
+        let property_changes: Vec<_> = diff
+            .iter()
+            .filter(|d| matches!(d, DiffEntry::PropertyChanged { .. }))
+            .collect();
+        assert_eq!(
+            property_changes.len(),
+            1,
+            "expected exactly one changed property, got {diff:?}"
+        );
+        match property_changes[0] {
+            DiffEntry::PropertyChanged {
+                element_id,
+                property,
+                old,
+                new,
+            } => {
+                assert_eq!(element_id, "Fan");
+                assert_eq!(property, "mass");
+                assert_eq!(old, &serde_json::json!("120kg"));
+                assert_eq!(new, &serde_json::json!("95kg"));
+            }
+            other => panic!("expected PropertyChanged, got {other:?}"),
+        }
+    }
+
+    /// Two projects' elements never leak into each other — the same id string in two different
+    /// projects addresses two distinct Neo4j nodes.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn projects_are_isolated() {
+        let (neo4j, _postgres, _objects, versioning) = connect_test_stores().await;
+        let project_a = test_project(&versioning, "isolation-a").await;
+        let project_b = test_project(&versioning, "isolation-b").await;
+
+        neo4j
+            .upsert_element(
+                &project_a.id,
+                &Element {
+                    id: "SharedId".to_string(),
+                    kind: NodeKind::Structure,
+                    name: "In project A".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+
+        let b_elements = neo4j.list_elements(&project_b.id).await.unwrap();
+        assert!(
+            !b_elements.iter().any(|e| e.id == "SharedId"),
+            "project B must not see project A's element"
+        );
+
+        let a_elements = neo4j.list_elements(&project_a.id).await.unwrap();
+        assert!(a_elements.iter().any(|e| e.id == "SharedId"));
     }
 }

@@ -12,7 +12,10 @@
 //! partial import (the same "precise error, never silent partial compile" rule `alf-lite` follows
 //! for unsupported constructs).
 
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
 use serde::Serialize;
 use sysml_core::{Element, ElementBody, NodeKind, Origin};
 
@@ -76,6 +79,7 @@ pub struct ImportSummary {
 
 pub async fn import_reqif(
     State(state): State<AppState>,
+    Path(project_id): Path<String>,
     body: String,
 ) -> Result<Json<ImportSummary>, ApiError> {
     let requirements = parse_reqif(&body)?;
@@ -97,11 +101,14 @@ pub async fn import_reqif(
 
         state
             .postgres
-            .upsert_body(&ElementBody {
-                element_id: req.identifier.clone(),
-                rationale,
-                properties,
-            })
+            .upsert_body(
+                &project_id,
+                &ElementBody {
+                    element_id: req.identifier.clone(),
+                    rationale,
+                    properties,
+                },
+            )
             .await?;
     }
 
@@ -132,7 +139,7 @@ pub async fn import_reqif(
     // identifier already used by a non-Requirement element is rejected.
     state
         .neo4j
-        .import_elements_and_edges(&elements, &[])
+        .import_elements_and_edges(&project_id, &elements, &[])
         .await?;
 
     Ok(Json(ImportSummary {

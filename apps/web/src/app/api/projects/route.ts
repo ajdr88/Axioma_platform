@@ -1,10 +1,10 @@
 import { proxyRequest } from "@/lib/api-proxy";
 
 export async function GET() {
-  return proxyRequest("GET", "/api/v0/elements");
+  return proxyRequest("GET", "/api/v0/projects");
 }
 
 export async function POST(request: Request) {
   const body = await request.json();
-  return proxyRequest("POST", "/api/v0/elements", body);
+  return proxyRequest("POST", "/api/v0/projects", body);
 }

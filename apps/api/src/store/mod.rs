@@ -5,7 +5,9 @@
 pub mod neo4j;
 pub mod objects;
 pub mod postgres;
+pub mod versioning;
 
 pub use neo4j::Neo4jStore;
 pub use objects::ObjectStore;
 pub use postgres::PostgresStore;
+pub use versioning::VersioningStore;

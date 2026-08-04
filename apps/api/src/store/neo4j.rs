@@ -1,5 +1,10 @@
 //! Topology store (ADR-003 / NFR-DATA-01): Neo4j holds elements and relationships only — no
 //! bodies, no blobs. See `super::postgres` and `super::objects` for those.
+//!
+//! Every element carries a `project_id` property (multi-project support, roadmap versioning
+//! work) — the same tier as `active`/`origin`, not a separate label. `MERGE`/`MATCH` always key
+//! on `{id, project_id}` together, so the same human-readable id string (e.g. a seeded fixture's
+//! `"Combustor"`) in two different projects addresses two distinct nodes, never one shared node.
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,17 +53,19 @@ impl Neo4jStore {
             .context("Neo4j ping failed")
     }
 
-    /// `MERGE`s an element node by id. Only `id`/`kind`(label)/`name`/`active`/`origin` are
-    /// stored here — bodies and blobs live elsewhere (NFR-DATA-01).
-    pub async fn upsert_element(&self, element: &Element) -> Result<()> {
+    /// `MERGE`s an element node by `(id, project_id)`. Only `id`/`kind`(label)/`name`/`active`/
+    /// `origin`/`project_id` are stored here — bodies and blobs live elsewhere (NFR-DATA-01).
+    pub async fn upsert_element(&self, project_id: &str, element: &Element) -> Result<()> {
         let label = element.kind.as_label();
         let cypher = format!(
-            "MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = $active, n.origin = $origin"
+            "MERGE (n:{label} {{id: $id, project_id: $project_id}}) \
+             SET n.name = $name, n.active = $active, n.origin = $origin"
         );
         self.conn
             .run(
                 query(&cypher)
                     .param("id", element.id.clone())
+                    .param("project_id", project_id.to_string())
                     .param("name", element.name.clone())
                     .param("active", element.active)
                     .param("origin", element.origin.as_str()),
@@ -72,7 +79,7 @@ impl Neo4jStore {
     /// records exactly one transaction" claim about this exact write path, so it uses a real
     /// transaction primitive rather than relying on a single Cypher statement being *incidentally*
     /// atomic.
-    pub async fn rename_element(&self, id: &str, name: &str) -> Result<()> {
+    pub async fn rename_element(&self, project_id: &str, id: &str, name: &str) -> Result<()> {
         let mut txn = self
             .conn
             .start_txn()
@@ -80,8 +87,9 @@ impl Neo4jStore {
             .context("starting rename transaction")?;
         let result = txn
             .run(
-                query("MATCH (n {id: $id}) SET n.name = $name")
+                query("MATCH (n {id: $id, project_id: $project_id}) SET n.name = $name")
                     .param("id", id.to_string())
+                    .param("project_id", project_id.to_string())
                     .param("name", name.to_string()),
             )
             .await;
@@ -93,11 +101,12 @@ impl Neo4jStore {
     }
 
     /// Sets just the `active` flag (canvas deactivate/reactivate) — never touches `name`.
-    pub async fn set_active(&self, id: &str, active: bool) -> Result<()> {
+    pub async fn set_active(&self, project_id: &str, id: &str, active: bool) -> Result<()> {
         self.conn
             .run(
-                query("MATCH (n {id: $id}) SET n.active = $active")
+                query("MATCH (n {id: $id, project_id: $project_id}) SET n.active = $active")
                     .param("id", id.to_string())
+                    .param("project_id", project_id.to_string())
                     .param("active", active),
             )
             .await
@@ -106,11 +115,12 @@ impl Neo4jStore {
 
     /// Sets just the `origin` flag (FR-CORE-08 provenance scaffolding, T-P1.2-06's "mark as
     /// ai-suggested via the API") — never touches `name`/`active`.
-    pub async fn set_origin(&self, id: &str, origin: Origin) -> Result<()> {
+    pub async fn set_origin(&self, project_id: &str, id: &str, origin: Origin) -> Result<()> {
         self.conn
             .run(
-                query("MATCH (n {id: $id}) SET n.origin = $origin")
+                query("MATCH (n {id: $id, project_id: $project_id}) SET n.origin = $origin")
                     .param("id", id.to_string())
+                    .param("project_id", project_id.to_string())
                     .param("origin", origin.as_str()),
             )
             .await
@@ -119,15 +129,17 @@ impl Neo4jStore {
 
     /// Single-element lookup — used by rename to preserve `kind`/`active`/`origin` when only
     /// `name` changes.
-    pub async fn get_element(&self, id: &str) -> Result<Option<Element>> {
+    pub async fn get_element(&self, project_id: &str, id: &str) -> Result<Option<Element>> {
         let mut result = self
             .conn
             .execute(
                 query(
-                    "MATCH (n {id: $id}) RETURN n.id AS id, n.name AS name, labels(n) AS labels, \
-                     coalesce(n.active, true) AS active, coalesce(n.origin, 'Human') AS origin",
+                    "MATCH (n {id: $id, project_id: $project_id}) RETURN n.id AS id, \
+                     n.name AS name, labels(n) AS labels, coalesce(n.active, true) AS active, \
+                     coalesce(n.origin, 'Human') AS origin",
                 )
-                .param("id", id.to_string()),
+                .param("id", id.to_string())
+                .param("project_id", project_id.to_string()),
             )
             .await
             .with_context(|| format!("looking up element {id}"))?;
@@ -138,13 +150,17 @@ impl Neo4jStore {
         }
     }
 
-    pub async fn list_elements(&self) -> Result<Vec<Element>> {
+    pub async fn list_elements(&self, project_id: &str) -> Result<Vec<Element>> {
         let mut result = self
             .conn
-            .execute(query(
-                "MATCH (n) RETURN n.id AS id, n.name AS name, labels(n) AS labels, \
-                 coalesce(n.active, true) AS active, coalesce(n.origin, 'Human') AS origin",
-            ))
+            .execute(
+                query(
+                    "MATCH (n {project_id: $project_id}) RETURN n.id AS id, n.name AS name, \
+                     labels(n) AS labels, coalesce(n.active, true) AS active, \
+                     coalesce(n.origin, 'Human') AS origin",
+                )
+                .param("project_id", project_id.to_string()),
+            )
             .await
             .context("listing elements")?;
 
@@ -157,24 +173,27 @@ impl Neo4jStore {
 
     /// Every existing element id mapped to its current `NodeKind` — used to detect a
     /// kind-conflict (re-importing an id under a different kind) before writing anything.
-    pub async fn element_kinds(&self) -> Result<HashMap<ElementId, NodeKind>> {
+    pub async fn element_kinds(&self, project_id: &str) -> Result<HashMap<ElementId, NodeKind>> {
         Ok(self
-            .list_elements()
+            .list_elements(project_id)
             .await?
             .into_iter()
             .map(|el| (el.id, el.kind))
             .collect())
     }
 
-    /// All existing edges of one kind — enough to run
+    /// All existing edges of one kind (within one project) — enough to run
     /// [`sysml_core::would_create_containment_cycle`] (for `Contains`) without hydrating a full
     /// graph, and to list a relationship kind (e.g. `Causes`/`MitigatedBy`) for the API.
-    pub async fn edges_of_kind(&self, kind: EdgeKind) -> Result<Vec<Edge>> {
+    pub async fn edges_of_kind(&self, project_id: &str, kind: EdgeKind) -> Result<Vec<Edge>> {
         let rel_type = kind.as_rel_type();
-        let cypher = format!("MATCH (a)-[:{rel_type}]->(b) RETURN a.id AS source, b.id AS target");
+        let cypher = format!(
+            "MATCH (a {{project_id: $project_id}})-[:{rel_type}]->(b {{project_id: $project_id}}) \
+             RETURN a.id AS source, b.id AS target"
+        );
         let mut result = self
             .conn
-            .execute(query(&cypher))
+            .execute(query(&cypher).param("project_id", project_id.to_string()))
             .await
             .with_context(|| format!("listing {rel_type} edges"))?;
 
@@ -191,30 +210,30 @@ impl Neo4jStore {
 
     /// All existing `Contains` edges — enough to run
     /// [`sysml_core::would_create_containment_cycle`] without hydrating a full graph.
-    pub async fn contains_edges(&self) -> Result<Vec<Edge>> {
-        self.edges_of_kind(EdgeKind::Contains).await
+    pub async fn contains_edges(&self, project_id: &str) -> Result<Vec<Edge>> {
+        self.edges_of_kind(project_id, EdgeKind::Contains).await
     }
 
-    /// Creates a relationship between two already-`upsert_element`ed nodes, matched by id.
-    /// Rejects a dangling edge (either endpoint not an existing element, NFR-REL-01) and an
-    /// endpoint-type violation ([`sysml_core::check_relationship_endpoints`], FR-CORE-05) before
-    /// checking containment acyclicity (FR-CORE-05, NFR-REL-02, `Contains`-only) — every other
-    /// edge kind is legal to cycle (§5.7/NFR-REL-02).
-    pub async fn create_edge(&self, edge: &Edge) -> Result<()> {
-        let source_el =
-            self.get_element(&edge.source)
-                .await?
-                .ok_or_else(|| ValidationError::DanglingEdge {
-                    edge_kind: edge.kind,
-                    missing_id: edge.source.clone(),
-                })?;
-        let target_el =
-            self.get_element(&edge.target)
-                .await?
-                .ok_or_else(|| ValidationError::DanglingEdge {
-                    edge_kind: edge.kind,
-                    missing_id: edge.target.clone(),
-                })?;
+    /// Creates a relationship between two already-`upsert_element`ed nodes, matched by
+    /// `(id, project_id)`. Rejects a dangling edge (either endpoint not an existing element,
+    /// NFR-REL-01) and an endpoint-type violation ([`sysml_core::check_relationship_endpoints`],
+    /// FR-CORE-05) before checking containment acyclicity (FR-CORE-05, NFR-REL-02,
+    /// `Contains`-only) — every other edge kind is legal to cycle (§5.7/NFR-REL-02).
+    pub async fn create_edge(&self, project_id: &str, edge: &Edge) -> Result<()> {
+        let source_el = self
+            .get_element(project_id, &edge.source)
+            .await?
+            .ok_or_else(|| ValidationError::DanglingEdge {
+                edge_kind: edge.kind,
+                missing_id: edge.source.clone(),
+            })?;
+        let target_el = self
+            .get_element(project_id, &edge.target)
+            .await?
+            .ok_or_else(|| ValidationError::DanglingEdge {
+                edge_kind: edge.kind,
+                missing_id: edge.target.clone(),
+            })?;
         sysml_core::check_relationship_endpoints(
             edge.kind,
             &edge.source,
@@ -224,7 +243,7 @@ impl Neo4jStore {
         )?;
 
         if edge.kind.is_acyclicity_scoped() {
-            let existing = self.contains_edges().await?;
+            let existing = self.contains_edges(project_id).await?;
             if sysml_core::would_create_containment_cycle(&existing, &edge.source, &edge.target) {
                 return Err(ValidationError::ContainmentCycle {
                     parent: edge.source.clone(),
@@ -235,13 +254,16 @@ impl Neo4jStore {
         }
 
         let rel_type = edge.kind.as_rel_type();
-        let cypher =
-            format!("MATCH (a {{id: $source}}), (b {{id: $target}}) MERGE (a)-[:{rel_type}]->(b)");
+        let cypher = format!(
+            "MATCH (a {{id: $source, project_id: $project_id}}), \
+             (b {{id: $target, project_id: $project_id}}) MERGE (a)-[:{rel_type}]->(b)"
+        );
         self.conn
             .run(
                 query(&cypher)
                     .param("source", edge.source.clone())
-                    .param("target", edge.target.clone()),
+                    .param("target", edge.target.clone())
+                    .param("project_id", project_id.to_string()),
             )
             .await
             .with_context(|| {
@@ -254,15 +276,18 @@ impl Neo4jStore {
 
     /// Removes a relationship between two nodes, matched by id and kind. No validation needed —
     /// removing an edge can't create a cycle or a kind conflict, only heal one.
-    pub async fn delete_edge(&self, edge: &Edge) -> Result<()> {
+    pub async fn delete_edge(&self, project_id: &str, edge: &Edge) -> Result<()> {
         let rel_type = edge.kind.as_rel_type();
-        let cypher =
-            format!("MATCH (a {{id: $source}})-[r:{rel_type}]->(b {{id: $target}}) DELETE r");
+        let cypher = format!(
+            "MATCH (a {{id: $source, project_id: $project_id}})-[r:{rel_type}]->\
+             (b {{id: $target, project_id: $project_id}}) DELETE r"
+        );
         self.conn
             .run(
                 query(&cypher)
                     .param("source", edge.source.clone())
-                    .param("target", edge.target.clone()),
+                    .param("target", edge.target.clone())
+                    .param("project_id", project_id.to_string()),
             )
             .await
             .with_context(|| {
@@ -281,15 +306,16 @@ impl Neo4jStore {
     /// partial import (T-P1.1-02's "no partial write" standard, extended to a whole batch).
     pub async fn import_elements_and_edges(
         &self,
+        project_id: &str,
         elements: &[Element],
         contains: &[(ElementId, ElementId)],
     ) -> Result<()> {
-        let existing_kinds = self.element_kinds().await?;
+        let existing_kinds = self.element_kinds(project_id).await?;
         for element in elements {
             sysml_core::check_kind_conflict(existing_kinds.get(&element.id).copied(), element)?;
         }
 
-        let mut working_edges = self.contains_edges().await?;
+        let mut working_edges = self.contains_edges(project_id).await?;
         for (parent, child) in contains {
             if sysml_core::would_create_containment_cycle(&working_edges, parent, child) {
                 return Err(ValidationError::ContainmentCycle {
@@ -314,12 +340,14 @@ impl Neo4jStore {
         for element in elements {
             let label = element.kind.as_label();
             let cypher = format!(
-                "MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = $active, n.origin = $origin"
+                "MERGE (n:{label} {{id: $id, project_id: $project_id}}) \
+                 SET n.name = $name, n.active = $active, n.origin = $origin"
             );
             if let Err(err) = txn
                 .run(
                     query(&cypher)
                         .param("id", element.id.clone())
+                        .param("project_id", project_id.to_string())
                         .param("name", element.name.clone())
                         .param("active", element.active)
                         .param("origin", element.origin.as_str()),
@@ -334,13 +362,15 @@ impl Neo4jStore {
         for (parent, child) in contains {
             let rel_type = EdgeKind::Contains.as_rel_type();
             let cypher = format!(
-                "MATCH (a {{id: $source}}), (b {{id: $target}}) MERGE (a)-[:{rel_type}]->(b)"
+                "MATCH (a {{id: $source, project_id: $project_id}}), \
+                 (b {{id: $target, project_id: $project_id}}) MERGE (a)-[:{rel_type}]->(b)"
             );
             if let Err(err) = txn
                 .run(
                     query(&cypher)
                         .param("source", parent.clone())
-                        .param("target", child.clone()),
+                        .param("target", child.clone())
+                        .param("project_id", project_id.to_string()),
                 )
                 .await
             {
@@ -361,11 +391,15 @@ impl Neo4jStore {
     /// front and updates it incrementally — an ancestry check walks only the affected subtree,
     /// not the whole edge set, and there's exactly one Neo4j round trip for state, not one per
     /// op.
-    pub async fn apply_graph_ops(&self, ops: &[GraphOp]) -> Result<ApplyOpsOutcome> {
-        let existing_elements = self.list_elements().await?;
+    pub async fn apply_graph_ops(
+        &self,
+        project_id: &str,
+        ops: &[GraphOp],
+    ) -> Result<ApplyOpsOutcome> {
+        let existing_elements = self.list_elements(project_id).await?;
         let existing_ids: HashSet<ElementId> =
             existing_elements.iter().map(|e| e.id.clone()).collect();
-        let contains = self.contains_edges().await?;
+        let contains = self.contains_edges(project_id).await?;
 
         let mut children_of: HashMap<ElementId, Vec<ElementId>> = HashMap::new();
         let mut parent_of: HashMap<ElementId, ElementId> = HashMap::new();
@@ -484,8 +518,9 @@ impl Neo4jStore {
             let result = match op {
                 GraphOp::Rename { id, name } => {
                     txn.run(
-                        query("MATCH (n {id: $id}) SET n.name = $name")
+                        query("MATCH (n {id: $id, project_id: $project_id}) SET n.name = $name")
                             .param("id", id.clone())
+                            .param("project_id", project_id.to_string())
                             .param("name", name.clone()),
                     )
                     .await
@@ -499,12 +534,14 @@ impl Neo4jStore {
                     let real_id = id_map.get(temp_id).expect("resolved during validation");
                     let label = kind.as_label();
                     let create_cypher = format!(
-                        "MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = true, n.origin = 'Human'"
+                        "MERGE (n:{label} {{id: $id, project_id: $project_id}}) \
+                         SET n.name = $name, n.active = true, n.origin = 'Human'"
                     );
                     let mut res = txn
                         .run(
                             query(&create_cypher)
                                 .param("id", real_id.clone())
+                                .param("project_id", project_id.to_string())
                                 .param("name", name.clone()),
                         )
                         .await;
@@ -513,11 +550,13 @@ impl Neo4jStore {
                             res = txn
                                 .run(
                                     query(
-                                        "MATCH (a {id: $parent}), (b {id: $id}) \
+                                        "MATCH (a {id: $parent, project_id: $project_id}), \
+                                         (b {id: $id, project_id: $project_id}) \
                                          MERGE (a)-[:CONTAINS]->(b)",
                                     )
                                     .param("parent", parent)
-                                    .param("id", real_id.clone()),
+                                    .param("id", real_id.clone())
+                                    .param("project_id", project_id.to_string()),
                                 )
                                 .await;
                         }
@@ -527,8 +566,12 @@ impl Neo4jStore {
                 GraphOp::Reparent { id, new_parent_id } => {
                     let mut res = txn
                         .run(
-                            query("MATCH ({id: $id})<-[r:CONTAINS]-() DELETE r")
-                                .param("id", id.clone()),
+                            query(
+                                "MATCH ({id: $id, project_id: $project_id})<-[r:CONTAINS]-() \
+                                 DELETE r",
+                            )
+                            .param("id", id.clone())
+                            .param("project_id", project_id.to_string()),
                         )
                         .await;
                     if res.is_ok() {
@@ -536,11 +579,13 @@ impl Neo4jStore {
                             res = txn
                                 .run(
                                     query(
-                                        "MATCH (a {id: $parent}), (b {id: $id}) \
+                                        "MATCH (a {id: $parent, project_id: $project_id}), \
+                                         (b {id: $id, project_id: $project_id}) \
                                          MERGE (a)-[:CONTAINS]->(b)",
                                     )
                                     .param("parent", parent)
-                                    .param("id", id.clone()),
+                                    .param("id", id.clone())
+                                    .param("project_id", project_id.to_string()),
                                 )
                                 .await;
                         }
