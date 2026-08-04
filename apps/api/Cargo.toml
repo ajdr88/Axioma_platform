@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 sysml-core = { path = "../../packages/sysml-core" }
+sysml-textual = { path = "../../packages/sysml-textual" }
 
 axum = "0.7"
 tokio = { workspace = true }

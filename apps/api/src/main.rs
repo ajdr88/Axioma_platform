@@ -7,6 +7,8 @@
 mod import;
 mod store;
 
+use std::collections::HashMap;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -15,8 +17,10 @@ use axum::{
     Json, Router,
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use store::neo4j::ApplyOpsOutcome;
 use store::{Neo4jStore, ObjectStore, PostgresStore};
 use sysml_core::{Edge, EdgeKind, Element, ElementBody, NodeKind, Origin, ValidationError};
+use sysml_textual::GraphOp;
 
 #[derive(Clone)]
 struct AppState {
@@ -132,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
             get(list_edges).post(create_edge).delete(delete_edge),
         )
         .route("/api/v0/positions", get(list_positions))
+        .route("/api/v0/text-model/apply", post(apply_text_model))
         .route("/import/sysml-v2", post(import::sysml_v2::import_sysml_v2))
         .route("/import/reqif", post(import::reqif::import_reqif))
         .with_state(state)
@@ -265,7 +270,7 @@ async fn rename_element(
         name: payload.name,
         ..existing
     };
-    state.neo4j.upsert_element(&updated).await?;
+    state.neo4j.rename_element(&id, &updated.name).await?;
     Ok(Json(updated).into_response())
 }
 
@@ -451,6 +456,59 @@ async fn update_element_body(
         })
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ApplyTextModelRequest {
+    ops: Vec<GraphOp>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyTextModelResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id_map: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    errors: Option<Vec<OpErrorResponse>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpErrorResponse {
+    op_index: usize,
+    message: String,
+}
+
+/// FR-CORE-02 / T-P1.2-01: applies a batch of `GraphOp`s (rename/create/reparent, computed by the
+/// LSP server's text↔diagram diff, see `sysml-textual`) as one atomic transaction — either every
+/// op commits, or none do. `ok: false` with `errors` is a normal, expected response (invalid
+/// edits are common while typing), not a server fault — only a genuine I/O/store failure becomes
+/// a `500` via `ApiError`.
+async fn apply_text_model(
+    State(state): State<AppState>,
+    Json(payload): Json<ApplyTextModelRequest>,
+) -> Result<Json<ApplyTextModelResponse>, ApiError> {
+    match state.neo4j.apply_graph_ops(&payload.ops).await? {
+        ApplyOpsOutcome::Applied { id_map } => Ok(Json(ApplyTextModelResponse {
+            ok: true,
+            id_map: Some(id_map),
+            errors: None,
+        })),
+        ApplyOpsOutcome::Rejected { errors } => Ok(Json(ApplyTextModelResponse {
+            ok: false,
+            id_map: None,
+            errors: Some(
+                errors
+                    .into_iter()
+                    .map(|e| OpErrorResponse {
+                        op_index: e.op_index,
+                        message: e.message,
+                    })
+                    .collect(),
+            ),
+        })),
+    }
 }
 
 /// Seeds `Turbofan-Ref`'s P1.1 structural fixture (test spec §0) across all three stores:

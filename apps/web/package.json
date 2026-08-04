@@ -12,10 +12,14 @@
     "@axioma/diagram-engine": "workspace:*",
     "@axioma/shared-types": "workspace:*",
     "@axioma/ui-components": "workspace:*",
+    "@monaco-editor/react": "^4.7.0",
     "@xyflow/react": "^12.11.2",
+    "monaco-editor": "^0.56.0",
     "next": "^16.2.11",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "vscode-jsonrpc": "~8.2.1",
+    "vscode-ws-jsonrpc": "^3.5.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",

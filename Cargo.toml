@@ -2,7 +2,9 @@
 resolver = "2"
 members = [
     "apps/api",
+    "apps/lsp",
     "packages/sysml-core",
+    "packages/sysml-textual",
 ]
 
 [workspace.package]

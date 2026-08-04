@@ -1,11 +1,12 @@
 //! Topology store (ADR-003 / NFR-DATA-01): Neo4j holds elements and relationships only — no
 //! bodies, no blobs. See `super::postgres` and `super::objects` for those.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use neo4rs::{query, Graph as Neo4jConn, Row};
 use sysml_core::{Edge, EdgeKind, Element, ElementId, NodeKind, Origin, ValidationError};
+use sysml_textual::GraphOp;
 
 /// Shared by `list_elements` and `get_element` — both queries return the same five columns.
 fn row_to_element(row: &Row) -> Result<Element> {
@@ -64,6 +65,31 @@ impl Neo4jStore {
             )
             .await
             .with_context(|| format!("upserting element {}", element.id))
+    }
+
+    /// Renames an element by id — wrapped in an explicit Neo4j transaction rather than
+    /// `upsert_element`'s implicit single-statement write. T-P1.2-01 makes an explicit "backend
+    /// records exactly one transaction" claim about this exact write path, so it uses a real
+    /// transaction primitive rather than relying on a single Cypher statement being *incidentally*
+    /// atomic.
+    pub async fn rename_element(&self, id: &str, name: &str) -> Result<()> {
+        let mut txn = self
+            .conn
+            .start_txn()
+            .await
+            .context("starting rename transaction")?;
+        let result = txn
+            .run(
+                query("MATCH (n {id: $id}) SET n.name = $name")
+                    .param("id", id.to_string())
+                    .param("name", name.to_string()),
+            )
+            .await;
+        if let Err(err) = result {
+            let _ = txn.rollback().await;
+            return Err(err).with_context(|| format!("renaming element {id}"));
+        }
+        txn.commit().await.context("committing rename transaction")
     }
 
     /// Sets just the `active` flag (canvas deactivate/reactivate) — never touches `name`.
@@ -326,4 +352,253 @@ impl Neo4jStore {
 
         txn.commit().await.context("committing import transaction")
     }
+
+    /// Applies a batch of [`GraphOp`]s (FR-CORE-02 / T-P1.2-01's text↔diagram sync) as one
+    /// atomic transaction — every op is validated against current state (and against the
+    /// batch's own effect on that state, processed in order) before anything is written; if any
+    /// op fails, nothing commits. Unlike [`Self::import_elements_and_edges`]'s per-pair
+    /// re-scan-a-growing-`Vec` cycle check, this builds one children/parent adjacency index up
+    /// front and updates it incrementally — an ancestry check walks only the affected subtree,
+    /// not the whole edge set, and there's exactly one Neo4j round trip for state, not one per
+    /// op.
+    pub async fn apply_graph_ops(&self, ops: &[GraphOp]) -> Result<ApplyOpsOutcome> {
+        let existing_elements = self.list_elements().await?;
+        let existing_ids: HashSet<ElementId> =
+            existing_elements.iter().map(|e| e.id.clone()).collect();
+        let contains = self.contains_edges().await?;
+
+        let mut children_of: HashMap<ElementId, Vec<ElementId>> = HashMap::new();
+        let mut parent_of: HashMap<ElementId, ElementId> = HashMap::new();
+        for edge in &contains {
+            children_of
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.target.clone());
+            parent_of.insert(edge.target.clone(), edge.source.clone());
+        }
+
+        let mut id_map: HashMap<String, ElementId> = HashMap::new();
+        let mut op_errors: Vec<OpError> = Vec::new();
+
+        // Resolves a referenced id that may be a real element id, or an earlier `Create` op's
+        // `temp_id` in this same batch.
+        let resolve = |id_map: &HashMap<String, ElementId>, raw: &str| -> String {
+            id_map.get(raw).cloned().unwrap_or_else(|| raw.to_string())
+        };
+
+        for (index, op) in ops.iter().enumerate() {
+            match op {
+                GraphOp::Rename { id, name } => {
+                    if !existing_ids.contains(id) {
+                        op_errors.push(OpError {
+                            op_index: index,
+                            message: format!("element #{id} does not exist"),
+                        });
+                        continue;
+                    }
+                    if name.trim().is_empty() {
+                        op_errors.push(OpError {
+                            op_index: index,
+                            message: "name must not be empty".to_string(),
+                        });
+                    }
+                }
+                GraphOp::Create {
+                    temp_id, parent_id, ..
+                } => {
+                    let resolved_parent = parent_id.as_ref().map(|p| resolve(&id_map, p));
+                    if let Some(parent) = &resolved_parent {
+                        if !existing_ids.contains(parent) && !id_map.values().any(|v| v == parent) {
+                            op_errors.push(OpError {
+                                op_index: index,
+                                message: format!("parent #{parent} does not exist"),
+                            });
+                            continue;
+                        }
+                    }
+                    let real_id = uuid::Uuid::new_v4().to_string();
+                    id_map.insert(temp_id.clone(), real_id.clone());
+                    if let Some(parent) = resolved_parent {
+                        children_of
+                            .entry(parent.clone())
+                            .or_default()
+                            .push(real_id.clone());
+                        parent_of.insert(real_id, parent);
+                    }
+                }
+                GraphOp::Reparent { id, new_parent_id } => {
+                    if !existing_ids.contains(id) {
+                        op_errors.push(OpError {
+                            op_index: index,
+                            message: format!("element #{id} does not exist"),
+                        });
+                        continue;
+                    }
+                    let resolved_parent = new_parent_id.as_ref().map(|p| resolve(&id_map, p));
+                    if let Some(parent) = &resolved_parent {
+                        if !existing_ids.contains(parent) && !id_map.values().any(|v| v == parent) {
+                            op_errors.push(OpError {
+                                op_index: index,
+                                message: format!("new parent #{parent} does not exist"),
+                            });
+                            continue;
+                        }
+                        if is_descendant(&children_of, id, parent) {
+                            op_errors.push(OpError {
+                                op_index: index,
+                                message: format!(
+                                    "reparenting #{id} under #{parent} would create a \
+                                     containment cycle"
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                    if let Some(old_parent) = parent_of.remove(id) {
+                        if let Some(siblings) = children_of.get_mut(&old_parent) {
+                            siblings.retain(|c| c != id);
+                        }
+                    }
+                    if let Some(parent) = resolved_parent {
+                        children_of
+                            .entry(parent.clone())
+                            .or_default()
+                            .push(id.clone());
+                        parent_of.insert(id.clone(), parent);
+                    }
+                }
+            }
+        }
+
+        if !op_errors.is_empty() {
+            return Ok(ApplyOpsOutcome::Rejected { errors: op_errors });
+        }
+
+        let mut txn = self
+            .conn
+            .start_txn()
+            .await
+            .context("starting text-model apply transaction")?;
+
+        for op in ops {
+            let result = match op {
+                GraphOp::Rename { id, name } => {
+                    txn.run(
+                        query("MATCH (n {id: $id}) SET n.name = $name")
+                            .param("id", id.clone())
+                            .param("name", name.clone()),
+                    )
+                    .await
+                }
+                GraphOp::Create {
+                    temp_id,
+                    kind,
+                    name,
+                    parent_id,
+                } => {
+                    let real_id = id_map.get(temp_id).expect("resolved during validation");
+                    let label = kind.as_label();
+                    let create_cypher = format!(
+                        "MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = true, n.origin = 'Human'"
+                    );
+                    let mut res = txn
+                        .run(
+                            query(&create_cypher)
+                                .param("id", real_id.clone())
+                                .param("name", name.clone()),
+                        )
+                        .await;
+                    if res.is_ok() {
+                        if let Some(parent) = parent_id.as_ref().map(|p| resolve(&id_map, p)) {
+                            res = txn
+                                .run(
+                                    query(
+                                        "MATCH (a {id: $parent}), (b {id: $id}) \
+                                         MERGE (a)-[:CONTAINS]->(b)",
+                                    )
+                                    .param("parent", parent)
+                                    .param("id", real_id.clone()),
+                                )
+                                .await;
+                        }
+                    }
+                    res
+                }
+                GraphOp::Reparent { id, new_parent_id } => {
+                    let mut res = txn
+                        .run(
+                            query("MATCH ({id: $id})<-[r:CONTAINS]-() DELETE r")
+                                .param("id", id.clone()),
+                        )
+                        .await;
+                    if res.is_ok() {
+                        if let Some(parent) = new_parent_id.as_ref().map(|p| resolve(&id_map, p)) {
+                            res = txn
+                                .run(
+                                    query(
+                                        "MATCH (a {id: $parent}), (b {id: $id}) \
+                                         MERGE (a)-[:CONTAINS]->(b)",
+                                    )
+                                    .param("parent", parent)
+                                    .param("id", id.clone()),
+                                )
+                                .await;
+                        }
+                    }
+                    res
+                }
+            };
+            if let Err(err) = result {
+                let _ = txn.rollback().await;
+                return Err(err).context("applying text-model op batch");
+            }
+        }
+
+        txn.commit()
+            .await
+            .context("committing text-model apply transaction")?;
+        Ok(ApplyOpsOutcome::Applied { id_map })
+    }
+}
+
+/// True if `candidate` is `node` itself or a descendant of it in `children_of` — used to reject
+/// a `Reparent` that would make an element its own ancestor, walking only `node`'s current
+/// subtree rather than the whole edge set.
+fn is_descendant(
+    children_of: &HashMap<ElementId, Vec<ElementId>>,
+    node: &str,
+    candidate: &str,
+) -> bool {
+    if node == candidate {
+        return true;
+    }
+    let mut stack: Vec<&str> = children_of
+        .get(node)
+        .map(|c| c.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let mut visited: HashSet<&str> = HashSet::new();
+    while let Some(current) = stack.pop() {
+        if current == candidate {
+            return true;
+        }
+        if !visited.insert(current) {
+            continue;
+        }
+        if let Some(children) = children_of.get(current) {
+            stack.extend(children.iter().map(String::as_str));
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone)]
+pub struct OpError {
+    pub op_index: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ApplyOpsOutcome {
+    Applied { id_map: HashMap<String, ElementId> },
+    Rejected { errors: Vec<OpError> },
 }
