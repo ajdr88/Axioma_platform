@@ -14,7 +14,7 @@
 
 use axum::{extract::State, Json};
 use serde::Serialize;
-use sysml_core::{Element, ElementBody, NodeKind};
+use sysml_core::{Element, ElementBody, NodeKind, Origin};
 
 use super::BadRequest;
 use crate::{ApiError, AppState};
@@ -122,6 +122,7 @@ pub async fn import_reqif(
                 kind: NodeKind::Requirement,
                 name,
                 active: true,
+                origin: Origin::Human,
             }
         })
         .collect();

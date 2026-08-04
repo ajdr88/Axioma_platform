@@ -25,6 +25,41 @@ pub enum NodeKind {
     SimulationRun,
 }
 
+/// Provenance origin (FR-CORE-08, impl §6.3) — who/what created an element. Scaffolding only:
+/// `validation`/`suspect` (the other two of §6.3's three orthogonal signals) stay hardcoded
+/// placeholders on the frontend until something real produces them (solver/test runs for
+/// validation, staleness propagation for suspect) — inventing settable-but-untriggered fields for
+/// those now would be building ahead of the spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Origin {
+    Human,
+    AiSuggested,
+    AiAutoMerged,
+}
+
+impl Origin {
+    /// String form stored as a Neo4j node property. Mirrors [`NodeKind::as_label`]'s pattern —
+    /// a fixed, closed set of variants, safe to bind as a plain Cypher parameter.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Origin::Human => "Human",
+            Origin::AiSuggested => "AiSuggested",
+            Origin::AiAutoMerged => "AiAutoMerged",
+        }
+    }
+
+    /// Reverse of [`Origin::as_str`]. Defaults to `Human` for anything unrecognized (including
+    /// data written before this property existed) rather than failing the read — same
+    /// backward-compat stance `default_origin` takes on deserialize.
+    pub fn from_str_or_default(s: &str) -> Origin {
+        match s {
+            "AiSuggested" => Origin::AiSuggested,
+            "AiAutoMerged" => Origin::AiAutoMerged,
+            _ => Origin::Human,
+        }
+    }
+}
+
 impl NodeKind {
     /// The Neo4j node label for this kind. Safe to interpolate directly into a Cypher query
     /// string — this is a fixed, closed set of variants, never user-supplied text.
@@ -110,10 +145,18 @@ pub struct Element {
     /// deserialize so data written before this field existed still parses.
     #[serde(default = "default_active")]
     pub active: bool,
+    /// FR-CORE-08 provenance origin. Defaults to `Human` on deserialize so data written before
+    /// this field existed still parses — same backward-compat pattern as `active`.
+    #[serde(default = "default_origin")]
+    pub origin: Origin,
 }
 
 fn default_active() -> bool {
     true
+}
+
+fn default_origin() -> Origin {
+    Origin::Human
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -366,6 +409,7 @@ mod tests {
             kind: NodeKind::Structure,
             name: id.to_string(),
             active: true,
+            origin: Origin::Human,
         }
     }
 
@@ -440,6 +484,7 @@ mod tests {
             kind: NodeKind::Requirement,
             name: "Thrust requirement".to_string(),
             active: true,
+            origin: Origin::Human,
         });
         graph.add_element(structure("Turbine"));
 
@@ -495,6 +540,7 @@ mod tests {
             kind: NodeKind::Requirement,
             name: "Thrust requirement".to_string(),
             active: true,
+            origin: Origin::Human,
         });
 
         let result = graph.add_edge(Edge {
@@ -621,6 +667,7 @@ mod tests {
             kind: NodeKind::Requirement,
             name: "Turbine".to_string(),
             active: true,
+            origin: Origin::Human,
         };
         let result = check_kind_conflict(Some(NodeKind::Structure), &el);
         assert_eq!(
@@ -670,5 +717,29 @@ mod tests {
         let json = serde_json::to_string(&pointer).unwrap();
         let parsed: GeometryPointer = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.object_key, "turbine/casing.stl");
+    }
+
+    /// FR-CORE-08: an element's origin round-trips through JSON, and data written before the
+    /// field existed still parses (defaults to `Human`) — same backward-compat pattern as
+    /// `active`.
+    #[test]
+    fn element_origin_roundtrips_and_defaults() {
+        let el = structure("Turbine");
+        let json = serde_json::to_string(&el).unwrap();
+        let parsed: Element = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.origin, Origin::Human);
+
+        let pre_origin_json =
+            r#"{"id":"Turbine","kind":"Structure","name":"Turbine","active":true}"#;
+        let parsed: Element = serde_json::from_str(pre_origin_json).unwrap();
+        assert_eq!(parsed.origin, Origin::Human);
+
+        let ai_suggested = Element {
+            origin: Origin::AiSuggested,
+            ..structure("Turbine")
+        };
+        let json = serde_json::to_string(&ai_suggested).unwrap();
+        let parsed: Element = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.origin, Origin::AiSuggested);
     }
 }

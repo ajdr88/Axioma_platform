@@ -7,7 +7,12 @@ import {
   edgeTypes,
   nodeTypes,
 } from "@axioma/diagram-engine";
-import type { Edge as ApiEdge, Element as ApiElement, NodeKind } from "@axioma/shared-types";
+import type {
+  Edge as ApiEdge,
+  Element as ApiElement,
+  NodeKind,
+  Origin,
+} from "@axioma/shared-types";
 import { Button, Panel as GlassPanel } from "@axioma/ui-components";
 import {
   addEdge,
@@ -47,8 +52,9 @@ function toFlowNode(
     data: {
       label: element.name,
       kind: element.kind,
-      // Placeholder — sysml_core::Element carries no provenance yet (FR-CORE-08 unimplemented).
-      origin: "human",
+      origin: element.origin,
+      // Placeholder — `validation`/`suspect` have no real trigger yet (solver/test runs,
+      // staleness propagation); FR-CORE-08's `origin` signal is real, these two aren't yet.
       validation: "unverified",
       active: element.active,
       properties: [],
@@ -93,6 +99,8 @@ export default function Home() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [showHazardPanel, setShowHazardPanel] = useState(false);
   const [showMissionPanel, setShowMissionPanel] = useState(false);
+  /** FR-CORE-08 / T-P1.2-06's "AI-suggested only" filter — "all" shows every origin. */
+  const [originFilter, setOriginFilter] = useState<Origin | "all">("all");
 
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode<AxiomaBlockData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge<AxiomaEdgeData>>([]);
@@ -349,27 +357,60 @@ export default function Home() {
     );
   }
 
+  /** FR-CORE-08 provenance scaffolding (T-P1.2-06) — the UI trigger for "mark as ai-suggested
+   * via the API": a picker next to Deactivate/Reactivate on the selected node. */
+  async function handleSetOrigin(node: FlowNode<AxiomaBlockData>, origin: Origin) {
+    const res = await fetch(`/api/elements/${node.id}/origin`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ origin }),
+    });
+    if (!res.ok) {
+      showNotice(await readErrorMessage(res));
+      return;
+    }
+    setNodes((nds) =>
+      nds.map((n) => (n.id === node.id ? { ...n, data: { ...n.data, origin } } : n)),
+    );
+  }
+
   const selectedNode = nodes.find((n) => n.id === selectedNodeId) ?? null;
   const hazardCauseIds = new Set(causesEdges.map((e) => e.source));
+  const visibleNodes =
+    originFilter === "all" ? nodes : nodes.filter((n) => n.data.origin === originFilter);
 
-  const displayNodes = nodes.map((node) => ({
+  const displayNodes = visibleNodes.map((node) => ({
     ...node,
     data: {
       ...node.data,
       editable: editMode,
       hasHazard: hazardCauseIds.has(node.id),
       onRename: (name: string) => handleRename(node.id, name),
+      // Clears the one-shot autoFocusRename flag from persisted state right after it's consumed
+      // — see AxiomaBlockNode's doc comment. Without this, a later remount of this same node
+      // (e.g. it gets filtered out of the canvas by the origin filter and back in) would
+      // re-enter rename mode from a stale `true` flag.
+      onAutoFocusRenameConsumed: () => {
+        setNodes((nds) =>
+          nds.map((n) =>
+            n.id === node.id ? { ...n, data: { ...n.data, autoFocusRename: false } } : n,
+          ),
+        );
+      },
     },
   }));
 
-  const displayEdges = edges.map((edge) => ({
-    ...edge,
-    data: {
-      ...edge.data,
-      editable: editMode,
-      onDisconnect: () => handleDisconnect(edge.source, edge.target),
-    },
-  }));
+  const visibleNodeIds = new Set(visibleNodes.map((n) => n.id));
+  const displayEdges = edges
+    .filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target))
+    .map((edge) => ({
+      ...edge,
+      data: {
+        ...edge.data,
+        editable: editMode,
+        onDisconnect: () => handleDisconnect(edge.source, edge.target),
+      },
+    }));
 
   return (
     <div className="h-screen w-screen">
@@ -493,6 +534,29 @@ export default function Home() {
                   {(selectedNode.data.active ?? true) ? "Deactivate" : "Reactivate"}
                 </Button>
               )}
+              {editMode && selectedNode && (
+                <select
+                  id="origin-picker"
+                  value={selectedNode.data.origin}
+                  onChange={(event) => handleSetOrigin(selectedNode, event.target.value as Origin)}
+                  className="rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
+                >
+                  <option value="Human">Human</option>
+                  <option value="AiSuggested">AI-suggested</option>
+                  <option value="AiAutoMerged">AI-auto-merged</option>
+                </select>
+              )}
+              <select
+                id="origin-filter"
+                value={originFilter}
+                onChange={(event) => setOriginFilter(event.target.value as Origin | "all")}
+                className="rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
+              >
+                <option value="all">All origins</option>
+                <option value="Human">Human only</option>
+                <option value="AiSuggested">AI-suggested only</option>
+                <option value="AiAutoMerged">AI-auto-merged only</option>
+              </select>
               <Button
                 variant={showHazardPanel ? "primary" : "ghost"}
                 onClick={() => {

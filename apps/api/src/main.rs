@@ -16,7 +16,7 @@ use axum::{
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use store::{Neo4jStore, ObjectStore, PostgresStore};
-use sysml_core::{Edge, EdgeKind, Element, ElementBody, NodeKind, ValidationError};
+use sysml_core::{Edge, EdgeKind, Element, ElementBody, NodeKind, Origin, ValidationError};
 
 #[derive(Clone)]
 struct AppState {
@@ -112,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v0/elements", get(list_elements).post(create_element))
         .route("/api/v0/elements/:id", patch(rename_element))
         .route("/api/v0/elements/:id/active", patch(set_element_active))
+        .route("/api/v0/elements/:id/origin", patch(set_element_origin))
         .route(
             "/api/v0/elements/:id/body",
             get(get_element_body).put(update_element_body),
@@ -233,6 +234,7 @@ async fn create_element(
         kind: payload.kind.unwrap_or(NodeKind::Structure),
         name: payload.name,
         active: true,
+        origin: Origin::Human,
     };
     state.neo4j.upsert_element(&element).await?;
     Ok(Json(element))
@@ -281,6 +283,22 @@ async fn set_element_active(
     Json(payload): Json<SetActiveRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.neo4j.set_active(&id, payload.active).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetOriginRequest {
+    origin: Origin,
+}
+
+/// FR-CORE-08 provenance scaffolding (T-P1.2-06): "mark as ai-suggested via the API." Mirrors
+/// `set_element_active` exactly — never touches `name`/`active`.
+async fn set_element_origin(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<SetOriginRequest>,
+) -> Result<StatusCode, ApiError> {
+    state.neo4j.set_origin(&id, payload.origin).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -445,6 +463,7 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
         kind: NodeKind::Structure,
         name: "Engine".to_string(),
         active: true,
+        origin: Origin::Human,
     };
     state.neo4j.upsert_element(&engine).await?;
 
@@ -464,6 +483,7 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
                 kind: NodeKind::Structure,
                 name: name.to_string(),
                 active: true,
+                origin: Origin::Human,
             })
             .await?;
         state
@@ -481,6 +501,7 @@ async fn seed_turbofan_ref(state: &AppState) -> anyhow::Result<()> {
         kind: NodeKind::Requirement,
         name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
         active: true,
+        origin: Origin::Human,
     };
     state.neo4j.upsert_element(&req_thrust).await?;
     state
@@ -594,12 +615,14 @@ mod tests {
             kind: NodeKind::Structure,
             name: "Integration Test Engine".to_string(),
             active: true,
+            origin: Origin::Human,
         };
         let turbine = Element {
             id: "IntegrationTestTurbine".to_string(),
             kind: NodeKind::Structure,
             name: "Integration Test Turbine".to_string(),
             active: true,
+            origin: Origin::Human,
         };
         neo4j.upsert_element(&engine).await.unwrap();
         neo4j.upsert_element(&turbine).await.unwrap();
@@ -636,12 +659,14 @@ mod tests {
             kind: NodeKind::Structure,
             name: "Integration Test Combustor".to_string(),
             active: true,
+            origin: Origin::Human,
         };
         let turbine = Element {
             id: "IntegrationTestSatisfyTurbine".to_string(),
             kind: NodeKind::Structure,
             name: "Integration Test Turbine".to_string(),
             active: true,
+            origin: Origin::Human,
         };
         neo4j.upsert_element(&combustor).await.unwrap();
         neo4j.upsert_element(&turbine).await.unwrap();
@@ -680,6 +705,7 @@ mod tests {
             kind: NodeKind::Structure,
             name: "Integration Test Engine".to_string(),
             active: true,
+            origin: Origin::Human,
         };
         neo4j.upsert_element(&engine).await.unwrap();
 
@@ -702,6 +728,41 @@ mod tests {
                 .any(|e| e.source == engine.id && e.target == "IntegrationTestDoesNotExist"),
             "no partial write: the rejected edge must not appear on read-back"
         );
+    }
+
+    /// FR-CORE-08 / T-P1.2-06: an element defaults to `Human` origin, `set_origin` marks it
+    /// `AiSuggested`, and that sticks on read-back without touching `name`/`active`.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn set_origin_persists_against_neo4j() {
+        let (neo4j, _postgres, _objects) = connect_test_stores().await;
+
+        let element = Element {
+            id: "IntegrationTestOriginBlock".to_string(),
+            kind: NodeKind::Structure,
+            name: "Integration Test Origin Block".to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        neo4j.upsert_element(&element).await.unwrap();
+        assert_eq!(
+            neo4j
+                .get_element(&element.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .origin,
+            Origin::Human
+        );
+
+        neo4j
+            .set_origin(&element.id, Origin::AiSuggested)
+            .await
+            .unwrap();
+        let reloaded = neo4j.get_element(&element.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.origin, Origin::AiSuggested);
+        assert_eq!(reloaded.name, element.name);
+        assert!(reloaded.active);
     }
 
     /// T-P1.1-04: a large body lives in Postgres, a blob is referenced from the object store by
@@ -742,8 +803,8 @@ mod tests {
             "the large body should be readable back from Postgres"
         );
 
-        // Neo4j's upsert_element only ever sets `id`/`name`/`active` — there is no path for the
-        // 20 KB rationale to leak into the graph, but assert it directly rather than by
+        // Neo4j's upsert_element only ever sets `id`/`name`/`active`/`origin` — there is no path
+        // for the 20 KB rationale to leak into the graph, but assert it directly rather than by
         // construction.
         neo4j
             .upsert_element(&Element {
@@ -751,6 +812,7 @@ mod tests {
                 kind: NodeKind::Requirement,
                 name: "Integration test requirement".to_string(),
                 active: true,
+                origin: Origin::Human,
             })
             .await
             .unwrap();
@@ -897,6 +959,7 @@ mod tests {
                 kind: NodeKind::Structure,
                 name: "Originally a Structure".to_string(),
                 active: true,
+                origin: Origin::Human,
             })
             .await
             .unwrap();
@@ -907,6 +970,7 @@ mod tests {
                 kind: NodeKind::Requirement,
                 name: "Now claimed as a Requirement".to_string(),
                 active: true,
+                origin: Origin::Human,
             }],
             contains: vec![],
         };

@@ -27,6 +27,9 @@ export type EdgeKind =
   | "Suspect"
   | "Concerns";
 
+/** FR-CORE-08 provenance origin — who/what created an element. */
+export type Origin = "Human" | "AiSuggested" | "AiAutoMerged";
+
 export interface Element {
   id: string;
   kind: NodeKind;
@@ -34,6 +37,7 @@ export interface Element {
   /** Excluded from *future* system-optimization loops (Mode B, not built yet) when false. Keeps
    * all its data either way — this is a visual/modeling marker, not a delete. */
   active: boolean;
+  origin: Origin;
 }
 
 export interface Edge {

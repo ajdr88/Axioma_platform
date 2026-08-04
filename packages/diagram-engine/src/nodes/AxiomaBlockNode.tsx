@@ -1,8 +1,8 @@
-import type { NodeKind } from "@axioma/shared-types";
+import type { NodeKind, Origin } from "@axioma/shared-types";
 import { Handle, type NodeProps, Position } from "@xyflow/react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-export type Origin = "human" | "ai-suggested" | "ai-auto-merged";
+export type { Origin };
 export type ValidationState = "unverified" | "solver-validated" | "test-validated";
 
 export interface AxiomaBlockProperty {
@@ -27,16 +27,21 @@ export interface AxiomaBlockData extends Record<string, unknown> {
   /** Whether Edit Mode is on — gates the double-click-to-rename interaction below. */
   editable?: boolean;
   onRename?: (name: string) => void;
-  /** Starts this node straight in rename mode (canvas "Add Node") — read once, as the initial
-   * state below; toggling it after mount has no further effect. */
+  /** Starts this node straight in rename mode (canvas "Add Node") — consumed once, on mount (see
+   * the effect below), which immediately reports back via `onAutoFocusRenameConsumed` so the
+   * caller can clear it from this node's persisted data. Without that, a *later* remount of this
+   * same node (e.g. it gets filtered out of the canvas and back in) would re-enter rename mode
+   * from the still-`true` flag — a real bug this project hit once the provenance-origin filter
+   * could cause exactly that remount. */
   autoFocusRename?: boolean;
+  onAutoFocusRenameConsumed?: () => void;
   properties: AxiomaBlockProperty[];
 }
 
 const originBorder: Record<Origin, string> = {
-  human: "border-white/10",
-  "ai-suggested": "border-dashed border-cobalt-glow/40",
-  "ai-auto-merged": "border-dashed border-cobalt-glow/70 shadow-cobalt-glow/20",
+  Human: "border-white/10",
+  AiSuggested: "border-dashed border-cobalt-glow/40",
+  AiAutoMerged: "border-dashed border-cobalt-glow/70 shadow-cobalt-glow/20",
 };
 
 /** Header-dot/header-band accent per `kind` — every other kind (Structure, Requirement, etc.)
@@ -56,6 +61,15 @@ export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData })
   const [isRenaming, setIsRenaming] = useState(data.autoFocusRename ?? false);
   const [draftName, setDraftName] = useState(data.label);
   const isActive = data.active ?? true;
+
+  // Intentionally mount-only: consumes the one-shot `autoFocusRename` flag exactly once per
+  // mount, not on every data change.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: see comment above
+  useEffect(() => {
+    if (data.autoFocusRename) {
+      data.onAutoFocusRenameConsumed?.();
+    }
+  }, []);
 
   function startRename() {
     if (!data.editable) {

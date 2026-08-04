@@ -5,14 +5,15 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use neo4rs::{query, Graph as Neo4jConn, Row};
-use sysml_core::{Edge, EdgeKind, Element, ElementId, NodeKind, ValidationError};
+use sysml_core::{Edge, EdgeKind, Element, ElementId, NodeKind, Origin, ValidationError};
 
-/// Shared by `list_elements` and `get_element` — both queries return the same four columns.
+/// Shared by `list_elements` and `get_element` — both queries return the same five columns.
 fn row_to_element(row: &Row) -> Result<Element> {
     let id: String = row.get("id").context("missing id")?;
     let name: String = row.get("name").context("missing name")?;
     let labels: Vec<String> = row.get("labels").context("missing labels")?;
     let active: bool = row.get("active").context("missing active")?;
+    let origin: String = row.get("origin").context("missing origin")?;
     let kind = labels
         .iter()
         .find_map(|l| NodeKind::from_label(l))
@@ -22,6 +23,7 @@ fn row_to_element(row: &Row) -> Result<Element> {
         kind,
         name,
         active,
+        origin: Origin::from_str_or_default(&origin),
     })
 }
 
@@ -45,18 +47,20 @@ impl Neo4jStore {
             .context("Neo4j ping failed")
     }
 
-    /// `MERGE`s an element node by id. Only `id`/`kind`(label)/`name`/`active` are stored here —
-    /// bodies and blobs live elsewhere (NFR-DATA-01).
+    /// `MERGE`s an element node by id. Only `id`/`kind`(label)/`name`/`active`/`origin` are
+    /// stored here — bodies and blobs live elsewhere (NFR-DATA-01).
     pub async fn upsert_element(&self, element: &Element) -> Result<()> {
         let label = element.kind.as_label();
-        let cypher =
-            format!("MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = $active");
+        let cypher = format!(
+            "MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = $active, n.origin = $origin"
+        );
         self.conn
             .run(
                 query(&cypher)
                     .param("id", element.id.clone())
                     .param("name", element.name.clone())
-                    .param("active", element.active),
+                    .param("active", element.active)
+                    .param("origin", element.origin.as_str()),
             )
             .await
             .with_context(|| format!("upserting element {}", element.id))
@@ -74,15 +78,28 @@ impl Neo4jStore {
             .with_context(|| format!("setting active={active} on element {id}"))
     }
 
-    /// Single-element lookup — used by rename to preserve `kind`/`active` when only `name`
-    /// changes.
+    /// Sets just the `origin` flag (FR-CORE-08 provenance scaffolding, T-P1.2-06's "mark as
+    /// ai-suggested via the API") — never touches `name`/`active`.
+    pub async fn set_origin(&self, id: &str, origin: Origin) -> Result<()> {
+        self.conn
+            .run(
+                query("MATCH (n {id: $id}) SET n.origin = $origin")
+                    .param("id", id.to_string())
+                    .param("origin", origin.as_str()),
+            )
+            .await
+            .with_context(|| format!("setting origin={origin:?} on element {id}"))
+    }
+
+    /// Single-element lookup — used by rename to preserve `kind`/`active`/`origin` when only
+    /// `name` changes.
     pub async fn get_element(&self, id: &str) -> Result<Option<Element>> {
         let mut result = self
             .conn
             .execute(
                 query(
                     "MATCH (n {id: $id}) RETURN n.id AS id, n.name AS name, labels(n) AS labels, \
-                     coalesce(n.active, true) AS active",
+                     coalesce(n.active, true) AS active, coalesce(n.origin, 'Human') AS origin",
                 )
                 .param("id", id.to_string()),
             )
@@ -100,7 +117,7 @@ impl Neo4jStore {
             .conn
             .execute(query(
                 "MATCH (n) RETURN n.id AS id, n.name AS name, labels(n) AS labels, \
-                 coalesce(n.active, true) AS active",
+                 coalesce(n.active, true) AS active, coalesce(n.origin, 'Human') AS origin",
             ))
             .await
             .context("listing elements")?;
@@ -270,14 +287,16 @@ impl Neo4jStore {
 
         for element in elements {
             let label = element.kind.as_label();
-            let cypher =
-                format!("MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = $active");
+            let cypher = format!(
+                "MERGE (n:{label} {{id: $id}}) SET n.name = $name, n.active = $active, n.origin = $origin"
+            );
             if let Err(err) = txn
                 .run(
                     query(&cypher)
                         .param("id", element.id.clone())
                         .param("name", element.name.clone())
-                        .param("active", element.active),
+                        .param("active", element.active)
+                        .param("origin", element.origin.as_str()),
                 )
                 .await
             {
