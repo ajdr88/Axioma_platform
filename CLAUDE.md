@@ -174,3 +174,5 @@ binary PASS/FAIL criteria with numeric thresholds where the source NFR defines o
 - `alf-lite`: each supported construct needs a golden test (source → fUML → executed trace);
   an out-of-subset construct must yield a precise compile error, never a silent partial compile.
 - Deterministic replay: 100 identical simulation runs produce identical results.
+
+
