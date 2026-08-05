@@ -82,6 +82,13 @@ export function HazardRiskPanel({
 
       {error && <p className="mb-2 text-xs text-alert">{error}</p>}
 
+      <a
+        href={`/api/projects/${projectId}/safety/risk-register`}
+        className="mb-3 block w-full rounded border border-white/10 px-2 py-1 text-center text-xs text-white/70 hover:bg-white/5"
+      >
+        Export Risk Register (ARP4761)
+      </a>
+
       <div className="mb-3">
         <label
           htmlFor="hazard-subsystem-filter"

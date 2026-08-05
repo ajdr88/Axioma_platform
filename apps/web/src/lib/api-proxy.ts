@@ -21,9 +21,19 @@ export async function proxyRequest(
     // The Response constructor throws if given a body (even "") alongside a null-body status —
     // apps/api's PATCH/PUT endpoints return 204 with no content, so this isn't an edge case.
     const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
+    const headers: HeadersInit = {
+      "Content-Type": upstream.headers.get("Content-Type") ?? "application/json",
+    };
+    // Forwarded so the risk-register export's "attachment" disposition survives the proxy hop —
+    // a browser only triggers a native download if this header reaches the response it actually
+    // sees, not just the upstream response the proxy fetched.
+    const contentDisposition = upstream.headers.get("Content-Disposition");
+    if (contentDisposition) {
+      headers["Content-Disposition"] = contentDisposition;
+    }
     return new Response(NULL_BODY_STATUSES.has(upstream.status) ? null : responseBody, {
       status: upstream.status,
-      headers: { "Content-Type": upstream.headers.get("Content-Type") ?? "application/json" },
+      headers,
     });
   } catch {
     return Response.json(

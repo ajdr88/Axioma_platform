@@ -43,6 +43,7 @@ import { HazardRiskPanel } from "@/components/HazardRiskPanel";
 import { MissionPlanningPanel } from "@/components/MissionPlanningPanel";
 import { StageTrackingPanel } from "@/components/StageTrackingPanel";
 import type { TextualEditorPanelHandle } from "@/components/TextualEditorPanel";
+import { TraceabilityPanel } from "@/components/TraceabilityPanel";
 
 // `monaco-editor` touches `window` at module-evaluation time — a plain static import would pull
 // it into the SSR module graph (and crash prerendering) even while `showTextPanel` is false and
@@ -136,6 +137,7 @@ export default function Home() {
   const [showHazardPanel, setShowHazardPanel] = useState(false);
   const [showMissionPanel, setShowMissionPanel] = useState(false);
   const [showStagePanel, setShowStagePanel] = useState(false);
+  const [showTraceabilityPanel, setShowTraceabilityPanel] = useState(false);
   /** FR-CORE-08 / T-P1.2-06's "AI-suggested only" filter — "all" shows every origin. */
   const [originFilter, setOriginFilter] = useState<Origin | "all">("all");
 
@@ -315,7 +317,10 @@ export default function Home() {
       return null;
     }
     const element: ApiElement = await res.json();
-    const position = { x: 40 + Math.random() * 80, y: 40 + Math.random() * 80 };
+    // Same reasoning as computeElkLayout's isolated-node placement (packages/diagram-engine/src
+    // /layout.ts): the flow-space origin sits directly under the fixed top-left toolbar panel
+    // once the canvas fits content into view, so a fresh node must not jitter-spawn near (0, 0).
+    const position = { x: 400 + Math.random() * 200, y: 400 + Math.random() * 200 };
     await fetch(apiPath(projectId, `/elements/${element.id}/position`), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -562,6 +567,8 @@ export default function Home() {
         setShowMissionPanel={setShowMissionPanel}
         showStagePanel={showStagePanel}
         setShowStagePanel={setShowStagePanel}
+        showTraceabilityPanel={showTraceabilityPanel}
+        setShowTraceabilityPanel={setShowTraceabilityPanel}
         originFilter={originFilter}
         setOriginFilter={setOriginFilter}
         nodes={nodes}
@@ -608,6 +615,8 @@ interface CanvasProps {
   setShowMissionPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showStagePanel: boolean;
   setShowStagePanel: React.Dispatch<React.SetStateAction<boolean>>;
+  showTraceabilityPanel: boolean;
+  setShowTraceabilityPanel: React.Dispatch<React.SetStateAction<boolean>>;
   originFilter: Origin | "all";
   setOriginFilter: (filter: Origin | "all") => void;
   nodes: FlowNode<AxiomaBlockData>[];
@@ -656,6 +665,8 @@ function Canvas({
   setShowMissionPanel,
   showStagePanel,
   setShowStagePanel,
+  showTraceabilityPanel,
+  setShowTraceabilityPanel,
   originFilter,
   setOriginFilter,
   nodes,
@@ -1004,6 +1015,7 @@ function Canvas({
                   setShowHazardPanel((v) => !v);
                   setShowMissionPanel(false);
                   setShowStagePanel(false);
+                  setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
@@ -1016,6 +1028,7 @@ function Canvas({
                   setShowMissionPanel((v) => !v);
                   setShowHazardPanel(false);
                   setShowStagePanel(false);
+                  setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
@@ -1028,11 +1041,24 @@ function Canvas({
                   setShowStagePanel((v) => !v);
                   setShowHazardPanel(false);
                   setShowMissionPanel(false);
+                  setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
               >
                 Stage Tracking
+              </Button>
+              <Button
+                variant={showTraceabilityPanel ? "primary" : "ghost"}
+                onClick={() => {
+                  setShowTraceabilityPanel((v) => !v);
+                  setShowHazardPanel(false);
+                  setShowMissionPanel(false);
+                  setShowStagePanel(false);
+                }}
+                className="!px-2 !py-1 text-xs"
+              >
+                Traceability
               </Button>
               <Button
                 variant={showTextPanel ? "primary" : "ghost"}
@@ -1044,12 +1070,22 @@ function Canvas({
             </div>
           </GlassPanel>
 
-          {selectedNode && projectId && (
+          {selectedNode && projectId && !showTraceabilityPanel && (
             <ElementInspector
               elementId={selectedNode.id}
               elementLabel={selectedNode.data.label}
               projectId={projectId}
+              editMode={editMode}
               onClose={() => setSelectedNodeId(null)}
+              reloadModel={reloadModel}
+            />
+          )}
+
+          {showTraceabilityPanel && projectId && (
+            <TraceabilityPanel
+              selectedNode={selectedNode}
+              projectId={projectId}
+              onClose={() => setShowTraceabilityPanel(false)}
             />
           )}
 

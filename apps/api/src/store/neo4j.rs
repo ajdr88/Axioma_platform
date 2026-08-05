@@ -298,6 +298,80 @@ impl Neo4jStore {
             })
     }
 
+    /// Removes an element and every relationship touching it, any kind, either direction
+    /// (`DETACH DELETE` — Neo4j's atomic node-plus-incident-edges delete). Callers (P1.3,
+    /// `apps/api/src/traceability.rs`) are responsible for the Traceability Breach gate *before*
+    /// calling this — it performs no dependent check itself, matching `delete_edge`'s "no
+    /// validation needed" stance for the graph-level operation itself.
+    pub async fn delete_element(&self, project_id: &str, id: &str) -> Result<()> {
+        self.conn
+            .run(
+                query("MATCH (n {id: $id, project_id: $project_id}) DETACH DELETE n")
+                    .param("id", id.to_string())
+                    .param("project_id", project_id.to_string()),
+            )
+            .await
+            .with_context(|| format!("deleting element {id}"))
+    }
+
+    /// One hop of {`Satisfy`, `Verify`, `Refine`} out of this element (this element is the edge's
+    /// source) — the traceability BFS engine's (`apps/api/src/traceability.rs`) "outgoing"
+    /// direction (FR-CORE-03).
+    pub async fn trace_outgoing_neighbors(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<(ElementId, EdgeKind)>> {
+        self.trace_neighbors(project_id, id, "->").await
+    }
+
+    /// One hop of {`Satisfy`, `Verify`, `Refine`} into this element (this element is the edge's
+    /// target) — "what depends on / satisfies / verifies / refines me," the change-impact
+    /// direction (T-P1.3-01/03).
+    pub async fn trace_incoming_neighbors(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<(ElementId, EdgeKind)>> {
+        self.trace_neighbors(project_id, id, "<-").await
+    }
+
+    async fn trace_neighbors(
+        &self,
+        project_id: &str,
+        id: &str,
+        arrow: &str,
+    ) -> Result<Vec<(ElementId, EdgeKind)>> {
+        // `arrow` is always one of the two literal strings above, never caller/user input —
+        // same "fixed, closed set, safe to interpolate" reasoning as `EdgeKind::as_rel_type`.
+        let cypher = if arrow == "->" {
+            "MATCH (a {id: $id, project_id: $project_id})-[r:SATISFY|VERIFY|REFINE]->\
+             (b {project_id: $project_id}) RETURN b.id AS neighbor_id, type(r) AS rel_type"
+        } else {
+            "MATCH (a {id: $id, project_id: $project_id})<-[r:SATISFY|VERIFY|REFINE]-\
+             (b {project_id: $project_id}) RETURN b.id AS neighbor_id, type(r) AS rel_type"
+        };
+        let mut result = self
+            .conn
+            .execute(
+                query(cypher)
+                    .param("id", id.to_string())
+                    .param("project_id", project_id.to_string()),
+            )
+            .await
+            .with_context(|| format!("listing trace neighbors of {id}"))?;
+
+        let mut neighbors = Vec::new();
+        while let Some(row) = result.next().await.context("reading trace neighbor row")? {
+            let neighbor_id: String = row.get("neighbor_id").context("missing neighbor_id")?;
+            let rel_type: String = row.get("rel_type").context("missing rel_type")?;
+            let kind = EdgeKind::from_rel_type(&rel_type)
+                .with_context(|| format!("unknown relationship type {rel_type}"))?;
+            neighbors.push((neighbor_id, kind));
+        }
+        Ok(neighbors)
+    }
+
     /// Validates and writes a batch of elements + `Contains` edges atomically (import handlers,
     /// FR-CORE-07): kind-conflict and containment-cycle checks run first, against existing state
     /// *and* against the batch itself (so a batch that only cycles internally is also caught) —

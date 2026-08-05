@@ -4,8 +4,14 @@ import type { AxiomaBlockData } from "@axioma/diagram-engine";
 import type { Edge as ApiEdge } from "@axioma/shared-types";
 import { Button, Panel } from "@axioma/ui-components";
 import type { Node as FlowNode } from "@xyflow/react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useElementBodies } from "@/lib/useElementBodies";
+
+interface MissionCoverage {
+  totalRequirements: number;
+  coveredCount: number;
+  orphaned: { id: string; name: string }[];
+}
 
 /** FR-MSN-03: "Lifecycle phases (Concept -> Development -> Production -> Operations -> Disposal)
  * as a timeline overlay." */
@@ -62,6 +68,31 @@ export function MissionPlanningPanel({
   );
   const { bodies, updateProperty, error } = useElementBodies(trackedIds, projectId);
 
+  // FR-MSN-04 / T-P1.3-05: re-fetched whenever the Concerns edge count changes (creating a
+  // Stakeholder's Mission/Requirement links is the only thing that can change coverage) rather
+  // than recomputed client-side, so this panel doesn't duplicate `apps/api`'s coverage rule.
+  // concernsEdges.length is a deliberate re-fetch trigger, not a value the effect body reads.
+  const [coverage, setCoverage] = useState<MissionCoverage | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional re-fetch-on-edge-change
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/projects/${projectId}/mission-coverage`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: MissionCoverage | null) => {
+        if (!cancelled) {
+          setCoverage(data);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCoverage(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, concernsEdges.length]);
+
   function stakeholdersConcernedWith(elementId: string): FlowNode<AxiomaBlockData>[] {
     return concernsEdges
       .filter((e) => e.target === elementId)
@@ -79,6 +110,28 @@ export function MissionPlanningPanel({
       </div>
 
       {error && <p className="mb-2 text-xs text-alert">{error}</p>}
+
+      {coverage && (
+        <div className="mb-3 rounded border border-white/10 p-2">
+          <p className="text-[10px] uppercase tracking-widest text-white/40">Mission Coverage</p>
+          <p className="text-xs text-white/80">
+            {coverage.coveredCount} of {coverage.totalRequirements} requirements traced to a mission
+          </p>
+          {coverage.orphaned.length > 0 && (
+            <ul className="mt-1 space-y-0.5">
+              {coverage.orphaned.map((requirement) => (
+                <li
+                  key={requirement.id}
+                  data-orphaned-requirement-id={requirement.id}
+                  className="font-mono text-[10px] text-alert"
+                >
+                  {requirement.name}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       <div className="mb-4">
         <p className="mb-1 text-[10px] uppercase tracking-widest text-white/40">Missions</p>

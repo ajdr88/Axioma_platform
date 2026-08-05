@@ -132,6 +132,23 @@ impl EdgeKind {
             EdgeKind::Concerns => "CONCERNS",
         }
     }
+
+    /// Reverse of [`EdgeKind::as_rel_type`] — reconstructs an `EdgeKind` from a Neo4j relationship
+    /// type string (e.g. `type(r)` in a Cypher `RETURN`).
+    pub fn from_rel_type(rel_type: &str) -> Option<EdgeKind> {
+        match rel_type {
+            "CONTAINS" => Some(EdgeKind::Contains),
+            "SATISFY" => Some(EdgeKind::Satisfy),
+            "VERIFY" => Some(EdgeKind::Verify),
+            "REFINE" => Some(EdgeKind::Refine),
+            "CAUSES" => Some(EdgeKind::Causes),
+            "MITIGATED_BY" => Some(EdgeKind::MitigatedBy),
+            "VALIDATED_BY" => Some(EdgeKind::ValidatedBy),
+            "SUSPECT" => Some(EdgeKind::Suspect),
+            "CONCERNS" => Some(EdgeKind::Concerns),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -696,6 +713,24 @@ mod tests {
             assert_eq!(NodeKind::from_label(kind.as_label()), Some(kind));
         }
         assert_eq!(NodeKind::from_label("NotAKind"), None);
+    }
+
+    #[test]
+    fn edge_kind_rel_type_roundtrips() {
+        for kind in [
+            EdgeKind::Contains,
+            EdgeKind::Satisfy,
+            EdgeKind::Verify,
+            EdgeKind::Refine,
+            EdgeKind::Causes,
+            EdgeKind::MitigatedBy,
+            EdgeKind::ValidatedBy,
+            EdgeKind::Suspect,
+            EdgeKind::Concerns,
+        ] {
+            assert_eq!(EdgeKind::from_rel_type(kind.as_rel_type()), Some(kind));
+        }
+        assert_eq!(EdgeKind::from_rel_type("NOT_A_KIND"), None);
     }
 
     #[test]

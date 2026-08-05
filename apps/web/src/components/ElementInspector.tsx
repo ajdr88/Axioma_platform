@@ -10,11 +10,22 @@ interface PropertyRow {
 
 type LoadState = { status: "loading" } | { status: "error"; message: string } | { status: "ready" };
 
+interface BreachDependent {
+  id: string;
+  kind: string;
+  name: string;
+}
+
 interface ElementInspectorProps {
   elementId: string;
   elementLabel: string;
   projectId: string;
+  editMode: boolean;
   onClose: () => void;
+  /** Refetches the canvas's nodes/edges from the backend — reused here after a successful
+   * delete, since removing a node isn't one of the local-state updates any existing handler
+   * already knows how to do (every other mutation edits a node in place; this removes one). */
+  reloadModel: () => Promise<void>;
 }
 
 /**
@@ -27,12 +38,18 @@ export function ElementInspector({
   elementId,
   elementLabel,
   projectId,
+  editMode,
   onClose,
+  reloadModel,
 }: ElementInspectorProps) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [rationale, setRationale] = useState("");
   const [rows, setRows] = useState<PropertyRow[]>([]);
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [breach, setBreach] = useState<{ message: string; dependents: BreachDependent[] } | null>(
+    null,
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -103,6 +120,37 @@ export function ElementInspector({
       });
     } finally {
       setSaving(false);
+    }
+  }
+
+  /** T-P1.3-03: a direct Satisfy/Verify/Refine dependent blocks the delete with a 409
+   * Traceability Breach unless `acknowledge=true` — `acknowledge` re-sends the same request
+   * with that override once the user has seen (and accepted) the dependent list. */
+  async function handleDelete(acknowledge: boolean) {
+    setDeleting(true);
+    try {
+      const query = acknowledge ? "?acknowledge=true" : "";
+      const res = await fetch(`/api/projects/${projectId}/elements/${elementId}${query}`, {
+        method: "DELETE",
+      });
+      if (res.status === 409) {
+        const body = await res.json();
+        setBreach({ message: body.message, dependents: body.dependents });
+        return;
+      }
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.error ?? `delete failed with status ${res.status}`);
+      }
+      await reloadModel();
+      onClose();
+    } catch (error) {
+      setState({
+        status: "error",
+        message: error instanceof Error ? error.message : "failed to delete element",
+      });
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -189,6 +237,53 @@ export function ElementInspector({
           <Button onClick={handleSave} disabled={saving} className="w-full justify-center">
             {saving ? "Saving…" : "Save"}
           </Button>
+
+          {editMode && (
+            <div className="border-t border-white/10 pt-3">
+              {breach ? (
+                <div className="space-y-2">
+                  <p className="text-xs text-alert">Traceability Breach</p>
+                  <p className="text-[11px] text-white/70">{breach.message}</p>
+                  <ul className="space-y-0.5">
+                    {breach.dependents.map((dependent) => (
+                      <li
+                        key={dependent.id}
+                        data-dependent-id={dependent.id}
+                        className="font-mono text-[10px] text-graphite"
+                      >
+                        {dependent.name} ({dependent.kind})
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="flex gap-1.5">
+                    <Button
+                      variant="ghost"
+                      onClick={() => setBreach(null)}
+                      className="flex-1 !py-1 text-xs"
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      onClick={() => handleDelete(true)}
+                      disabled={deleting}
+                      className="flex-1 !bg-alert !py-1 text-xs hover:!bg-alert/80"
+                    >
+                      {deleting ? "Deleting…" : "Acknowledge and delete anyway"}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <Button
+                  variant="ghost"
+                  onClick={() => handleDelete(false)}
+                  disabled={deleting}
+                  className="w-full justify-center !text-alert"
+                >
+                  {deleting ? "Deleting…" : "Delete element"}
+                </Button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </Panel>

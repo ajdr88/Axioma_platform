@@ -96,6 +96,11 @@ pub enum DiffEntry {
         kind: NodeKind,
         name: String,
     },
+    ElementDeleted {
+        element_id: ElementId,
+        kind: NodeKind,
+        name: String,
+    },
     ElementActiveChanged {
         element_id: ElementId,
         active: bool,
@@ -538,6 +543,20 @@ fn compute_snapshot_diff(old: &Snapshot, new: &Snapshot) -> Vec<DiffEntry> {
                 name: element.name.clone(),
             }),
         }
+    }
+
+    let new_by_id: HashMap<&str, &Element> =
+        new.elements.iter().map(|e| (e.id.as_str(), e)).collect();
+    for element in old
+        .elements
+        .iter()
+        .filter(|e| !new_by_id.contains_key(e.id.as_str()))
+    {
+        out.push(DiffEntry::ElementDeleted {
+            element_id: element.id.clone(),
+            kind: element.kind,
+            name: element.name.clone(),
+        });
     }
 
     for (id, new_body) in &new.bodies {

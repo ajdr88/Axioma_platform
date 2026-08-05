@@ -9,6 +9,7 @@
 
 mod import;
 mod store;
+mod traceability;
 
 use std::collections::HashMap;
 
@@ -161,7 +162,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/v0/projects/:projectId/elements/:id",
-            patch(rename_element),
+            patch(rename_element).delete(traceability::delete_element),
+        )
+        .route(
+            "/api/v0/projects/:projectId/elements/:id/traceability",
+            get(traceability::get_traceability),
         )
         .route(
             "/api/v0/projects/:projectId/elements/:id/active",
@@ -201,6 +206,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/import/reqif",
             post(import::reqif::import_reqif),
+        )
+        .route(
+            "/api/v0/projects/:projectId/safety/risk-register",
+            get(traceability::get_risk_register),
+        )
+        .route(
+            "/api/v0/projects/:projectId/mission-coverage",
+            get(traceability::get_mission_coverage),
         )
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -1804,5 +1817,695 @@ mod tests {
 
         let a_elements = neo4j.list_elements(&project_a.id).await.unwrap();
         assert!(a_elements.iter().any(|e| e.id == "SharedId"));
+    }
+
+    // -----------------------------------------------------------------------
+    // P1.3 Digital Thread: traceability, delete/breach, safety export, mission-coverage
+    // -----------------------------------------------------------------------
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = response.into_body();
+        let bytes = http_body_util::BodyExt::collect(body)
+            .await
+            .expect("collecting response body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("response body should be valid JSON")
+    }
+
+    async fn make_structure(neo4j: &Neo4jStore, project_id: &str, id: &str) {
+        neo4j
+            .upsert_element(
+                project_id,
+                &Element {
+                    id: id.to_string(),
+                    kind: NodeKind::Structure,
+                    name: id.to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn traceability_both_direction_never_includes_the_root_itself() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "trace-no-self").await;
+        make_structure(&state.neo4j, &project.id, "A").await;
+        make_structure(&state.neo4j, &project.id, "B").await;
+        // A single A->B edge, traversed with direction=both, walks backward from B to A too —
+        // the root (A) must never end up in its own results because of that backward walk.
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "A".to_string(),
+                    target: "B".to_string(),
+                    kind: EdgeKind::Refine,
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "A".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(3),
+                max_fanout: Some(50),
+                direction: Some(traceability::Direction::Both),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response_json(response).await;
+        let ids: Vec<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["B"],
+            "root A must not reappear in its own traceability results"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn traceability_depth_and_direction_filter_correctly() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "trace-depth").await;
+        for id in ["S1", "S2", "S3"] {
+            make_structure(&state.neo4j, &project.id, id).await;
+        }
+        // S1 --Refine--> S2 --Refine--> S3 (Refine has no endpoint-kind constraint, unlike
+        // Satisfy, so a plain Structure-Structure chain is legal here).
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "S1".to_string(),
+                    target: "S2".to_string(),
+                    kind: EdgeKind::Refine,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "S2".to_string(),
+                    target: "S3".to_string(),
+                    kind: EdgeKind::Refine,
+                },
+            )
+            .await
+            .unwrap();
+
+        // depth=1, incoming from S2: only S1 (the thing pointing AT S2).
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "S2".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(1),
+                max_fanout: Some(50),
+                direction: Some(traceability::Direction::Incoming),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response_json(response).await;
+        let ids: Vec<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["S1"],
+            "incoming depth=1 from S2 should be just S1"
+        );
+
+        // depth=1, outgoing from S2: only S3.
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "S2".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(1),
+                max_fanout: Some(50),
+                direction: Some(traceability::Direction::Outgoing),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response_json(response).await;
+        let ids: Vec<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["S3"],
+            "outgoing depth=1 from S2 should be just S3"
+        );
+
+        // depth=2, incoming from S3: S2 (hop 1) and S1 (hop 2, reached via S2).
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "S3".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(2),
+                max_fanout: Some(50),
+                direction: Some(traceability::Direction::Incoming),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response_json(response).await;
+        let mut ids: Vec<&str> = body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["S1", "S2"],
+            "incoming depth=2 from S3 should recover both S2 and S1"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn traceability_requires_explicit_depth_and_fanout() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "trace-explicit").await;
+        make_structure(&state.neo4j, &project.id, "Solo").await;
+
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "Solo".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: None,
+                max_fanout: Some(50),
+                direction: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        assert!(
+            response.is_err(),
+            "missing depth must be rejected, not defaulted"
+        );
+
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "Solo".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(3),
+                max_fanout: None,
+                direction: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        assert!(
+            response.is_err(),
+            "missing maxFanout must be rejected, not defaulted"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn traceability_rejects_above_ceiling() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "trace-ceiling").await;
+        make_structure(&state.neo4j, &project.id, "Solo").await;
+
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "Solo".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(11),
+                max_fanout: Some(50),
+                direction: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        assert!(
+            response.is_err(),
+            "depth above the server's ceiling must be rejected"
+        );
+
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "Solo".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(3),
+                max_fanout: Some(501),
+                direction: None,
+                cursor: None,
+            }),
+        )
+        .await;
+        assert!(
+            response.is_err(),
+            "maxFanout above the server's ceiling must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn traceability_caps_fanout_and_flags_truncation() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "trace-fanout").await;
+        make_structure(&state.neo4j, &project.id, "Hub").await;
+        for i in 0..5 {
+            let id = format!("Leaf{i}");
+            make_structure(&state.neo4j, &project.id, &id).await;
+            state
+                .neo4j
+                .create_edge(
+                    &project.id,
+                    &Edge {
+                        source: id,
+                        target: "Hub".to_string(),
+                        kind: EdgeKind::Refine,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "Hub".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(1),
+                max_fanout: Some(2),
+                direction: Some(traceability::Direction::Incoming),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response_json(response).await;
+        assert_eq!(body["results"].as_array().unwrap().len(), 2);
+        assert_eq!(body["fanoutTruncated"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn traceability_pagination_covers_full_set_without_duplicates() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "trace-pagination").await;
+        make_structure(&state.neo4j, &project.id, "Hub").await;
+        let mut expected_ids = std::collections::HashSet::new();
+        for i in 0..220 {
+            let id = format!("Dep{i:04}");
+            make_structure(&state.neo4j, &project.id, &id).await;
+            state
+                .neo4j
+                .create_edge(
+                    &project.id,
+                    &Edge {
+                        source: id.clone(),
+                        target: "Hub".to_string(),
+                        kind: EdgeKind::Refine,
+                    },
+                )
+                .await
+                .unwrap();
+            expected_ids.insert(id);
+        }
+
+        let first_page = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "Hub".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(1),
+                max_fanout: Some(500),
+                direction: Some(traceability::Direction::Incoming),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let first_body = response_json(first_page).await;
+        let first_ids: Vec<String> = first_body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            first_ids.len(),
+            200,
+            "first page should be exactly PAGE_SIZE"
+        );
+        let cursor = first_body["nextCursor"]
+            .as_str()
+            .expect("first page should have a next cursor")
+            .to_string();
+
+        let second_page = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "Hub".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(1),
+                max_fanout: Some(500),
+                direction: Some(traceability::Direction::Incoming),
+                cursor: Some(cursor),
+            }),
+        )
+        .await
+        .unwrap();
+        let second_body = response_json(second_page).await;
+        let second_ids: Vec<String> = second_body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            second_ids.len(),
+            20,
+            "second page should hold the remaining 20"
+        );
+        assert!(
+            second_body["nextCursor"].is_null(),
+            "no more pages after the second"
+        );
+
+        let mut all_ids: std::collections::HashSet<String> = first_ids.into_iter().collect();
+        for id in &second_ids {
+            assert!(
+                all_ids.insert(id.clone()),
+                "id {id} appeared on both pages — pagination overlap"
+            );
+        }
+        assert_eq!(
+            all_ids, expected_ids,
+            "union of all pages must equal the true dependent set, none missed/spurious"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn delete_with_dependents_returns_breach_then_succeeds_with_acknowledge() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "delete-breach").await;
+        // Satisfy's endpoint rule requires the target to be a Requirement (a real one, so the
+        // dependent edges below are legal) — matches T-P1.3-03's own "10 Satisfy dependents" shape.
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "Hub".to_string(),
+                    kind: NodeKind::Requirement,
+                    name: "Hub".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        for id in ["Dep1", "Dep2", "Dep3"] {
+            make_structure(&state.neo4j, &project.id, id).await;
+            state
+                .neo4j
+                .create_edge(
+                    &project.id,
+                    &Edge {
+                        source: id.to_string(),
+                        target: "Hub".to_string(),
+                        kind: EdgeKind::Satisfy,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let response = traceability::delete_element(
+            State(state.clone()),
+            Path((project.id.clone(), "Hub".to_string())),
+            Query(traceability::DeleteElementQuery { acknowledge: false }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], serde_json::json!("traceability_breach"));
+        let mut dependent_ids: Vec<&str> = body["dependents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        dependent_ids.sort();
+        assert_eq!(dependent_ids, vec!["Dep1", "Dep2", "Dep3"]);
+
+        // Still exists — the breach must have actually blocked the delete.
+        assert!(state
+            .neo4j
+            .get_element(&project.id, "Hub")
+            .await
+            .unwrap()
+            .is_some());
+
+        let response = traceability::delete_element(
+            State(state.clone()),
+            Path((project.id.clone(), "Hub".to_string())),
+            Query(traceability::DeleteElementQuery { acknowledge: true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(state
+            .neo4j
+            .get_element(&project.id, "Hub")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn delete_without_dependents_succeeds_without_acknowledge() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "delete-lonely").await;
+        make_structure(&state.neo4j, &project.id, "Lonely").await;
+
+        let response = traceability::delete_element(
+            State(state.clone()),
+            Path((project.id.clone(), "Lonely".to_string())),
+            Query(traceability::DeleteElementQuery { acknowledge: false }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(state
+            .neo4j
+            .get_element(&project.id, "Lonely")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn risk_register_reflects_hazard_severity_and_mitigated_control() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "risk-register").await;
+
+        make_structure(&state.neo4j, &project.id, "Turbine").await;
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "HAZ-OVERSPEED".to_string(),
+                    kind: NodeKind::Hazard,
+                    name: "Overspeed".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .postgres
+            .upsert_body(
+                &project.id,
+                &ElementBody {
+                    element_id: "HAZ-OVERSPEED".to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "severity": "Major", "likelihood": "Probable" }),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "Turbine".to_string(),
+                    target: "HAZ-OVERSPEED".to_string(),
+                    kind: EdgeKind::Causes,
+                },
+            )
+            .await
+            .unwrap();
+
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "Governor".to_string(),
+                    kind: NodeKind::Control,
+                    name: "Governor".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .postgres
+            .upsert_body(
+                &project.id,
+                &ElementBody {
+                    element_id: "Governor".to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "status": "Mitigated" }),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "HAZ-OVERSPEED".to_string(),
+                    target: "Governor".to_string(),
+                    kind: EdgeKind::MitigatedBy,
+                },
+            )
+            .await
+            .unwrap();
+
+        let response =
+            traceability::get_risk_register(State(state.clone()), Path(project.id.clone()))
+                .await
+                .unwrap();
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_DISPOSITION)
+                .is_some(),
+            "export should set Content-Disposition so a browser click downloads it"
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["format"], serde_json::json!("ARP4761"));
+        let entries = body["entries"].as_array().unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e["hazardId"] == "HAZ-OVERSPEED")
+            .expect("HAZ-OVERSPEED should be in the register");
+        assert_eq!(entry["severityClassification"], serde_json::json!("Major"));
+        assert_eq!(entry["likelihood"], serde_json::json!("Probable"));
+        assert_eq!(entry["riskIndex"], serde_json::json!(16)); // Major(4) x Probable(4)
+        assert_eq!(entry["residualRisk"], serde_json::json!(4)); // Mitigated -> severity x 1
+        assert_eq!(entry["causingStructure"], serde_json::json!("Turbine"));
+        assert_eq!(entry["status"], serde_json::json!("Mitigated"));
+        let controls = entry["controls"].as_array().unwrap();
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0]["status"], serde_json::json!("Mitigated"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mission_coverage_flags_the_one_orphaned_requirement() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "mission-coverage").await;
+
+        for (id, kind) in [
+            ("R1", NodeKind::Requirement),
+            ("R2", NodeKind::Requirement),
+            ("M1", NodeKind::Mission),
+            ("SH1", NodeKind::Stakeholder),
+        ] {
+            state
+                .neo4j
+                .upsert_element(
+                    &project.id,
+                    &Element {
+                        id: id.to_string(),
+                        kind,
+                        name: id.to_string(),
+                        active: true,
+                        origin: Origin::Human,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        // SH1 concerns both M1 and R1 — the existing MissionPlanningPanel Stakeholder-creation
+        // shape — covering R1 but leaving R2 orphaned.
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "SH1".to_string(),
+                    target: "M1".to_string(),
+                    kind: EdgeKind::Concerns,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "SH1".to_string(),
+                    target: "R1".to_string(),
+                    kind: EdgeKind::Concerns,
+                },
+            )
+            .await
+            .unwrap();
+
+        let coverage =
+            traceability::get_mission_coverage(State(state.clone()), Path(project.id.clone()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(coverage.total_requirements, 2);
+        assert_eq!(coverage.covered_count, 1);
+        assert_eq!(coverage.orphaned.len(), 1);
+        assert_eq!(coverage.orphaned[0].id, "R2");
     }
 }

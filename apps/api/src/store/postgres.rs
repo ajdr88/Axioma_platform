@@ -160,4 +160,17 @@ impl PostgresStore {
         .context("listing positions")?;
         Ok(rows)
     }
+
+    /// Removes an element's body+position row (P1.3 element delete, T-P1.3-03) — a no-op if the
+    /// element never had one (e.g. a freshly-created node with no properties/rationale/position
+    /// set yet). Body and position share one row in this table, so one delete clears both.
+    pub async fn delete_body_and_position(&self, project_id: &str, element_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM element_bodies WHERE element_id = $1 AND project_id = $2")
+            .bind(element_id)
+            .bind(project_id)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("deleting body/position for {element_id}"))?;
+        Ok(())
+    }
 }

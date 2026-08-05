@@ -1,0 +1,598 @@
+//! Budgeted traceability (P1.3, FR-CORE-03 / NFR-PERF-04) plus the three things built on or
+//! alongside it: change-impact ("blast radius" — the same traversal, `direction=incoming`), the
+//! delete-time Traceability Breach gate (T-P1.3-03), and the two smaller P1.3 reports (safety
+//! risk-register, mission-coverage) that share this module's home but not its traversal engine.
+//!
+//! BFS runs in application code, not a Cypher variable-length path (`[:REL*1..N]`) — Cypher has
+//! no native per-node fan-out cap, and precise per-hop fanout capping is the actual budget
+//! guarantee NFR-PERF-04 asks for ("max depth, max fan-out... enforced"). One query per frontier
+//! expansion instead (`Neo4jStore::trace_incoming_neighbors`/`trace_outgoing_neighbors`).
+//!
+//! **Not verified at NFR-PERF-04's literal "<2s p95 at 1M-element scale"** — no `Turbofan-Scale`
+//! fixture (a synthetic 1M-element seeded graph) exists anywhere in this codebase, and building
+//! one is a separate, large infrastructure investment. What's verified here is functional
+//! correctness (budgets enforced, correct/complete results, pagination integrity) at the real
+//! `Turbofan-Ref` fixture's scale — same honesty stance as the P1.2 canvas-virtualization work's
+//! real FPS finding: implement correctly, don't fake the benchmark.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
+use sysml_core::{EdgeKind, NodeKind};
+
+use crate::{import, record_commit, ApiError, AppState, DiffEntry, DEFAULT_ACTOR};
+
+/// A request above either cap is rejected outright (400) — CLAUDE.md's "rejected, not merely
+/// discouraged." Depth 10 / fanout 500 are this project's own reasonable ceilings; NFR-PERF-04
+/// requires *some* enforced cap to exist, not these exact numbers.
+const MAX_ALLOWED_DEPTH: u32 = 10;
+const MAX_ALLOWED_FANOUT: u32 = 500;
+/// Result page size for the traceability endpoint's cursor pagination.
+const PAGE_SIZE: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum Direction {
+    Incoming,
+    Outgoing,
+    Both,
+}
+
+impl Direction {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Direction::Incoming => "incoming",
+            Direction::Outgoing => "outgoing",
+            Direction::Both => "both",
+        }
+    }
+}
+
+/// One BFS run's result: every reachable id's shortest hop distance and the edge kind it was
+/// first discovered through, plus whether any node's real fan-out exceeded `maxFanout`
+/// (T-P1.3-02's "explicit notice" that the traversal was capped, not silently incomplete).
+struct Traversal {
+    visited: HashMap<String, (u32, EdgeKind)>,
+    fanout_truncated: bool,
+}
+
+async fn run_traversal(
+    state: &AppState,
+    project_id: &str,
+    root_id: &str,
+    depth: u32,
+    max_fanout: u32,
+    direction: Direction,
+) -> anyhow::Result<Traversal> {
+    let mut visited: HashMap<String, (u32, EdgeKind)> = HashMap::new();
+    let mut fanout_truncated = false;
+    let mut seen_ids: HashSet<String> = HashSet::from([root_id.to_string()]);
+    let mut frontier: VecDeque<(String, u32)> = VecDeque::from([(root_id.to_string(), 0)]);
+
+    while let Some((current_id, current_depth)) = frontier.pop_front() {
+        if current_depth >= depth {
+            continue;
+        }
+        let mut neighbors = match direction {
+            Direction::Incoming => {
+                state
+                    .neo4j
+                    .trace_incoming_neighbors(project_id, &current_id)
+                    .await?
+            }
+            Direction::Outgoing => {
+                state
+                    .neo4j
+                    .trace_outgoing_neighbors(project_id, &current_id)
+                    .await?
+            }
+            Direction::Both => {
+                let mut both = state
+                    .neo4j
+                    .trace_incoming_neighbors(project_id, &current_id)
+                    .await?;
+                both.extend(
+                    state
+                        .neo4j
+                        .trace_outgoing_neighbors(project_id, &current_id)
+                        .await?,
+                );
+                both
+            }
+        };
+        // Sorted before the fanout cap is applied — a deterministic order is what makes "none
+        // missed/spurious" repeatable across identical requests and correct across pagination.
+        neighbors.sort_by(|a, b| a.0.cmp(&b.0));
+        if neighbors.len() as u32 > max_fanout {
+            fanout_truncated = true;
+            neighbors.truncate(max_fanout as usize);
+        }
+        let next_depth = current_depth + 1;
+        for (neighbor_id, edge_kind) in neighbors {
+            // `direction: Both` walks both endpoints of every edge it touches, so a single edge
+            // between the root and one neighbor is also traversed *backward* from that neighbor
+            // — without this guard the root would re-discover itself and appear in its own
+            // results. `seen_ids` already starts with the root, but that alone doesn't stop
+            // `visited` (a separate map) from recording it once found as someone else's neighbor.
+            if neighbor_id == root_id {
+                continue;
+            }
+            visited
+                .entry(neighbor_id.clone())
+                .or_insert((next_depth, edge_kind));
+            if seen_ids.insert(neighbor_id.clone()) {
+                frontier.push_back((neighbor_id, next_depth));
+            }
+        }
+    }
+
+    Ok(Traversal {
+        visited,
+        fanout_truncated,
+    })
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TraceabilityQuery {
+    pub(crate) depth: Option<u32>,
+    #[serde(rename = "maxFanout")]
+    pub(crate) max_fanout: Option<u32>,
+    #[serde(default)]
+    pub(crate) direction: Option<Direction>,
+    pub(crate) cursor: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TraceResultEntry {
+    id: String,
+    kind: NodeKind,
+    name: String,
+    #[serde(rename = "hopDistance")]
+    hop_distance: u32,
+    #[serde(rename = "viaEdgeKind")]
+    via_edge_kind: EdgeKind,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TraceabilityResponse {
+    #[serde(rename = "rootId")]
+    root_id: String,
+    direction: &'static str,
+    depth: u32,
+    #[serde(rename = "maxFanout")]
+    max_fanout: u32,
+    results: Vec<TraceResultEntry>,
+    #[serde(rename = "nextCursor")]
+    next_cursor: Option<String>,
+    #[serde(rename = "fanoutTruncated")]
+    fanout_truncated: bool,
+}
+
+/// `GET /api/v0/projects/:projectId/elements/:elementId/traceability` (FR-CORE-03, T-P1.3-01/02).
+/// `depth`/`maxFanout` are required, not defaulted — NFR-PERF-04 says budgets are "explicit."
+/// Change-impact ("blast radius", T-P1.3-01's "request the affected set" after a change) is this
+/// same endpoint called with `direction=incoming` — no separate endpoint exists for it.
+pub async fn get_traceability(
+    State(state): State<AppState>,
+    Path((project_id, element_id)): Path<(String, String)>,
+    Query(params): Query<TraceabilityQuery>,
+) -> Result<Response, ApiError> {
+    let Some(depth) = params.depth else {
+        return Err(
+            import::BadRequest("explicit maxDepth and maxFanout are required".to_string()).into(),
+        );
+    };
+    let Some(max_fanout) = params.max_fanout else {
+        return Err(
+            import::BadRequest("explicit maxDepth and maxFanout are required".to_string()).into(),
+        );
+    };
+    if depth > MAX_ALLOWED_DEPTH || max_fanout > MAX_ALLOWED_FANOUT {
+        return Err(import::BadRequest(format!(
+            "depth/maxFanout exceed this server's caps (max depth {MAX_ALLOWED_DEPTH}, max fanout {MAX_ALLOWED_FANOUT})"
+        ))
+        .into());
+    }
+    if state
+        .neo4j
+        .get_element(&project_id, &element_id)
+        .await?
+        .is_none()
+    {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no element {element_id}") })),
+        )
+            .into_response());
+    }
+
+    let direction = params.direction.unwrap_or(Direction::Both);
+    let traversal = run_traversal(
+        &state,
+        &project_id,
+        &element_id,
+        depth,
+        max_fanout,
+        direction,
+    )
+    .await?;
+
+    let mut sorted_ids: Vec<&String> = traversal.visited.keys().collect();
+    sorted_ids.sort();
+
+    let start_index = match &params.cursor {
+        Some(cursor) => sorted_ids
+            .iter()
+            .position(|id| *id == cursor)
+            .map_or(0, |i| i + 1),
+        None => 0,
+    };
+    let page_ids = &sorted_ids[start_index.min(sorted_ids.len())..];
+    let this_page: Vec<&String> = page_ids.iter().take(PAGE_SIZE).copied().collect();
+    let next_cursor = if page_ids.len() > PAGE_SIZE {
+        this_page.last().map(|id| (*id).clone())
+    } else {
+        None
+    };
+
+    let mut results = Vec::with_capacity(this_page.len());
+    for id in this_page {
+        let (hop_distance, via_edge_kind) = traversal.visited[id];
+        let Some(element) = state.neo4j.get_element(&project_id, id).await? else {
+            // The element was deleted between the traversal query and this hydration step — a
+            // real but narrow race; skip it rather than fail the whole page.
+            continue;
+        };
+        results.push(TraceResultEntry {
+            id: id.clone(),
+            kind: element.kind,
+            name: element.name,
+            hop_distance,
+            via_edge_kind,
+        });
+    }
+
+    Ok(Json(TraceabilityResponse {
+        root_id: element_id,
+        direction: direction.as_str(),
+        depth,
+        max_fanout,
+        results,
+        next_cursor,
+        fanout_truncated: traversal.fanout_truncated,
+    })
+    .into_response())
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DeleteElementQuery {
+    #[serde(default)]
+    pub(crate) acknowledge: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct BreachDependent {
+    id: String,
+    kind: NodeKind,
+    name: String,
+    #[serde(rename = "viaEdgeKind")]
+    via_edge_kind: EdgeKind,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TraceabilityBreach {
+    error: &'static str,
+    message: String,
+    dependents: Vec<BreachDependent>,
+}
+
+/// `DELETE /api/v0/projects/:projectId/elements/:elementId?acknowledge=true` (T-P1.3-03). Direct
+/// (depth=1) Satisfy/Verify/Refine dependents block the delete with a 409 Traceability Breach
+/// unless `acknowledge=true` is passed. "Reassign" (the test's other stated option) isn't a new
+/// bulk-reassign endpoint — a caller can already re-point edges via the existing edge endpoints
+/// before retrying the delete.
+pub async fn delete_element(
+    State(state): State<AppState>,
+    Path((project_id, element_id)): Path<(String, String)>,
+    Query(params): Query<DeleteElementQuery>,
+) -> Result<Response, ApiError> {
+    let Some(existing) = state.neo4j.get_element(&project_id, &element_id).await? else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no element {element_id}") })),
+        )
+            .into_response());
+    };
+
+    let dependents = state
+        .neo4j
+        .trace_incoming_neighbors(&project_id, &element_id)
+        .await?;
+    if !dependents.is_empty() && !params.acknowledge {
+        let mut breach_dependents = Vec::with_capacity(dependents.len());
+        for (id, via_edge_kind) in dependents {
+            if let Some(element) = state.neo4j.get_element(&project_id, &id).await? {
+                breach_dependents.push(BreachDependent {
+                    id,
+                    kind: element.kind,
+                    name: element.name,
+                    via_edge_kind,
+                });
+            }
+        }
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(TraceabilityBreach {
+                error: "traceability_breach",
+                message: format!(
+                    "{} element(s) depend on {element_id} via Satisfy/Verify/Refine — \
+                     re-point or remove those edges, or retry with ?acknowledge=true",
+                    breach_dependents.len()
+                ),
+                dependents: breach_dependents,
+            }),
+        )
+            .into_response());
+    }
+
+    state.neo4j.delete_element(&project_id, &element_id).await?;
+    state
+        .postgres
+        .delete_body_and_position(&project_id, &element_id)
+        .await?;
+    record_commit(
+        &state,
+        &project_id,
+        DEFAULT_ACTOR,
+        "Delete element",
+        vec![DiffEntry::ElementDeleted {
+            element_id,
+            kind: existing.kind,
+            name: existing.name,
+        }],
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RiskRegisterEntry {
+    #[serde(rename = "hazardId")]
+    hazard_id: String,
+    description: String,
+    #[serde(rename = "causingStructure")]
+    causing_structure: Option<String>,
+    #[serde(rename = "severityClassification")]
+    severity_classification: String,
+    likelihood: String,
+    #[serde(rename = "riskIndex")]
+    risk_index: u32,
+    controls: Vec<RiskRegisterControl>,
+    #[serde(rename = "residualRisk")]
+    residual_risk: u32,
+    status: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RiskRegisterControl {
+    id: String,
+    name: String,
+    status: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RiskRegister {
+    #[serde(rename = "projectId")]
+    project_id: String,
+    format: &'static str,
+    entries: Vec<RiskRegisterEntry>,
+}
+
+const SEVERITY_LEVELS: [&str; 5] = ["Negligible", "Minor", "Moderate", "Major", "Catastrophic"];
+const LIKELIHOOD_LEVELS: [&str; 5] = ["Improbable", "Remote", "Occasional", "Probable", "Frequent"];
+
+/// 1-5 score for a severity/likelihood label — mirrors `HazardRiskPanel.tsx`'s `scoreOf` exactly
+/// (index+1, defaulting to 1 for an unset/unrecognized value). Duplicated here, not imported,
+/// since this endpoint must be self-contained on the server side (export shouldn't depend on the
+/// frontend having computed anything first).
+fn score_of(levels: &[&str], value: Option<&str>) -> u32 {
+    match value.and_then(|v| levels.iter().position(|l| *l == v)) {
+        Some(index) => index as u32 + 1,
+        None => 1,
+    }
+}
+
+/// `GET /api/v0/projects/:projectId/safety/risk-register` (FR-SAFE-05, T-P1.3-04). An
+/// ARP4761-*shaped* JSON export — no literal ARP4761 template exists anywhere in the docs to copy
+/// against, so this is this project's own reasonable field layout (hazard/severity/likelihood/
+/// Risk Index/causing structure/linked controls+status/residual risk), same interpretation
+/// precedent as `HazardRiskPanel.tsx`'s Risk Index formula itself. MIL-STD-882/ISO-26262 variants
+/// are not built — no test or concrete spec covers their shape.
+pub async fn get_risk_register(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let elements = state.neo4j.list_elements(&project_id).await?;
+    let causes_edges = state
+        .neo4j
+        .edges_of_kind(&project_id, EdgeKind::Causes)
+        .await?;
+    let mitigated_by_edges = state
+        .neo4j
+        .edges_of_kind(&project_id, EdgeKind::MitigatedBy)
+        .await?;
+    let elements_by_id: HashMap<&str, &sysml_core::Element> =
+        elements.iter().map(|e| (e.id.as_str(), e)).collect();
+
+    let mut entries = Vec::new();
+    for hazard in elements.iter().filter(|e| e.kind == NodeKind::Hazard) {
+        let body = state.postgres.get_body(&project_id, &hazard.id).await?;
+        let properties = body
+            .as_ref()
+            .and_then(|b| b.get("properties"))
+            .and_then(|v| v.as_object());
+        let severity = properties
+            .and_then(|p| p.get("severity"))
+            .and_then(|v| v.as_str());
+        let likelihood = properties
+            .and_then(|p| p.get("likelihood"))
+            .and_then(|v| v.as_str());
+        let severity_score = score_of(&SEVERITY_LEVELS, severity);
+        let likelihood_score = score_of(&LIKELIHOOD_LEVELS, likelihood);
+        let risk_index = severity_score * likelihood_score;
+
+        let causing_structure = causes_edges
+            .iter()
+            .find(|e| e.target == hazard.id)
+            .and_then(|e| elements_by_id.get(e.source.as_str()))
+            .map(|e| e.name.clone());
+
+        let mut controls = Vec::new();
+        let mut any_mitigated = false;
+        for edge in mitigated_by_edges.iter().filter(|e| e.source == hazard.id) {
+            let Some(control) = elements_by_id.get(edge.target.as_str()) else {
+                continue;
+            };
+            let control_body = state.postgres.get_body(&project_id, &control.id).await?;
+            let control_status = control_body
+                .as_ref()
+                .and_then(|b| b.get("properties"))
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Open")
+                .to_string();
+            if control_status == "Mitigated" {
+                any_mitigated = true;
+            }
+            controls.push(RiskRegisterControl {
+                id: control.id.clone(),
+                name: control.name.clone(),
+                status: control_status,
+            });
+        }
+        // Mirrors HazardRiskPanel.tsx exactly: residual = severity x 1 if any linked Control is
+        // Mitigated, else the raw (unmitigated) Risk Index.
+        let residual_risk = if any_mitigated {
+            severity_score
+        } else {
+            risk_index
+        };
+
+        entries.push(RiskRegisterEntry {
+            hazard_id: hazard.id.clone(),
+            description: hazard.name.clone(),
+            causing_structure,
+            severity_classification: severity.unwrap_or(SEVERITY_LEVELS[0]).to_string(),
+            likelihood: likelihood.unwrap_or(LIKELIHOOD_LEVELS[0]).to_string(),
+            risk_index,
+            controls,
+            residual_risk,
+            status: if any_mitigated { "Mitigated" } else { "Open" },
+        });
+    }
+
+    let register = RiskRegister {
+        project_id: project_id.clone(),
+        format: "ARP4761",
+        entries,
+    };
+    let mut response = Json(register).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_str(&format!(
+            "attachment; filename=\"risk-register-{project_id}.json\""
+        ))
+        .map_err(anyhow::Error::from)?,
+    );
+    Ok(response)
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct OrphanedRequirement {
+    pub(crate) id: String,
+    #[allow(dead_code)] // read via JSON in the frontend; not read as a struct field in Rust
+    pub(crate) name: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MissionCoverage {
+    #[serde(rename = "totalRequirements")]
+    pub(crate) total_requirements: usize,
+    #[serde(rename = "coveredCount")]
+    pub(crate) covered_count: usize,
+    pub(crate) orphaned: Vec<OrphanedRequirement>,
+}
+
+/// `GET /api/v0/projects/:projectId/mission-coverage` (FR-MSN-04, T-P1.3-05). No dedicated
+/// Mission<->Requirement edge exists in the data model — the only real substrate linking them
+/// today is `MissionPlanningPanel`'s Stakeholder-creation flow, which creates two `Concerns`
+/// edges (Stakeholder->Mission, Stakeholder->Requirement) from one Stakeholder. A Requirement is
+/// "covered" iff some Stakeholder's Concerns pair connects it to a Mission — grounded in the
+/// actual existing data model, not a new edge kind invented for this endpoint. Unbounded by
+/// user-controlled depth (bounded by "every Requirement in the project"), so no query budget or
+/// pagination applies here.
+pub async fn get_mission_coverage(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<MissionCoverage>, ApiError> {
+    let elements = state.neo4j.list_elements(&project_id).await?;
+    let concerns_edges = state
+        .neo4j
+        .edges_of_kind(&project_id, EdgeKind::Concerns)
+        .await?;
+
+    let mission_ids: HashSet<&str> = elements
+        .iter()
+        .filter(|e| e.kind == NodeKind::Mission)
+        .map(|e| e.id.as_str())
+        .collect();
+    let stakeholder_ids: HashSet<&str> = elements
+        .iter()
+        .filter(|e| e.kind == NodeKind::Stakeholder)
+        .map(|e| e.id.as_str())
+        .collect();
+
+    // Every Mission a given Stakeholder is Concerns-linked to.
+    let mut missions_by_stakeholder: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in &concerns_edges {
+        if stakeholder_ids.contains(edge.source.as_str())
+            && mission_ids.contains(edge.target.as_str())
+        {
+            missions_by_stakeholder
+                .entry(edge.source.as_str())
+                .or_default()
+                .push(edge.target.as_str());
+        }
+    }
+
+    let requirements: Vec<&sysml_core::Element> = elements
+        .iter()
+        .filter(|e| e.kind == NodeKind::Requirement)
+        .collect();
+    let mut orphaned = Vec::new();
+    for requirement in &requirements {
+        let covered = concerns_edges.iter().any(|edge| {
+            edge.target == requirement.id
+                && missions_by_stakeholder
+                    .get(edge.source.as_str())
+                    .is_some_and(|missions| !missions.is_empty())
+        });
+        if !covered {
+            orphaned.push(OrphanedRequirement {
+                id: requirement.id.clone(),
+                name: requirement.name.clone(),
+            });
+        }
+    }
+
+    Ok(Json(MissionCoverage {
+        total_requirements: requirements.len(),
+        covered_count: requirements.len() - orphaned.len(),
+        orphaned,
+    }))
+}
