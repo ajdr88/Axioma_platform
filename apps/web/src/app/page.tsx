@@ -41,6 +41,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ElementInspector } from "@/components/ElementInspector";
 import { HazardRiskPanel } from "@/components/HazardRiskPanel";
 import { MissionPlanningPanel } from "@/components/MissionPlanningPanel";
+import { StageTrackingPanel } from "@/components/StageTrackingPanel";
 import type { TextualEditorPanelHandle } from "@/components/TextualEditorPanel";
 
 // `monaco-editor` touches `window` at module-evaluation time — a plain static import would pull
@@ -134,6 +135,7 @@ export default function Home() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [showHazardPanel, setShowHazardPanel] = useState(false);
   const [showMissionPanel, setShowMissionPanel] = useState(false);
+  const [showStagePanel, setShowStagePanel] = useState(false);
   /** FR-CORE-08 / T-P1.2-06's "AI-suggested only" filter — "all" shows every origin. */
   const [originFilter, setOriginFilter] = useState<Origin | "all">("all");
 
@@ -554,6 +556,8 @@ export default function Home() {
         setShowHazardPanel={setShowHazardPanel}
         showMissionPanel={showMissionPanel}
         setShowMissionPanel={setShowMissionPanel}
+        showStagePanel={showStagePanel}
+        setShowStagePanel={setShowStagePanel}
         originFilter={originFilter}
         setOriginFilter={setOriginFilter}
         nodes={nodes}
@@ -597,6 +601,8 @@ interface CanvasProps {
   setShowHazardPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showMissionPanel: boolean;
   setShowMissionPanel: React.Dispatch<React.SetStateAction<boolean>>;
+  showStagePanel: boolean;
+  setShowStagePanel: React.Dispatch<React.SetStateAction<boolean>>;
   originFilter: Origin | "all";
   setOriginFilter: (filter: Origin | "all") => void;
   nodes: FlowNode<AxiomaBlockData>[];
@@ -642,6 +648,8 @@ function Canvas({
   setShowHazardPanel,
   showMissionPanel,
   setShowMissionPanel,
+  showStagePanel,
+  setShowStagePanel,
   originFilter,
   setOriginFilter,
   nodes,
@@ -989,6 +997,7 @@ function Canvas({
                 onClick={() => {
                   setShowHazardPanel((v) => !v);
                   setShowMissionPanel(false);
+                  setShowStagePanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
@@ -1000,11 +1009,24 @@ function Canvas({
                 onClick={() => {
                   setShowMissionPanel((v) => !v);
                   setShowHazardPanel(false);
+                  setShowStagePanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
               >
                 Mission Planning
+              </Button>
+              <Button
+                variant={showStagePanel ? "primary" : "ghost"}
+                onClick={() => {
+                  setShowStagePanel((v) => !v);
+                  setShowHazardPanel(false);
+                  setShowMissionPanel(false);
+                  setSelectedNodeId(null);
+                }}
+                className="!px-2 !py-1 text-xs"
+              >
+                Stage Tracking
               </Button>
               <Button
                 variant={showTextPanel ? "primary" : "ghost"}
@@ -1016,34 +1038,46 @@ function Canvas({
             </div>
           </GlassPanel>
 
-          {selectedNode && (
+          {selectedNode && projectId && (
             <ElementInspector
               elementId={selectedNode.id}
               elementLabel={selectedNode.data.label}
+              projectId={projectId}
               onClose={() => setSelectedNodeId(null)}
             />
           )}
 
-          {showHazardPanel && (
+          {showHazardPanel && projectId && (
             <HazardRiskPanel
               nodes={nodes}
               causesEdges={causesEdges}
               mitigatedByEdges={mitigatedByEdges}
               editMode={editMode}
+              projectId={projectId}
               onClose={() => setShowHazardPanel(false)}
               onCreateHazard={handleCreateHazard}
               onCreateControl={handleCreateControl}
             />
           )}
 
-          {showMissionPanel && (
+          {showMissionPanel && projectId && (
             <MissionPlanningPanel
               nodes={nodes}
               concernsEdges={concernsEdges}
               editMode={editMode}
+              projectId={projectId}
               onClose={() => setShowMissionPanel(false)}
               onCreateMission={handleCreateMission}
               onCreateStakeholder={handleCreateStakeholder}
+            />
+          )}
+
+          {showStagePanel && projectId && (
+            <StageTrackingPanel
+              nodes={nodes}
+              containsEdges={containsEdgesForClustering}
+              projectId={projectId}
+              onClose={() => setShowStagePanel(false)}
             />
           )}
         </ReactFlow>

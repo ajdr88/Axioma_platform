@@ -16,6 +16,7 @@ interface MissionPlanningPanelProps {
   /** source=Stakeholder, target=Mission or Requirement (FR-MSN-02). */
   concernsEdges: ApiEdge[];
   editMode: boolean;
+  projectId: string;
   onClose: () => void;
   onCreateMission: (name: string) => Promise<void>;
   onCreateStakeholder: (
@@ -39,6 +40,7 @@ export function MissionPlanningPanel({
   nodes,
   concernsEdges,
   editMode,
+  projectId,
   onClose,
   onCreateMission,
   onCreateStakeholder,
@@ -58,7 +60,7 @@ export function MissionPlanningPanel({
     () => [...requirements.map((r) => r.id), ...stakeholders.map((s) => s.id)],
     [requirements, stakeholders],
   );
-  const { bodies, updateProperty, error } = useElementBodies(trackedIds);
+  const { bodies, updateProperty, error } = useElementBodies(trackedIds, projectId);
 
   function stakeholdersConcernedWith(elementId: string): FlowNode<AxiomaBlockData>[] {
     return concernsEdges

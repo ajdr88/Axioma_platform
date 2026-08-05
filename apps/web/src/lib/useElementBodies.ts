@@ -10,11 +10,11 @@ export interface ElementBody {
 const EMPTY_BODY: ElementBody = { rationale: null, properties: {} };
 
 /**
- * Hydrates and edits a set of elements' Postgres bodies (`GET`/`PUT /api/elements/:id/body`) —
- * the same endpoint `ElementInspector` uses, just driven by a purpose-built editor (dropdowns,
- * pickers) instead of the generic key/value rows. Originally written for `HazardRiskPanel`'s
- * severity/likelihood/status scoring; extracted here once a second panel needed the exact same
- * race-safe update logic.
+ * Hydrates and edits a set of elements' Postgres bodies
+ * (`GET`/`PUT /api/projects/:projectId/elements/:id/body`) — the same endpoint `ElementInspector`
+ * uses, just driven by a purpose-built editor (dropdowns, pickers) instead of the generic
+ * key/value rows. Originally written for `HazardRiskPanel`'s severity/likelihood/status scoring;
+ * extracted here once a second panel needed the exact same race-safe update logic.
  *
  * Both the lazy hydration effect and `updateProperty` read/write a `useRef` mirror of `bodies`,
  * not just the state itself. Two `updateProperty` calls fired back-to-back (e.g. scoring severity
@@ -25,22 +25,36 @@ const EMPTY_BODY: ElementBody = { rationale: null, properties: {} };
  * still in flight, and that GET's response (a snapshot from before the write existed) must not be
  * allowed to overwrite it once it resolves.
  */
-export function useElementBodies(trackedIds: string[]) {
+export function useElementBodies(trackedIds: string[], projectId: string | null) {
   const [bodies, setBodies] = useState<Record<string, ElementBody>>({});
   const [error, setError] = useState<string | null>(null);
   const bodiesRef = useRef<Record<string, ElementBody>>({});
   const idsKey = trackedIds.join(",");
 
+  // Element ids aren't unique across projects, so a stale cache entry from a previously-open
+  // project could otherwise leak into a same-id element in a newly-switched-to one — reset on
+  // every project change (the panels stay mounted across a project switch, only their `nodes`
+  // prop changes, so this ref would otherwise outlive the switch).
+  const lastProjectIdRef = useRef<string | null>(projectId);
+  if (lastProjectIdRef.current !== projectId) {
+    lastProjectIdRef.current = projectId;
+    bodiesRef.current = {};
+    setBodies({});
+  }
+
   useEffect(() => {
     let cancelled = false;
     async function loadBodies() {
+      if (!projectId) {
+        return;
+      }
       const ids = (idsKey ? idsKey.split(",") : []).filter((id) => !(id in bodiesRef.current));
       if (ids.length === 0) {
         return;
       }
       const entries = await Promise.all(
         ids.map(async (id): Promise<[string, ElementBody]> => {
-          const res = await fetch(`/api/elements/${id}/body`);
+          const res = await fetch(`/api/projects/${projectId}/elements/${id}/body`);
           if (!res.ok) {
             return [id, EMPTY_BODY];
           }
@@ -60,9 +74,12 @@ export function useElementBodies(trackedIds: string[]) {
     return () => {
       cancelled = true;
     };
-  }, [idsKey]);
+  }, [idsKey, projectId]);
 
   async function updateProperty(elementId: string, patch: Record<string, string>) {
+    if (!projectId) {
+      return;
+    }
     const previous = bodiesRef.current[elementId] ?? EMPTY_BODY;
     const nextBody: ElementBody = {
       rationale: previous.rationale,
@@ -71,7 +88,7 @@ export function useElementBodies(trackedIds: string[]) {
     bodiesRef.current = { ...bodiesRef.current, [elementId]: nextBody };
     setBodies((b) => ({ ...b, [elementId]: nextBody }));
 
-    const res = await fetch(`/api/elements/${elementId}/body`, {
+    const res = await fetch(`/api/projects/${projectId}/elements/${elementId}/body`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(nextBody),

@@ -13,6 +13,7 @@ type LoadState = { status: "loading" } | { status: "error"; message: string } | 
 interface ElementInspectorProps {
   elementId: string;
   elementLabel: string;
+  projectId: string;
   onClose: () => void;
 }
 
@@ -22,7 +23,12 @@ interface ElementInspectorProps {
  * rows only — that's the only shape properties actually have today (the ReqIF importer's
  * attribute map); nested/typed JSON isn't supported here.
  */
-export function ElementInspector({ elementId, elementLabel, onClose }: ElementInspectorProps) {
+export function ElementInspector({
+  elementId,
+  elementLabel,
+  projectId,
+  onClose,
+}: ElementInspectorProps) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [rationale, setRationale] = useState("");
   const [rows, setRows] = useState<PropertyRow[]>([]);
@@ -34,7 +40,7 @@ export function ElementInspector({ elementId, elementLabel, onClose }: ElementIn
 
     async function load() {
       try {
-        const res = await fetch(`/api/elements/${elementId}/body`);
+        const res = await fetch(`/api/projects/${projectId}/elements/${elementId}/body`);
         if (res.status === 404) {
           // No body yet (e.g. a freshly-added node) — that's a valid empty starting point, not
           // an error.
@@ -72,7 +78,7 @@ export function ElementInspector({ elementId, elementLabel, onClose }: ElementIn
     return () => {
       cancelled = true;
     };
-  }, [elementId]);
+  }, [elementId, projectId]);
 
   async function handleSave() {
     setSaving(true);
@@ -80,7 +86,7 @@ export function ElementInspector({ elementId, elementLabel, onClose }: ElementIn
       const properties = Object.fromEntries(
         rows.filter((row) => row.key.trim().length > 0).map((row) => [row.key.trim(), row.value]),
       );
-      const res = await fetch(`/api/elements/${elementId}/body`, {
+      const res = await fetch(`/api/projects/${projectId}/elements/${elementId}/body`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ rationale: rationale.trim() || null, properties }),

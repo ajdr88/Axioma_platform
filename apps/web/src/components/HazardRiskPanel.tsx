@@ -24,6 +24,7 @@ interface HazardRiskPanelProps {
   /** source=Hazard, target=Control (FR-SAFE-01/03). */
   mitigatedByEdges: ApiEdge[];
   editMode: boolean;
+  projectId: string;
   onClose: () => void;
   onCreateHazard: (name: string, causingStructureId: string) => Promise<void>;
   onCreateControl: (hazardId: string, name: string) => Promise<void>;
@@ -42,6 +43,7 @@ export function HazardRiskPanel({
   causesEdges,
   mitigatedByEdges,
   editMode,
+  projectId,
   onClose,
   onCreateHazard,
   onCreateControl,
@@ -60,7 +62,7 @@ export function HazardRiskPanel({
     () => [...hazards.map((h) => h.id), ...controlIds],
     [hazards, controlIds],
   );
-  const { bodies, updateProperty, error } = useElementBodies(trackedIds);
+  const { bodies, updateProperty, error } = useElementBodies(trackedIds, projectId);
 
   const visibleHazards = hazards.filter((hazard) => {
     if (subsystemFilter === "all") {
