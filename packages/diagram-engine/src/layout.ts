@@ -33,6 +33,19 @@ export async function computeElkLayout(
   // element outside the current set (e.g. a filtered view) rather than letting layout fail.
   const validEdges = edges.filter((e) => elementIds.has(e.source) && elementIds.has(e.target));
 
+  // An element with no edge at all (an untraced Requirement, a freshly-created Hazard) forms its
+  // own trivial single-node connected component — ELK's `layered` algorithm places these at the
+  // whole layout's origin corner (confirmed directly: (12, 12) for a 220x92 node with the spacing
+  // options below), which is also where the app's fixed top-left toolbar panel sits once the
+  // canvas fits the graph into view. Relocated below, after ELK runs, rather than trying to steer
+  // ELK's own placement for them.
+  const connectedIds = new Set<string>();
+  for (const edge of validEdges) {
+    connectedIds.add(edge.source);
+    connectedIds.add(edge.target);
+  }
+  const isolatedIds = elements.map((el) => el.id).filter((id) => !connectedIds.has(id));
+
   const graph = await elk.layout({
     id: "root",
     layoutOptions: {
@@ -66,5 +79,18 @@ export async function computeElkLayout(
       positions.set(child.id, { x: child.x, y: child.y });
     }
   }
+
+  if (isolatedIds.length > 0) {
+    const connectedYs = [...positions.entries()]
+      .filter(([id]) => connectedIds.has(id))
+      .map(([, p]) => p.y);
+    // No connected graph at all (e.g. a brand-new project) — 400 clears the toolbar panel's
+    // rough footprint at a typical zoom level without depending on any connected node existing.
+    const rowY = connectedYs.length > 0 ? Math.max(...connectedYs) + NODE_HEIGHT + 80 : 400;
+    isolatedIds.forEach((id, index) => {
+      positions.set(id, { x: 12 + index * (NODE_WIDTH + 40), y: rowY });
+    });
+  }
+
   return positions;
 }

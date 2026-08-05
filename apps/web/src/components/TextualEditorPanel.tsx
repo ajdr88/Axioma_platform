@@ -32,6 +32,13 @@ export interface TextualEditorPanelHandle {
 interface TextualEditorPanelProps {
   onClose: () => void;
   onHandleReady: (handle: TextualEditorPanelHandle) => void;
+  /** Called whenever the server pushes a refreshed snapshot (`workspace/applyEdit`) — i.e. a
+   * text-driven edit (or the initial didOpen sync) changed the model on the backend. The canvas
+   * has no other way to learn about a change that originated on this side of the bridge: unlike
+   * the diagram→text direction (`notifyElementRenamed`, driven by the canvas's own PATCH), a
+   * text edit is applied to `apps/api` entirely inside `apps/lsp`, so `page.tsx`'s React Flow
+   * state would otherwise never refetch and silently drift from the real graph. */
+  onModelChanged?: () => void;
 }
 
 function lspUrl(): string {
@@ -41,11 +48,21 @@ function lspUrl(): string {
   return "ws://localhost:8090/lsp";
 }
 
-export function TextualEditorPanel({ onClose, onHandleReady }: TextualEditorPanelProps) {
+export function TextualEditorPanel({
+  onClose,
+  onHandleReady,
+  onModelChanged,
+}: TextualEditorPanelProps) {
   const connectionRef = useRef<MessageConnection | null>(null);
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof Monaco | null>(null);
   const [status, setStatus] = useState<"connecting" | "connected" | "error">("connecting");
+  // `onModelChanged` is called from inside the connection-setup effect below, which
+  // deliberately runs once (empty deps — the WebSocket connection shouldn't be torn down and
+  // rebuilt just because this callback's identity changed upstream). A ref keeps the call
+  // pointed at the latest callback without adding it to that effect's dependencies.
+  const onModelChangedRef = useRef(onModelChanged);
+  onModelChangedRef.current = onModelChanged;
 
   useEffect(() => {
     const socket = new WebSocket(lspUrl());
@@ -58,6 +75,7 @@ export function TextualEditorPanel({ onClose, onHandleReady }: TextualEditorPane
 
       connection.onRequest("workspace/applyEdit", (params: WorkspaceApplyEditParams) => {
         applyWorkspaceEdit(editorRef.current, params);
+        onModelChangedRef.current?.();
         return { applied: true };
       });
       connection.onNotification(

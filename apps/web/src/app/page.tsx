@@ -190,84 +190,87 @@ export default function Home() {
     };
   }, []);
 
-  useEffect(() => {
+  // A monotonic token, not a plain boolean flag, since this is now called both by the
+  // project-switch effect below AND externally (the text panel's `onModelChanged` — a
+  // text-driven edit landing on the backend while a project switch is also mid-flight must not
+  // let the stale one win).
+  const reloadTokenRef = useRef(0);
+
+  const reloadModel = useCallback(async () => {
     if (!projectId) {
       return;
     }
-    // Captured as its own const so the closure below keeps TypeScript's non-null narrowing —
-    // `projectId` itself is still `string | null` from the effect's own perspective.
     const currentProjectId = projectId;
-    let cancelled = false;
-
-    async function load() {
-      setStatus("loading");
-      try {
-        const [elementsRes, containsRes, positionsRes, causesRes, mitigatedByRes, concernsRes] =
-          await Promise.all([
-            fetch(apiPath(currentProjectId, "/elements")),
-            fetch(apiPath(currentProjectId, "/contains")),
-            fetch(apiPath(currentProjectId, "/positions")),
-            fetch(apiPath(currentProjectId, "/edges?kind=Causes")),
-            fetch(apiPath(currentProjectId, "/edges?kind=MitigatedBy")),
-            fetch(apiPath(currentProjectId, "/edges?kind=Concerns")),
-          ]);
-        for (const res of [
-          elementsRes,
-          containsRes,
-          positionsRes,
-          causesRes,
-          mitigatedByRes,
-          concernsRes,
-        ]) {
-          if (!res.ok) {
-            throw new Error(await readErrorMessage(res));
-          }
-        }
-        const elements: ApiElement[] = await elementsRes.json();
-        const contains: ApiEdge[] = await containsRes.json();
-        const positionEntries: PositionEntry[] = await positionsRes.json();
-        const causes: ApiEdge[] = await causesRes.json();
-        const mitigatedBy: ApiEdge[] = await mitigatedByRes.json();
-        const concerns: ApiEdge[] = await concernsRes.json();
-        if (cancelled) {
-          return;
-        }
-
-        const storedPositions = new Map(
-          positionEntries.map((p) => [p.elementId, { x: p.x, y: p.y }]),
-        );
-        const allEdgePairs = [...contains, ...causes, ...mitigatedBy, ...concerns];
-        const elkPositions = await computeElkLayout(elements, allEdgePairs);
-
-        setNodes(
-          elements.map((element) =>
-            toFlowNode(
-              element,
-              storedPositions.get(element.id) ?? elkPositions.get(element.id) ?? { x: 0, y: 0 },
-            ),
-          ),
-        );
-        setEdges(contains.map(toFlowEdge));
-        setCausesEdges(causes);
-        setMitigatedByEdges(mitigatedBy);
-        setConcernsEdges(concerns);
-        setStatus("ready");
-      } catch (error) {
-        if (!cancelled) {
-          setErrorMessage(error instanceof Error ? error.message : "failed to load the model");
-          setStatus("error");
+    const token = ++reloadTokenRef.current;
+    setStatus("loading");
+    try {
+      const [elementsRes, containsRes, positionsRes, causesRes, mitigatedByRes, concernsRes] =
+        await Promise.all([
+          fetch(apiPath(currentProjectId, "/elements")),
+          fetch(apiPath(currentProjectId, "/contains")),
+          fetch(apiPath(currentProjectId, "/positions")),
+          fetch(apiPath(currentProjectId, "/edges?kind=Causes")),
+          fetch(apiPath(currentProjectId, "/edges?kind=MitigatedBy")),
+          fetch(apiPath(currentProjectId, "/edges?kind=Concerns")),
+        ]);
+      for (const res of [
+        elementsRes,
+        containsRes,
+        positionsRes,
+        causesRes,
+        mitigatedByRes,
+        concernsRes,
+      ]) {
+        if (!res.ok) {
+          throw new Error(await readErrorMessage(res));
         }
       }
-    }
+      const elements: ApiElement[] = await elementsRes.json();
+      const contains: ApiEdge[] = await containsRes.json();
+      const positionEntries: PositionEntry[] = await positionsRes.json();
+      const causes: ApiEdge[] = await causesRes.json();
+      const mitigatedBy: ApiEdge[] = await mitigatedByRes.json();
+      const concerns: ApiEdge[] = await concernsRes.json();
+      if (reloadTokenRef.current !== token) {
+        return;
+      }
 
-    load();
-    return () => {
-      cancelled = true;
-    };
+      const storedPositions = new Map(
+        positionEntries.map((p) => [p.elementId, { x: p.x, y: p.y }]),
+      );
+      const allEdgePairs = [...contains, ...causes, ...mitigatedBy, ...concerns];
+      const elkPositions = await computeElkLayout(elements, allEdgePairs);
+      if (reloadTokenRef.current !== token) {
+        return;
+      }
+
+      setNodes(
+        elements.map((element) =>
+          toFlowNode(
+            element,
+            storedPositions.get(element.id) ?? elkPositions.get(element.id) ?? { x: 0, y: 0 },
+          ),
+        ),
+      );
+      setEdges(contains.map(toFlowEdge));
+      setCausesEdges(causes);
+      setMitigatedByEdges(mitigatedBy);
+      setConcernsEdges(concerns);
+      setStatus("ready");
+    } catch (error) {
+      if (reloadTokenRef.current === token) {
+        setErrorMessage(error instanceof Error ? error.message : "failed to load the model");
+        setStatus("error");
+      }
+    }
     // setNodes/setEdges (from useNodesState/useEdgesState) are stable across renders — safe to
-    // list without turning this into a run-on-every-render effect. `projectId` is the real
-    // trigger — switching projects re-runs this from scratch.
+    // list without turning this into a run-on-every-render callback. `projectId` is the real
+    // trigger — switching projects gives this a new identity, which the effect below picks up.
   }, [projectId, setNodes, setEdges]);
+
+  useEffect(() => {
+    reloadModel();
+  }, [reloadModel]);
 
   function showNotice(message: string) {
     setNotice(message);
@@ -548,6 +551,7 @@ export default function Home() {
         projectId={projectId}
         setProjectId={setProjectId}
         handleCreateProject={handleCreateProject}
+        reloadModel={reloadModel}
         editMode={editMode}
         setEditMode={setEditMode}
         selectedNode={selectedNode}
@@ -593,6 +597,7 @@ interface CanvasProps {
   projectId: string | null;
   setProjectId: (id: string) => void;
   handleCreateProject: () => Promise<void>;
+  reloadModel: () => Promise<void>;
   editMode: boolean;
   setEditMode: React.Dispatch<React.SetStateAction<boolean>>;
   selectedNode: FlowNode<AxiomaBlockData> | null;
@@ -640,6 +645,7 @@ function Canvas({
   projectId,
   setProjectId,
   handleCreateProject,
+  reloadModel,
   editMode,
   setEditMode,
   selectedNode,
@@ -1086,6 +1092,7 @@ function Canvas({
         <TextualEditorPanel
           onClose={() => setShowTextPanel(false)}
           onHandleReady={setTextualHandle}
+          onModelChanged={reloadModel}
         />
       )}
     </div>
