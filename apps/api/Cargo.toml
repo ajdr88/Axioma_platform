@@ -39,5 +39,10 @@ roxmltree = "0.21"
 # Server-generated ids for canvas-created elements (POST /api/v0/elements).
 uuid = { version = "1", features = ["v4"] }
 
+# Mode A grounded-copilot slice (apps/api/src/mode_a.rs) — a local Ollama call, no llm-gateway
+# package yet (ADR-004, deliberately deferred until a second consumer needs the abstraction).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+
 [dev-dependencies]
 http-body-util = "0.1"

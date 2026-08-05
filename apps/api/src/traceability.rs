@@ -56,12 +56,12 @@ impl Direction {
 /// One BFS run's result: every reachable id's shortest hop distance and the edge kind it was
 /// first discovered through, plus whether any node's real fan-out exceeded `maxFanout`
 /// (T-P1.3-02's "explicit notice" that the traversal was capped, not silently incomplete).
-struct Traversal {
-    visited: HashMap<String, (u32, EdgeKind)>,
-    fanout_truncated: bool,
+pub(crate) struct Traversal {
+    pub(crate) visited: HashMap<String, (u32, EdgeKind)>,
+    pub(crate) fanout_truncated: bool,
 }
 
-async fn run_traversal(
+pub(crate) async fn run_traversal(
     state: &AppState,
     project_id: &str,
     root_id: &str,

@@ -8,6 +8,7 @@
 //! nouns impl §1 names, made real rather than a `/api/v0/elements` stand-in.
 
 mod import;
+mod mode_a;
 mod store;
 mod traceability;
 
@@ -214,6 +215,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/mission-coverage",
             get(traceability::get_mission_coverage),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/mode-a/query",
+            post(mode_a::query),
         )
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -2507,5 +2512,139 @@ mod tests {
         assert_eq!(coverage.covered_count, 1);
         assert_eq!(coverage.orphaned.len(), 1);
         assert_eq!(coverage.orphaned[0].id, "R2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mode A grounded copilot query (thin slice — hard-wired local Ollama, no llm-gateway yet)
+    // -----------------------------------------------------------------------
+
+    /// Requires a real local Ollama (`docker compose up -d ollama`, plus the model `OLLAMA_MODEL`
+    /// defaults to actually pulled — `docker exec <ollama-container> ollama pull qwen2.5:1.5b`),
+    /// not just Postgres/Neo4j/MinIO — a stricter precondition than every other `--ignored` test
+    /// in this file, called out explicitly since a bare `docker compose up -d` isn't enough on
+    /// its own for this one.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` AND a pulled Ollama model (see doc comment)"]
+    async fn mode_a_query_grounds_answer_with_real_citations() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "mode-a-grounded").await;
+
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "REQ-THRUST".to_string(),
+                    kind: NodeKind::Requirement,
+                    name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "Combustor".to_string(),
+                    kind: NodeKind::Structure,
+                    name: "Combustor".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "Combustor".to_string(),
+                    target: "REQ-THRUST".to_string(),
+                    kind: EdgeKind::Satisfy,
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = mode_a::query(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_a::ModeAQueryRequest {
+                question: "What verifies the thrust requirement?".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let body = response_json(response).await;
+
+        let provenance = &body["provenance"];
+        for field in [
+            "modelName",
+            "modelVersion",
+            "promptTemplateHash",
+            "contextSnapshot",
+        ] {
+            assert!(
+                !provenance[field].is_null(),
+                "provenance.{field} must not be null: {body:?}"
+            );
+        }
+        assert_ne!(provenance["modelName"], serde_json::json!("none"));
+        assert_ne!(provenance["modelVersion"], serde_json::json!("none"));
+
+        let cited: Vec<&str> = body["citedElementIds"]
+            .as_array()
+            .expect("citedElementIds should be an array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            !cited.is_empty(),
+            "expected at least one citation, got answer: {}",
+            body["answer"]
+        );
+        assert!(
+            cited.contains(&"Combustor") || cited.contains(&"REQ-THRUST"),
+            "expected a citation to a real seeded element, got {cited:?}"
+        );
+        assert_eq!(
+            body["groundedFully"],
+            serde_json::json!(true),
+            "answer: {}",
+            body["answer"]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mode_a_query_returns_not_found_without_calling_the_model() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "mode-a-ungrounded").await;
+        make_structure(&state.neo4j, &project.id, "Unrelated").await;
+
+        // No element anywhere in this project has anything to do with this question — grounding
+        // should come back empty and short-circuit before any Ollama call is attempted, so this
+        // doesn't even need Ollama running to pass.
+        let response = mode_a::query(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_a::ModeAQueryRequest {
+                question: "Describe the hyperspace flux capacitor subsystem".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let body = response_json(response).await;
+
+        assert_eq!(body["answer"], serde_json::json!("not found"));
+        assert_eq!(body["groundedFully"], serde_json::json!(true));
+        assert_eq!(body["citedElementIds"], serde_json::json!([]));
+        assert_eq!(body["provenance"]["contextSnapshot"], serde_json::json!([]));
     }
 }

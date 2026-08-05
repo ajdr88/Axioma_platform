@@ -60,10 +60,25 @@ services:
       timeout: 5s
       retries: 10
 
+  # Mode A's grounded-copilot slice (ADR-004: local-first LLM) — apps/api calls this directly
+  # over plain HTTP (no llm-gateway package yet, see packages/llm-gateway/README.md).
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 volumes:
   neo4j-data:
   postgres-data:
   minio-data:
+  ollama-data:
 
 # Intentionally not included yet: Vault (secrets) and `collab` (CRDT server) — these join the
 # stack when auth (AX-104) and real-time collaboration (FR-CORE-06) work actually starts, per
