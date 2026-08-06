@@ -8,12 +8,36 @@
 //! guarantee NFR-PERF-04 asks for ("max depth, max fan-out... enforced"). One query per frontier
 //! expansion instead (`Neo4jStore::trace_incoming_neighbors`/`trace_outgoing_neighbors`).
 //!
-//! **Not verified at NFR-PERF-04's literal "<2s p95 at 1M-element scale"** — no `Turbofan-Scale`
-//! fixture (a synthetic 1M-element seeded graph) exists anywhere in this codebase, and building
-//! one is a separate, large infrastructure investment. What's verified here is functional
-//! correctness (budgets enforced, correct/complete results, pagination integrity) at the real
-//! `Turbofan-Ref` fixture's scale — same honesty stance as the P1.2 canvas-virtualization work's
-//! real FPS finding: implement correctly, don't fake the benchmark.
+//! **Now verified at real 1M-element scale (T-P1.4-06, `Turbofan-Scale` — see
+//! `apps/api/src/bin/seed_turbofan_scale.rs`) — NFR-PERF-04's "<2s p95" PASSES.** Measured
+//! directly against a real ~1,000,007-element/~1,000,005-edge seeded project: `depth=1,
+//! maxFanout=500, direction=incoming` from a `REQ-THRUST-SCALE` requirement with ~1,200 direct
+//! `Satisfy` dependents returned in **566–890ms** across 5 runs — comfortably under the 2s
+//! budget. This was **not** true on the first measurement: the identical query took **~46.5
+//! seconds** before a real bug was found and fixed (see `Neo4jStore::ensure_indexes`'s doc
+//! comment) — every query in this store except `upsert_element`'s own `MERGE` matched `{id,
+//! project_id}` with no node label at all, which cannot use *any* label-scoped index no matter
+//! how many exist, so the query fell back to an unindexed scan across the whole graph. Fixed by
+//! giving every node a second, shared `:Element` label (in addition to its specific kind label)
+//! and an index on it, then adding `:Element` to every previously label-less `MATCH`.
+//!
+//! **NFR-PERF-02/T-P1.1-07's "<100ms p95 / <50ms p50" element-create budget still FAILS badly at
+//! this scale — measured, not assumed.** `POST .../elements` took **~34–39 seconds per call**
+//! against the same 1M-element project, both before and after the index fix above (the index fix
+//! doesn't touch this path's actual bottleneck). Root cause: every mutating endpoint's
+//! `record_commit` → `build_snapshot` (`apps/api/src/main.rs`) fetches *every* element, *every*
+//! edge across all 9 `EdgeKind`s, and *every* Postgres body in the whole project — then
+//! serializes all of it to JSON and writes that as one commit row — on every single write,
+//! including a plain one-element create. This is the "snapshot-per-commit, not delta chains"
+//! design chosen in the P1.1 versioning work, explicitly accepted then as "fine at
+//! reference-fixture scale." **Per an explicit user choice**, this was measured and documented,
+//! not fixed — redesigning the versioning system's snapshot mechanism is separate, much larger
+//! scope than building a load fixture, and affects every mutating endpoint at every project size,
+//! not just this one.
+//!
+//! T-P1.2-02 (canvas FPS at 1M-element scale) is **still not measured** — that needs real
+//! browser/Playwright automation, out of scope for a backend-only pass; flagged rather than
+//! faked, same as everything else in this file's history.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 

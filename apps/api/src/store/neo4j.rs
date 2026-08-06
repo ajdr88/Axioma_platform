@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use neo4rs::{query, Graph as Neo4jConn, Row};
+use neo4rs::{query, BoltType, Graph as Neo4jConn, Row};
 use sysml_core::{Edge, EdgeKind, Element, ElementId, NodeKind, Origin, ValidationError};
 use sysml_textual::GraphOp;
 
@@ -38,12 +38,66 @@ pub struct Neo4jStore {
     conn: Neo4jConn,
 }
 
+/// Every `NodeKind` label — used to create the `(id, project_id)` index on each one (roadmap:
+/// T-P1.4-06). Cypher can't parameterize a label, so this is a fixed list of statements, not a
+/// loop over a query template with a bound label.
+const ALL_LABELS: [&str; 9] = [
+    "Element",
+    "Structure",
+    "Requirement",
+    "Port",
+    "Hazard",
+    "Control",
+    "Mission",
+    "Stakeholder",
+    "SimulationRun",
+];
+
 impl Neo4jStore {
     pub async fn connect(uri: &str, user: &str, password: &str) -> Result<Self> {
         let conn = Neo4jConn::new(uri, user, password)
             .await
             .with_context(|| format!("connecting to Neo4j at {uri}"))?;
-        Ok(Self { conn })
+        let store = Self { conn };
+        store.ensure_indexes().await?;
+        Ok(store)
+    }
+
+    /// Every existing query matches on `{id, project_id}` with no index at all — confirmed
+    /// directly (grepped the whole store for `CREATE INDEX`/`CREATE CONSTRAINT`: none exist),
+    /// meaning every read/write today is an unindexed property scan. This is the single
+    /// highest-leverage fix for T-P1.4-06's 1M-element scale — every existing feature benefits,
+    /// not just the new fixture.
+    ///
+    /// This creates one index per `ALL_LABELS` entry, which serves two different query shapes
+    /// found in this file:
+    /// - The handful of queries that already state a *specific* label (`upsert_element`'s
+    ///   `MERGE`, `bulk_upsert_elements`, `bulk_create_edges`) use their own specific label's
+    ///   index directly.
+    /// - Every OTHER query in this file matches by `{id, project_id}` with *no* label at all
+    ///   (`get_element`, `trace_neighbors`, `create_edge`'s final `MERGE`, `delete_element`,
+    ///   etc.) — a label-less `MATCH` can't use a label-scoped index no matter how many exist.
+    ///   These are rewritten to match `:Element` instead — the one label [`Self::upsert_element`]
+    ///   (and `bulk_upsert_elements`) now applies to *every* node in addition to its specific
+    ///   kind label, so the plain `Element` entry already in `ALL_LABELS` covers them too; no
+    ///   separate index is needed. Confirmed directly this second half was necessary: with only
+    ///   the specific-label indexes in place, `trace_neighbors` (via the traceability endpoint)
+    ///   was just as slow as before at real 1M-element scale, since none of its own patterns
+    ///   named a label.
+    ///
+    /// All idempotent via `IF NOT EXISTS`, safe to run on every connect.
+    async fn ensure_indexes(&self) -> Result<()> {
+        for label in ALL_LABELS {
+            let cypher = format!(
+                "CREATE INDEX element_id_project_{label} IF NOT EXISTS \
+                 FOR (n:{label}) ON (n.id, n.project_id)"
+            );
+            self.conn
+                .run(query(&cypher))
+                .await
+                .with_context(|| format!("creating index for label {label}"))?;
+        }
+        Ok(())
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -55,10 +109,15 @@ impl Neo4jStore {
 
     /// `MERGE`s an element node by `(id, project_id)`. Only `id`/`kind`(label)/`name`/`active`/
     /// `origin`/`project_id` are stored here — bodies and blobs live elsewhere (NFR-DATA-01).
+    ///
+    /// Every node gets a second, shared `:Element` label alongside its specific kind label
+    /// (multi-label nodes are a first-class Neo4j feature) — see `ensure_indexes`'s doc comment
+    /// for why: it's what lets every OTHER method's label-less `MATCH (n {id: ..., project_id:
+    /// ...})` (which has no way to know a specific kind up front) use an index at all.
     pub async fn upsert_element(&self, project_id: &str, element: &Element) -> Result<()> {
         let label = element.kind.as_label();
         let cypher = format!(
-            "MERGE (n:{label} {{id: $id, project_id: $project_id}}) \
+            "MERGE (n:Element:{label} {{id: $id, project_id: $project_id}}) \
              SET n.name = $name, n.active = $active, n.origin = $origin"
         );
         self.conn
@@ -87,7 +146,7 @@ impl Neo4jStore {
             .context("starting rename transaction")?;
         let result = txn
             .run(
-                query("MATCH (n {id: $id, project_id: $project_id}) SET n.name = $name")
+                query("MATCH (n:Element {id: $id, project_id: $project_id}) SET n.name = $name")
                     .param("id", id.to_string())
                     .param("project_id", project_id.to_string())
                     .param("name", name.to_string()),
@@ -104,10 +163,12 @@ impl Neo4jStore {
     pub async fn set_active(&self, project_id: &str, id: &str, active: bool) -> Result<()> {
         self.conn
             .run(
-                query("MATCH (n {id: $id, project_id: $project_id}) SET n.active = $active")
-                    .param("id", id.to_string())
-                    .param("project_id", project_id.to_string())
-                    .param("active", active),
+                query(
+                    "MATCH (n:Element {id: $id, project_id: $project_id}) SET n.active = $active",
+                )
+                .param("id", id.to_string())
+                .param("project_id", project_id.to_string())
+                .param("active", active),
             )
             .await
             .with_context(|| format!("setting active={active} on element {id}"))
@@ -118,10 +179,12 @@ impl Neo4jStore {
     pub async fn set_origin(&self, project_id: &str, id: &str, origin: Origin) -> Result<()> {
         self.conn
             .run(
-                query("MATCH (n {id: $id, project_id: $project_id}) SET n.origin = $origin")
-                    .param("id", id.to_string())
-                    .param("project_id", project_id.to_string())
-                    .param("origin", origin.as_str()),
+                query(
+                    "MATCH (n:Element {id: $id, project_id: $project_id}) SET n.origin = $origin",
+                )
+                .param("id", id.to_string())
+                .param("project_id", project_id.to_string())
+                .param("origin", origin.as_str()),
             )
             .await
             .with_context(|| format!("setting origin={origin:?} on element {id}"))
@@ -134,7 +197,7 @@ impl Neo4jStore {
             .conn
             .execute(
                 query(
-                    "MATCH (n {id: $id, project_id: $project_id}) RETURN n.id AS id, \
+                    "MATCH (n:Element {id: $id, project_id: $project_id}) RETURN n.id AS id, \
                      n.name AS name, labels(n) AS labels, coalesce(n.active, true) AS active, \
                      coalesce(n.origin, 'Human') AS origin",
                 )
@@ -155,7 +218,7 @@ impl Neo4jStore {
             .conn
             .execute(
                 query(
-                    "MATCH (n {project_id: $project_id}) RETURN n.id AS id, n.name AS name, \
+                    "MATCH (n:Element {project_id: $project_id}) RETURN n.id AS id, n.name AS name, \
                      labels(n) AS labels, coalesce(n.active, true) AS active, \
                      coalesce(n.origin, 'Human') AS origin",
                 )
@@ -188,8 +251,8 @@ impl Neo4jStore {
     pub async fn edges_of_kind(&self, project_id: &str, kind: EdgeKind) -> Result<Vec<Edge>> {
         let rel_type = kind.as_rel_type();
         let cypher = format!(
-            "MATCH (a {{project_id: $project_id}})-[:{rel_type}]->(b {{project_id: $project_id}}) \
-             RETURN a.id AS source, b.id AS target"
+            "MATCH (a:Element {{project_id: $project_id}})-[:{rel_type}]->\
+             (b:Element {{project_id: $project_id}}) RETURN a.id AS source, b.id AS target"
         );
         let mut result = self
             .conn
@@ -255,8 +318,8 @@ impl Neo4jStore {
 
         let rel_type = edge.kind.as_rel_type();
         let cypher = format!(
-            "MATCH (a {{id: $source, project_id: $project_id}}), \
-             (b {{id: $target, project_id: $project_id}}) MERGE (a)-[:{rel_type}]->(b)"
+            "MATCH (a:Element {{id: $source, project_id: $project_id}}), \
+             (b:Element {{id: $target, project_id: $project_id}}) MERGE (a)-[:{rel_type}]->(b)"
         );
         self.conn
             .run(
@@ -279,8 +342,8 @@ impl Neo4jStore {
     pub async fn delete_edge(&self, project_id: &str, edge: &Edge) -> Result<()> {
         let rel_type = edge.kind.as_rel_type();
         let cypher = format!(
-            "MATCH (a {{id: $source, project_id: $project_id}})-[r:{rel_type}]->\
-             (b {{id: $target, project_id: $project_id}}) DELETE r"
+            "MATCH (a:Element {{id: $source, project_id: $project_id}})-[r:{rel_type}]->\
+             (b:Element {{id: $target, project_id: $project_id}}) DELETE r"
         );
         self.conn
             .run(
@@ -306,7 +369,7 @@ impl Neo4jStore {
     pub async fn delete_element(&self, project_id: &str, id: &str) -> Result<()> {
         self.conn
             .run(
-                query("MATCH (n {id: $id, project_id: $project_id}) DETACH DELETE n")
+                query("MATCH (n:Element {id: $id, project_id: $project_id}) DETACH DELETE n")
                     .param("id", id.to_string())
                     .param("project_id", project_id.to_string()),
             )
@@ -345,11 +408,11 @@ impl Neo4jStore {
         // `arrow` is always one of the two literal strings above, never caller/user input —
         // same "fixed, closed set, safe to interpolate" reasoning as `EdgeKind::as_rel_type`.
         let cypher = if arrow == "->" {
-            "MATCH (a {id: $id, project_id: $project_id})-[r:SATISFY|VERIFY|REFINE]->\
-             (b {project_id: $project_id}) RETURN b.id AS neighbor_id, type(r) AS rel_type"
+            "MATCH (a:Element {id: $id, project_id: $project_id})-[r:SATISFY|VERIFY|REFINE]->\
+             (b:Element {project_id: $project_id}) RETURN b.id AS neighbor_id, type(r) AS rel_type"
         } else {
-            "MATCH (a {id: $id, project_id: $project_id})<-[r:SATISFY|VERIFY|REFINE]-\
-             (b {project_id: $project_id}) RETURN b.id AS neighbor_id, type(r) AS rel_type"
+            "MATCH (a:Element {id: $id, project_id: $project_id})<-[r:SATISFY|VERIFY|REFINE]-\
+             (b:Element {project_id: $project_id}) RETURN b.id AS neighbor_id, type(r) AS rel_type"
         };
         let mut result = self
             .conn
@@ -370,6 +433,114 @@ impl Neo4jStore {
             neighbors.push((neighbor_id, kind));
         }
         Ok(neighbors)
+    }
+
+    /// Bulk-writes elements in `UNWIND`-batched chunks — the one-`MERGE`-per-element pattern
+    /// (`upsert_element`) is architecturally the wrong shape at 1M-element scale (roadmap:
+    /// T-P1.4-06's synthetic `Turbofan-Scale` fixture). Groups by `NodeKind` first since Cypher
+    /// can't parameterize a label, so each kind gets its own `UNWIND` statement per chunk. No
+    /// validation of any kind (no kind-conflict check) — a trusted bulk path for a fixture
+    /// generator that owns every id it writes, never exposed via any HTTP endpoint.
+    ///
+    /// Only `apps/api/src/bin/seed_turbofan_scale.rs` calls this, not `main.rs`'s HTTP surface —
+    /// `#[allow(dead_code)]` because each `[[bin]]` target's dead-code analysis is independent,
+    /// so `main.rs`'s own compilation sees this as unused even though the other binary needs it.
+    #[allow(dead_code)]
+    pub async fn bulk_upsert_elements(&self, project_id: &str, elements: &[Element]) -> Result<()> {
+        const CHUNK_SIZE: usize = 5_000;
+        let mut by_kind: HashMap<NodeKind, Vec<&Element>> = HashMap::new();
+        for element in elements {
+            by_kind.entry(element.kind).or_default().push(element);
+        }
+        for (kind, group) in by_kind {
+            let label = kind.as_label();
+            let cypher = format!(
+                "UNWIND $rows AS row \
+                 MERGE (n:Element:{label} {{id: row.id, project_id: $project_id}}) \
+                 SET n.name = row.name, n.active = row.active, n.origin = row.origin"
+            );
+            for chunk in group.chunks(CHUNK_SIZE) {
+                let rows: Vec<BoltType> = chunk
+                    .iter()
+                    .map(|element| {
+                        let mut row: HashMap<String, BoltType> = HashMap::new();
+                        row.insert("id".to_string(), element.id.clone().into());
+                        row.insert("name".to_string(), element.name.clone().into());
+                        row.insert("active".to_string(), element.active.into());
+                        row.insert(
+                            "origin".to_string(),
+                            element.origin.as_str().to_string().into(),
+                        );
+                        BoltType::from(row)
+                    })
+                    .collect();
+                self.conn
+                    .run(
+                        query(&cypher)
+                            .param("rows", rows)
+                            .param("project_id", project_id.to_string()),
+                    )
+                    .await
+                    .with_context(|| format!("bulk-upserting a chunk of {label} elements"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bulk-writes edges of one kind in `UNWIND`-batched chunks. Deliberately skips the
+    /// dangling-edge/cycle validation [`Self::create_edge`] normally does — safe only because the
+    /// caller (the `Turbofan-Scale` seeder) constructs an already-acyclic, fully-formed graph by
+    /// construction; never exposed via any HTTP endpoint. Same `#[allow(dead_code)]` reasoning as
+    /// [`Self::bulk_upsert_elements`] just above.
+    ///
+    /// `source_label`/`target_label` name every endpoint's `NodeKind` label — confirmed
+    /// necessary, not a style preference: a label-less `MATCH (a {id: ..., project_id: ...})`
+    /// (the same shape [`Self::get_element`]/[`Self::create_edge`] already use) can't use the
+    /// per-label index `ensure_indexes` creates, since the planner has no way to know which
+    /// label's index to consult, and falls back to an unindexed scan. Confirmed directly at real
+    /// ~200k-in-flight scale: `bulk_upsert_elements`'s labeled `MERGE` finished a 200,000-element
+    /// chunk set in well under a minute; the *first* unlabeled edge-`MATCH` attempt was still on
+    /// its first few 5,000-edge chunks ten minutes in. This is also why looping
+    /// [`Self::create_edge`] for a modest edge count (e.g. a few hundred `Satisfy` edges) is only
+    /// safe *before* the graph reaches real scale — at 1M+ elements the exact same unlabeled-scan
+    /// cost applies per call, just amortized over fewer calls, not eliminated.
+    #[allow(dead_code)]
+    pub async fn bulk_create_edges(
+        &self,
+        project_id: &str,
+        kind: EdgeKind,
+        source_label: &str,
+        target_label: &str,
+        pairs: &[(ElementId, ElementId)],
+    ) -> Result<()> {
+        const CHUNK_SIZE: usize = 5_000;
+        let rel_type = kind.as_rel_type();
+        let cypher = format!(
+            "UNWIND $rows AS row \
+             MATCH (a:{source_label} {{id: row.source, project_id: $project_id}}), \
+                   (b:{target_label} {{id: row.target, project_id: $project_id}}) \
+             MERGE (a)-[:{rel_type}]->(b)"
+        );
+        for chunk in pairs.chunks(CHUNK_SIZE) {
+            let rows: Vec<BoltType> = chunk
+                .iter()
+                .map(|(source, target)| {
+                    let mut row: HashMap<String, BoltType> = HashMap::new();
+                    row.insert("source".to_string(), source.clone().into());
+                    row.insert("target".to_string(), target.clone().into());
+                    BoltType::from(row)
+                })
+                .collect();
+            self.conn
+                .run(
+                    query(&cypher)
+                        .param("rows", rows)
+                        .param("project_id", project_id.to_string()),
+                )
+                .await
+                .with_context(|| format!("bulk-creating a chunk of {rel_type} edges"))?;
+        }
+        Ok(())
     }
 
     /// Validates and writes a batch of elements + `Contains` edges atomically (import handlers,
@@ -414,7 +585,7 @@ impl Neo4jStore {
         for element in elements {
             let label = element.kind.as_label();
             let cypher = format!(
-                "MERGE (n:{label} {{id: $id, project_id: $project_id}}) \
+                "MERGE (n:Element:{label} {{id: $id, project_id: $project_id}}) \
                  SET n.name = $name, n.active = $active, n.origin = $origin"
             );
             if let Err(err) = txn
@@ -436,8 +607,8 @@ impl Neo4jStore {
         for (parent, child) in contains {
             let rel_type = EdgeKind::Contains.as_rel_type();
             let cypher = format!(
-                "MATCH (a {{id: $source, project_id: $project_id}}), \
-                 (b {{id: $target, project_id: $project_id}}) MERGE (a)-[:{rel_type}]->(b)"
+                "MATCH (a:Element {{id: $source, project_id: $project_id}}), \
+                 (b:Element {{id: $target, project_id: $project_id}}) MERGE (a)-[:{rel_type}]->(b)"
             );
             if let Err(err) = txn
                 .run(
@@ -592,10 +763,13 @@ impl Neo4jStore {
             let result = match op {
                 GraphOp::Rename { id, name } => {
                     txn.run(
-                        query("MATCH (n {id: $id, project_id: $project_id}) SET n.name = $name")
-                            .param("id", id.clone())
-                            .param("project_id", project_id.to_string())
-                            .param("name", name.clone()),
+                        query(
+                            "MATCH (n:Element {id: $id, project_id: $project_id}) \
+                             SET n.name = $name",
+                        )
+                        .param("id", id.clone())
+                        .param("project_id", project_id.to_string())
+                        .param("name", name.clone()),
                     )
                     .await
                 }
@@ -608,7 +782,7 @@ impl Neo4jStore {
                     let real_id = id_map.get(temp_id).expect("resolved during validation");
                     let label = kind.as_label();
                     let create_cypher = format!(
-                        "MERGE (n:{label} {{id: $id, project_id: $project_id}}) \
+                        "MERGE (n:Element:{label} {{id: $id, project_id: $project_id}}) \
                          SET n.name = $name, n.active = true, n.origin = 'Human'"
                     );
                     let mut res = txn
@@ -624,8 +798,8 @@ impl Neo4jStore {
                             res = txn
                                 .run(
                                     query(
-                                        "MATCH (a {id: $parent, project_id: $project_id}), \
-                                         (b {id: $id, project_id: $project_id}) \
+                                        "MATCH (a:Element {id: $parent, project_id: $project_id}), \
+                                         (b:Element {id: $id, project_id: $project_id}) \
                                          MERGE (a)-[:CONTAINS]->(b)",
                                     )
                                     .param("parent", parent)
@@ -641,8 +815,8 @@ impl Neo4jStore {
                     let mut res = txn
                         .run(
                             query(
-                                "MATCH ({id: $id, project_id: $project_id})<-[r:CONTAINS]-() \
-                                 DELETE r",
+                                "MATCH (:Element {id: $id, project_id: $project_id})\
+                                 <-[r:CONTAINS]-() DELETE r",
                             )
                             .param("id", id.clone())
                             .param("project_id", project_id.to_string()),
@@ -653,8 +827,8 @@ impl Neo4jStore {
                             res = txn
                                 .run(
                                     query(
-                                        "MATCH (a {id: $parent, project_id: $project_id}), \
-                                         (b {id: $id, project_id: $project_id}) \
+                                        "MATCH (a:Element {id: $parent, project_id: $project_id}), \
+                                         (b:Element {id: $id, project_id: $project_id}) \
                                          MERGE (a)-[:CONTAINS]->(b)",
                                     )
                                     .param("parent", parent)
