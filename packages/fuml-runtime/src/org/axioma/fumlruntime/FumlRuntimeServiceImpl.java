@@ -7,7 +7,9 @@ import java.io.PrintStream;
 import org.apache.log4j.Logger;
 import org.axioma.fumlruntime.proto.ExecuteRequest;
 import org.axioma.fumlruntime.proto.FumlRuntimeGrpc;
+import org.axioma.fumlruntime.proto.StateMachineRequest;
 import org.axioma.fumlruntime.proto.TraceEvent;
+import org.modeldriven.fuml.test.builtin.environment.ExecutorTest;
 import org.modeldriven.fuml.test.builtin.environment.TestEnvironment;
 import org.modeldriven.fuml.test.builtin.environment.TestSuite;
 
@@ -33,6 +35,41 @@ final class FumlRuntimeServiceImpl extends FumlRuntimeGrpc.FumlRuntimeImplBase {
             return;
         }
 
+        runWithTracing(activityName, responseObserver, environment -> {
+            TestSuite suite = new TestSuite(environment);
+            suite.testHelloWorld();
+        });
+    }
+
+    /** alf-lite (FR-CORE-09): runs the pilot's Control state machine — see
+     * {@link StateMachineActivityBuilder}'s doc comment for why this is one linear, self-driven
+     * fUML Activity chain rather than a native UML StateMachine execution. */
+    @Override
+    public void executeStateMachine(StateMachineRequest request, StreamObserver<TraceEvent> responseObserver) {
+        runWithTracing(StateMachineActivityBuilder.STATE_MACHINE_ACTIVITY_NAME, responseObserver, environment -> {
+            StateMachineActivityBuilder builder = new StateMachineActivityBuilder(environment);
+            String driverName = builder.build(
+                    request.getTransitionsList(),
+                    request.getSignalsToFireList(),
+                    request.getUseHandAuthoredReference());
+            ExecutorTest executorTest = new ExecutorTest(environment);
+            executorTest.testExecute(driverName);
+        });
+    }
+
+    private interface TracedExecution {
+        void run(TestEnvironment environment) throws Exception;
+    }
+
+    /** Shared tracing/output-capture harness for every RPC this service exposes — a fresh
+     * {@link TestEnvironment} per call (never shared/cached — T-P1.4-01's 100-identical-runs
+     * guarantee is a real way a stateful environment reused across calls could quietly break,
+     * confirmed by testing it, not assumed safe), one {@link TraceStreamingAppender} attached for
+     * the call's duration, {@code System.out} captured the same way. Not thread-safe across
+     * concurrent executions on the same process — see {@link TraceStreamingAppender}'s own doc
+     * comment on the single-request-at-a-time assumption this already requires. */
+    private void runWithTracing(
+            String activityName, StreamObserver<TraceEvent> responseObserver, TracedExecution body) {
         TraceStreamingAppender.Sink sink = (kind, actName, actionName, detail) -> {
             TraceEvent event = TraceEvent.newBuilder()
                     .setActivityName(actName.isEmpty() ? activityName : actName)
@@ -53,12 +90,8 @@ final class FumlRuntimeServiceImpl extends FumlRuntimeGrpc.FumlRuntimeImplBase {
             debugLogger.addAppender(appender);
             System.setOut(capturingOut);
 
-            // A fresh TestEnvironment per call, not a shared/cached one — T-P1.4-01 requires 100
-            // runs to be identical, and reusing a stateful environment across calls is a real way
-            // that guarantee could quietly break (confirmed by testing it, not assumed safe).
             TestEnvironment environment = new TestEnvironment();
-            TestSuite suite = new TestSuite(environment);
-            suite.testHelloWorld();
+            body.run(environment);
 
             responseObserver.onCompleted();
         } catch (Exception e) {

@@ -10,7 +10,8 @@ use axum::Json;
 
 use crate::{env_or, ApiError};
 
-mod proto {
+#[allow(clippy::enum_variant_names)] // generated code (prost oneofs) — not ours to rename
+pub(crate) mod proto {
     tonic::include_proto!("axioma.fuml");
 }
 
@@ -74,4 +75,30 @@ pub(crate) async fn execute_streaming(
 
 pub(crate) async fn simulate_hello_world() -> Result<Json<Vec<TraceEventDto>>, ApiError> {
     Ok(Json(execute(HELLO_WORLD_ACTIVITY).await?))
+}
+
+/// Runs the pilot's Control state machine (alf-lite's compiled transitions, or the
+/// hand-authored Java reference path when `use_hand_authored_reference` is set — T-P1.4-04's
+/// comparison mechanism) and collects the streamed trace. See `execute`'s doc comment for why
+/// collecting server-side is honest scope for this pass.
+pub(crate) async fn execute_state_machine(
+    transitions: Vec<proto::Transition>,
+    signals_to_fire: Vec<String>,
+    use_hand_authored_reference: bool,
+) -> anyhow::Result<Vec<TraceEventDto>> {
+    let addr = env_or("FUML_RUNTIME_ADDR", "http://localhost:50051");
+    let mut client = FumlRuntimeClient::connect(addr).await?;
+    let response = client
+        .execute_state_machine(proto::StateMachineRequest {
+            transitions,
+            signals_to_fire,
+            use_hand_authored_reference,
+        })
+        .await?;
+    let mut stream = response.into_inner();
+    let mut events = Vec::new();
+    while let Some(event) = stream.message().await? {
+        events.push(TraceEventDto::from(event));
+    }
+    Ok(events)
 }

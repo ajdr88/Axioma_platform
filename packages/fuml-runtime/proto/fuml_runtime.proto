@@ -14,6 +14,11 @@ service FumlRuntime {
   // Server-streaming, not a single response — T-P1.4-01 requires the trace to arrive
   // incrementally as it's produced, not as one terminal blob.
   rpc Execute(ExecuteRequest) returns (stream TraceEvent);
+
+  // alf-lite (FR-CORE-09): runs the pilot's Control state machine (Idle -> Armed -> Running ->
+  // Shutdown) as one linear, self-driven fUML Activity chain (see StateMachineActivityBuilder.java
+  // for why fUML has no native StateMachine execution to target instead).
+  rpc ExecuteStateMachine(StateMachineRequest) returns (stream TraceEvent);
 }
 
 message ExecuteRequest {
@@ -27,4 +32,95 @@ message TraceEvent {
   // (Debug's "Execute activity=..."/"Fire activity=...action=..." lines), not an invented taxonomy.
   string kind = 3;
   string detail = 4;
+}
+
+// --- alf-lite compiled AST (protobuf mirroring the subset directly — no XMI marshalling on
+// either side; both apps/api and fuml-runtime construct/consume these via direct calls, the same
+// model-builder pattern already proven for HelloWorld2). Field shapes mirror
+// packages/alf-lite/src/ast.rs's Expr/Stmt one-for-one; apps/api/src/alf_ir.rs converts between
+// them.
+
+message CompiledExpression {
+  oneof kind {
+    bool bool_literal = 1;
+    int64 int_literal = 2;
+    double real_literal = 3;
+    string string_literal = 4;
+    string var_ref = 5;
+    PropertyAccess property_access = 6;
+    UnaryOp unary_op = 7;
+    BinaryOp binary_op = 8;
+  }
+}
+
+message PropertyAccess {
+  string target = 1;
+  string feature = 2;
+}
+
+message UnaryOp {
+  string op = 1; // "not" — the only unary op in the subset
+  CompiledExpression operand = 2;
+}
+
+message BinaryOp {
+  string op = 1; // one of add|sub|mul|div|lt|le|gt|ge|eq|ne|and|or
+  CompiledExpression left = 2;
+  CompiledExpression right = 3;
+}
+
+message CompiledStatement {
+  oneof kind {
+    LetStatement let_stmt = 1;
+    AssignStatement assign_stmt = 2;
+    IfStatement if_stmt = 3;
+    InvokeStatement invoke_stmt = 4;
+    SendSignalStatement send_signal_stmt = 5;
+  }
+}
+
+message LetStatement {
+  string name = 1;
+  CompiledExpression value = 2;
+}
+
+message AssignStatement {
+  string target = 1;
+  string feature = 2;
+  CompiledExpression value = 3;
+}
+
+message IfStatement {
+  CompiledExpression condition = 1;
+  repeated CompiledStatement then_branch = 2;
+  repeated CompiledStatement else_branch = 3;
+}
+
+message InvokeStatement {
+  string behavior_name = 1;
+  repeated CompiledExpression args = 2;
+}
+
+message SendSignalStatement {
+  string signal_name = 1;
+  repeated CompiledExpression args = 2;
+}
+
+// One signal-triggered transition of the pilot's Control state machine.
+message Transition {
+  string from_state = 1;
+  string to_state = 2;
+  string signal = 3;
+  repeated CompiledStatement actions = 4;
+}
+
+message StateMachineRequest {
+  repeated Transition transitions = 1;
+  // The signals to fire, in order — the request self-drives the chain (see
+  // StateMachineActivityBuilder.java's doc comment on why this isn't true external/async
+  // multi-actor signaling).
+  repeated string signals_to_fire = 2;
+  // T-P1.4-04: build the identical golden scenario via a hand-authored Java path instead of
+  // interpreting `transitions`, to diff traces against the alf-lite-compiled run.
+  bool use_hand_authored_reference = 3;
 }

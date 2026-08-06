@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+alf-lite = { path = "../../packages/alf-lite" }
 sysml-core = { path = "../../packages/sysml-core" }
 sysml-textual = { path = "../../packages/sysml-textual" }
 

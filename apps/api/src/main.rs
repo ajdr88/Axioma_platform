@@ -7,6 +7,8 @@
 //! scope, a first real read/write path per store, and the Projects/Commits/Elements structuring
 //! nouns impl §1 names, made real rather than a `/api/v0/elements` stand-in.
 
+mod alf_ir;
+mod control_sim;
 mod fuml_client;
 mod import;
 mod mode_a;
@@ -224,6 +226,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/simulate/hello-world",
             post(fuml_client::simulate_hello_world),
+        )
+        .route(
+            "/api/v0/projects/:projectId/simulate/control-state-machine",
+            post(control_sim::simulate_control_state_machine),
         )
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -2719,5 +2725,173 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// The pilot's Control state machine, exactly as described in the test specs: Idle -> Armed
+    /// (`arm`) -> Running (`ignite`, the one transition with a real guard+effect) -> Shutdown
+    /// (`cutoff`). The Idle->Armed and Running->Shutdown transitions are trivial (empty actions)
+    /// — the docs only ever give one concrete transition action to compile.
+    fn golden_alf_transitions() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+        vec![
+            ("Idle", "Armed", "arm", ""),
+            (
+                "Armed",
+                "Running",
+                "ignite",
+                "if (Turbine.rpm < 3500.0) { SetTurbineRpm(3500.0); }",
+            ),
+            ("Running", "Shutdown", "cutoff", ""),
+        ]
+    }
+
+    fn compile_golden_transitions() -> Vec<fuml_client::proto::Transition> {
+        golden_alf_transitions()
+            .into_iter()
+            .map(|(from, to, signal, source)| {
+                let program =
+                    alf_lite::parse(source).expect("compiling a golden transition action");
+                fuml_client::proto::Transition {
+                    from_state: from.to_string(),
+                    to_state: to.to_string(),
+                    signal: signal.to_string(),
+                    actions: alf_ir::compile_program(&program),
+                }
+            })
+            .collect()
+    }
+
+    fn golden_signals() -> Vec<String> {
+        vec![
+            "arm".to_string(),
+            "ignite".to_string(),
+            "cutoff".to_string(),
+        ]
+    }
+
+    /// T-P1.4-02: an Alf action using only in-subset constructs (a guard comparison + a behavior
+    /// invocation setting `Turbine.rpm`) compiles without error and its produced fUML executes
+    /// to the golden trace — `Turbine.rpm` set as specified, surfaced here via the shared
+    /// read-back-and-print step every state-machine run ends with (see
+    /// `StateMachineActivityBuilder.appendFinalRpmOutput`'s doc comment for why that's the
+    /// meaningful, comparable signal instead of raw internal action names).
+    #[tokio::test]
+    #[ignore = "requires the fuml-runtime sidecar running (docker compose up -d fuml-runtime, or packages/fuml-runtime/run.sh)"]
+    async fn alf_state_machine_t_p1_4_02_subset_conformance() {
+        let events = fuml_client::execute_state_machine(
+            compile_golden_transitions(),
+            golden_signals(),
+            false,
+        )
+        .await
+        .expect("connect to fuml-runtime — is the sidecar running?");
+
+        let output = events
+            .iter()
+            .find(|e| e.kind == "output")
+            .expect("expected an 'output' trace event carrying Turbine.rpm's final value");
+        assert_eq!(output.detail, "3500.0");
+    }
+
+    /// T-P1.4-03: an out-of-subset construct (a collection/sequence literal) yields a precise
+    /// compile-time error naming it, and — because the handler compiles every transition before
+    /// ever calling the sidecar — no fUML is emitted at all, not just an incorrect one.
+    #[tokio::test]
+    async fn alf_state_machine_t_p1_4_03_rejects_unsupported_construct() {
+        let payload = control_sim::ControlStateMachineRequest {
+            transitions: vec![control_sim::TransitionRequest {
+                from: "Armed".to_string(),
+                to: "Running".to_string(),
+                signal: "ignite".to_string(),
+                alf_source: "let x = Sequence{1, 2, 3};".to_string(),
+            }],
+            signals: golden_signals(),
+            use_hand_authored_reference: false,
+        };
+
+        let response = control_sim::simulate_control_state_machine(Json(payload))
+            .await
+            .expect_err("expected a compile error, not a successful call to the sidecar")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collecting response body")
+            .to_bytes();
+        let message = String::from_utf8(bytes.to_vec()).expect("response body should be UTF-8");
+        assert!(
+            message.contains("collection/sequence expressions"),
+            "expected the error to name the unsupported construct, got: {message}"
+        );
+    }
+
+    /// T-P1.4-04: the identical golden scenario built two ways — via alf-lite's compiled path,
+    /// and hand-authored directly as fUML — must execute to identical results. Compared on the
+    /// final `Turbine.rpm` output value, not raw internal action names, which legitimately
+    /// differ between two independently-built graphs (see
+    /// `StateMachineActivityBuilder.appendFinalRpmOutput`'s doc comment).
+    #[tokio::test]
+    #[ignore = "requires the fuml-runtime sidecar running (docker compose up -d fuml-runtime, or packages/fuml-runtime/run.sh)"]
+    async fn alf_state_machine_t_p1_4_04_compiled_matches_hand_authored() {
+        let compiled = fuml_client::execute_state_machine(
+            compile_golden_transitions(),
+            golden_signals(),
+            false,
+        )
+        .await
+        .expect("connect to fuml-runtime — is the sidecar running? (compiled path)");
+        let hand_authored = fuml_client::execute_state_machine(
+            compile_golden_transitions(),
+            golden_signals(),
+            true,
+        )
+        .await
+        .expect("connect to fuml-runtime — is the sidecar running? (hand-authored path)");
+
+        let compiled_output = compiled
+            .iter()
+            .find(|e| e.kind == "output")
+            .expect("compiled path: expected an 'output' trace event");
+        let hand_authored_output = hand_authored
+            .iter()
+            .find(|e| e.kind == "output")
+            .expect("hand-authored path: expected an 'output' trace event");
+
+        assert_eq!(compiled_output.detail, hand_authored_output.detail);
+        assert_eq!(compiled_output.detail, "3500.0");
+    }
+
+    /// The concrete, verifiable form of "attempt the full dispatch loop": feeding all 3 signals
+    /// in order drives the state machine through all 4 states (Idle -> Armed -> Running ->
+    /// Shutdown), firing every transition's action along the way — asserted here via the driver's
+    /// own `Send(...)` actions appearing, in order, and the run completing with the expected
+    /// final output (proving the chain actually ran to completion, not just that the driver sent
+    /// its signals).
+    #[tokio::test]
+    #[ignore = "requires the fuml-runtime sidecar running (docker compose up -d fuml-runtime, or packages/fuml-runtime/run.sh)"]
+    async fn alf_state_machine_full_loop_reaches_all_four_states() {
+        let events = fuml_client::execute_state_machine(
+            compile_golden_transitions(),
+            golden_signals(),
+            false,
+        )
+        .await
+        .expect("connect to fuml-runtime — is the sidecar running?");
+
+        let sent_signals: Vec<&str> = events
+            .iter()
+            .filter(|e| e.kind == "fire" && e.action_name.starts_with("Send("))
+            .map(|e| e.action_name.as_str())
+            .collect();
+        assert_eq!(
+            sent_signals,
+            vec!["Send(arm)", "Send(ignite)", "Send(cutoff)"]
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == "output" && e.detail == "3500.0"),
+            "expected the run to reach completion with Turbine.rpm printed as 3500.0"
+        );
     }
 }
