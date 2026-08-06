@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+// P1.4 (roadmap: Behavioral Simulation, ADR-005/008) — the gRPC contract between apps/api and
+// the fuml-runtime JVM sidecar. Deliberately minimal for this pass: no XMI/model payload yet
+// (that's alf-lite's job, a later increment) — `activity_name` selects among a small fixed set
+// the sidecar constructs in-process via the fUML RI's own Java model-builder API, the same
+// construction proven in the ADR-005 spike.
+package axioma.fuml;
+
+option java_package = "org.axioma.fumlruntime.proto";
+option java_multiple_files = true;
+
+service FumlRuntime {
+  // Server-streaming, not a single response — T-P1.4-01 requires the trace to arrive
+  // incrementally as it's produced, not as one terminal blob.
+  rpc Execute(ExecuteRequest) returns (stream TraceEvent);
+}
+
+message ExecuteRequest {
+  string activity_name = 1;
+}
+
+message TraceEvent {
+  string activity_name = 1;
+  string action_name = 2;
+  // One of "execute" | "fire" | "output" — mirrors the fUML RI's own log4j event categories
+  // (Debug's "Execute activity=..."/"Fire activity=...action=..." lines), not an invented taxonomy.
+  string kind = 3;
+  string detail = 4;
+}

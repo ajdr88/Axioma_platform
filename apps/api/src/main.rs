@@ -7,6 +7,7 @@
 //! scope, a first real read/write path per store, and the Projects/Commits/Elements structuring
 //! nouns impl §1 names, made real rather than a `/api/v0/elements` stand-in.
 
+mod fuml_client;
 mod import;
 mod mode_a;
 mod store;
@@ -219,6 +220,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/cem/mode-a/query",
             post(mode_a::query),
+        )
+        .route(
+            "/api/v0/projects/:projectId/simulate/hello-world",
+            post(fuml_client::simulate_hello_world),
         )
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -2646,5 +2651,73 @@ mod tests {
         assert_eq!(body["groundedFully"], serde_json::json!(true));
         assert_eq!(body["citedElementIds"], serde_json::json!([]));
         assert_eq!(body["provenance"]["contextSnapshot"], serde_json::json!([]));
+    }
+
+    /// T-P1.4-01: the `Execute` RPC must stream incrementally, and 100 identical runs must
+    /// produce an identical trace. Set `FUML_RUNTIME_ADDR` if the sidecar isn't on its default
+    /// port (e.g. `http://localhost:50052`, needed on machines where something else already
+    /// holds 50051 — see `packages/fuml-runtime/README.md`). Run both fuml_execute_* tests with
+    /// `--test-threads=1`: the sidecar's `TraceStreamingAppender` attaches to a single
+    /// process-global log4j logger per call (see that class's own doc comment on the
+    /// single-request assumption) — two `Execute` calls running concurrently against the same
+    /// sidecar process cross-contaminate each other's trace, confirmed directly.
+    #[tokio::test]
+    #[ignore = "requires the fuml-runtime sidecar running (docker compose up -d fuml-runtime, or packages/fuml-runtime/run.sh)"]
+    async fn fuml_execute_streams_incrementally() {
+        let mut stream = fuml_client::execute_streaming("HelloWorld2")
+            .await
+            .expect("connect to fuml-runtime — is the sidecar running?");
+
+        // Reading messages one at a time off a `tonic::Streaming<TraceEvent>` (never a `Vec`
+        // deserialized in one shot) is itself the proof this is genuinely server-streaming, not
+        // a batched response dressed up as one — the type only offers this API because the wire
+        // protocol is HTTP/2 DATA frames arriving over time, not one length-prefixed message.
+        let mut count = 0;
+        while stream
+            .message()
+            .await
+            .expect("reading a trace event")
+            .is_some()
+        {
+            count += 1;
+        }
+        assert!(
+            count > 1,
+            "expected more than one streamed trace event, got {count}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the fuml-runtime sidecar running (docker compose up -d fuml-runtime, or packages/fuml-runtime/run.sh)"]
+    async fn fuml_execute_is_deterministic_across_100_runs() {
+        // The RI's own debug logging embeds a JVM object-identity hash in a handful of "log"
+        // events (e.g. "[destroy] object = 1d837fa3#1420a84d") that differs run-to-run by design
+        // — confirmed directly by diffing two runs — since it's a memory-address-derived identity
+        // token, not model state. So this compares the structural (kind, activityName,
+        // actionName) sequence, which real repeated runs confirmed is byte-for-byte identical,
+        // not the raw `detail` text.
+        let mut reference: Option<Vec<(String, String, String)>> = None;
+        for run in 0..100 {
+            let events = fuml_client::execute("HelloWorld2")
+                .await
+                .expect("connect to fuml-runtime — is the sidecar running?");
+            let structural: Vec<(String, String, String)> = events
+                .iter()
+                .map(|e| {
+                    (
+                        e.kind.clone(),
+                        e.activity_name.clone(),
+                        e.action_name.clone(),
+                    )
+                })
+                .collect();
+            match &reference {
+                None => reference = Some(structural),
+                Some(expected) => assert_eq!(
+                    &structural, expected,
+                    "run {run} produced a different trace sequence than run 0"
+                ),
+            }
+        }
     }
 }

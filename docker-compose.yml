@@ -74,6 +74,15 @@ services:
       timeout: 5s
       retries: 10
 
+  # P1.4's Behavioral Simulation sidecar (ADR-005/008) — the real fUML Reference Implementation,
+  # driven from apps/api over gRPC. This pass supports exactly one fixed activity ("HelloWorld2");
+  # no health check yet since the sidecar doesn't register gRPC's health-check service this pass
+  # (deferred alongside alf-lite/the pilot's real State Machine — see packages/fuml-runtime/README.md).
+  fuml-runtime:
+    build: ./packages/fuml-runtime
+    ports:
+      - "50051:50051"
+
 volumes:
   neo4j-data:
   postgres-data:

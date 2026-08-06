@@ -44,5 +44,15 @@ uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 
+# P1.4 (roadmap: Behavioral Simulation, ADR-005/008) — the gRPC client to the fuml-runtime JVM
+# sidecar. No dedicated Rust workspace crate for this (one caller, same "thin slice, no
+# premature package" reasoning already applied to Mode A/llm-gateway) — apps/api/build.rs
+# compiles the same proto/fuml_runtime.proto fuml-runtime's own build.sh does.
+tonic = "0.12"
+prost = "0.13"
+
+[build-dependencies]
+tonic-build = "0.12"
+
 [dev-dependencies]
 http-body-util = "0.1"
