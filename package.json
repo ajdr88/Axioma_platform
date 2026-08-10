@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "turbo run dev",
-    "dev:all": "docker compose up -d --wait && concurrently -n api,lsp,web -c green,yellow,magenta \"cargo run -p api\" \"cargo run -p lsp\" \"pnpm --filter @axioma/web dev\"",
+    "dev:all": "docker compose up -d --wait && concurrently -n api,lsp,web -c green,yellow,magenta \"cargo run -p api --bin api\" \"cargo run -p lsp\" \"pnpm --filter @axioma/web dev\"",
     "build": "turbo run build",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
