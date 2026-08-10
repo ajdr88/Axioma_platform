@@ -29,7 +29,9 @@ pub(crate) struct TraceEventDto {
     #[serde(rename = "actionName")]
     pub(crate) action_name: String,
     pub(crate) kind: String,
-    #[allow(dead_code)] // carried for the JSON response; not read anywhere in Rust yet
+    // Read by `control_sim::run_golden_control_sim` (the final `"output"`-kind event's `detail`
+    // carries the golden run's `Turbine.rpm` reading) as well as being carried in the JSON
+    // response for every other caller.
     pub(crate) detail: String,
 }
 

@@ -45,3 +45,13 @@ export interface Edge {
   target: string;
   kind: EdgeKind;
 }
+
+/** Git-backed model versioning (roadmap: P1.1, T-P1.1-05) — mirrors `store::versioning::Branch`.
+ * `headCommitId`/`forkCommitId` are `null` for a brand-new `main` branch with no commits yet. */
+export interface Branch {
+  id: string;
+  projectId: string;
+  name: string;
+  headCommitId: string | null;
+  forkCommitId: string | null;
+}

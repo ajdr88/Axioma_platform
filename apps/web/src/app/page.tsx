@@ -44,6 +44,7 @@ import { MissionPlanningPanel } from "@/components/MissionPlanningPanel";
 import { StageTrackingPanel } from "@/components/StageTrackingPanel";
 import type { TextualEditorPanelHandle } from "@/components/TextualEditorPanel";
 import { TraceabilityPanel } from "@/components/TraceabilityPanel";
+import { TradeStudyPanel } from "@/components/TradeStudyPanel";
 
 // `monaco-editor` touches `window` at module-evaluation time — a plain static import would pull
 // it into the SSR module graph (and crash prerendering) even while `showTextPanel` is false and
@@ -137,6 +138,7 @@ export default function Home() {
   const [showHazardPanel, setShowHazardPanel] = useState(false);
   const [showMissionPanel, setShowMissionPanel] = useState(false);
   const [showStagePanel, setShowStagePanel] = useState(false);
+  const [showTradeStudyPanel, setShowTradeStudyPanel] = useState(false);
   const [showTraceabilityPanel, setShowTraceabilityPanel] = useState(false);
   /** FR-CORE-08 / T-P1.2-06's "AI-suggested only" filter — "all" shows every origin. */
   const [originFilter, setOriginFilter] = useState<Origin | "all">("all");
@@ -567,6 +569,8 @@ export default function Home() {
         setShowMissionPanel={setShowMissionPanel}
         showStagePanel={showStagePanel}
         setShowStagePanel={setShowStagePanel}
+        showTradeStudyPanel={showTradeStudyPanel}
+        setShowTradeStudyPanel={setShowTradeStudyPanel}
         showTraceabilityPanel={showTraceabilityPanel}
         setShowTraceabilityPanel={setShowTraceabilityPanel}
         originFilter={originFilter}
@@ -615,6 +619,8 @@ interface CanvasProps {
   setShowMissionPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showStagePanel: boolean;
   setShowStagePanel: React.Dispatch<React.SetStateAction<boolean>>;
+  showTradeStudyPanel: boolean;
+  setShowTradeStudyPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showTraceabilityPanel: boolean;
   setShowTraceabilityPanel: React.Dispatch<React.SetStateAction<boolean>>;
   originFilter: Origin | "all";
@@ -665,6 +671,8 @@ function Canvas({
   setShowMissionPanel,
   showStagePanel,
   setShowStagePanel,
+  showTradeStudyPanel,
+  setShowTradeStudyPanel,
   showTraceabilityPanel,
   setShowTraceabilityPanel,
   originFilter,
@@ -1015,6 +1023,7 @@ function Canvas({
                   setShowHazardPanel((v) => !v);
                   setShowMissionPanel(false);
                   setShowStagePanel(false);
+                  setShowTradeStudyPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1028,6 +1037,7 @@ function Canvas({
                   setShowMissionPanel((v) => !v);
                   setShowHazardPanel(false);
                   setShowStagePanel(false);
+                  setShowTradeStudyPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1041,6 +1051,7 @@ function Canvas({
                   setShowStagePanel((v) => !v);
                   setShowHazardPanel(false);
                   setShowMissionPanel(false);
+                  setShowTradeStudyPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1049,12 +1060,27 @@ function Canvas({
                 Stage Tracking
               </Button>
               <Button
+                variant={showTradeStudyPanel ? "primary" : "ghost"}
+                onClick={() => {
+                  setShowTradeStudyPanel((v) => !v);
+                  setShowHazardPanel(false);
+                  setShowMissionPanel(false);
+                  setShowStagePanel(false);
+                  setShowTraceabilityPanel(false);
+                  setSelectedNodeId(null);
+                }}
+                className="!px-2 !py-1 text-xs"
+              >
+                Trade Study
+              </Button>
+              <Button
                 variant={showTraceabilityPanel ? "primary" : "ghost"}
                 onClick={() => {
                   setShowTraceabilityPanel((v) => !v);
                   setShowHazardPanel(false);
                   setShowMissionPanel(false);
                   setShowStagePanel(false);
+                  setShowTradeStudyPanel(false);
                 }}
                 className="!px-2 !py-1 text-xs"
               >
@@ -1121,6 +1147,10 @@ function Canvas({
               projectId={projectId}
               onClose={() => setShowStagePanel(false)}
             />
+          )}
+
+          {showTradeStudyPanel && projectId && (
+            <TradeStudyPanel projectId={projectId} onClose={() => setShowTradeStudyPanel(false)} />
           )}
         </ReactFlow>
       </div>

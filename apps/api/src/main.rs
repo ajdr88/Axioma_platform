@@ -14,6 +14,7 @@ mod import;
 mod mode_a;
 mod store;
 mod traceability;
+mod trade_study;
 
 use std::collections::HashMap;
 
@@ -162,6 +163,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/commits/:commitId/diff",
             get(diff_commit),
+        )
+        .route(
+            "/api/v0/projects/:projectId/trade-studies/compare",
+            post(trade_study::compare),
         )
         .route(
             "/api/v0/projects/:projectId/elements",
@@ -1959,6 +1964,103 @@ mod tests {
         }
     }
 
+    /// T-P1.4-05 — the pilot trade-study workflow, made real: branch, swap `FanLpCompression`'s
+    /// bypass ratio on the branch, run the pilot's Control-state-machine sim, compare against
+    /// `main`. PASS: the report shows a nonzero thrust delta between baseline and variant, the
+    /// simulation converges (proving the branch edit didn't break the pilot's behavior), and the
+    /// requested element/property round-trip unchanged. Requires the `fuml-runtime` sidecar
+    /// (`compare` runs `control_sim::run_golden_control_sim`), same as the other
+    /// `alf_state_machine_*`/`fuml_execute_*` tests — run with `--test-threads=1`.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` and the fuml-runtime sidecar"]
+    async fn trade_study_compare_reports_thrust_delta_and_confirms_simulation() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "trade-study").await;
+
+        let fan = Element {
+            id: "FanLpCompression".to_string(),
+            kind: NodeKind::Structure,
+            name: "Fan & LP Compression".to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(&project.id, &fan).await.unwrap();
+        state
+            .postgres
+            .upsert_body(
+                &project.id,
+                &ElementBody {
+                    element_id: "FanLpCompression".to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "bypassRatio": 5.0 }),
+                },
+            )
+            .await
+            .unwrap();
+        record_commit(
+            &state,
+            &project.id,
+            "test-actor",
+            "Seed Fan",
+            vec![DiffEntry::ElementCreated {
+                element_id: "FanLpCompression".to_string(),
+                kind: NodeKind::Structure,
+                name: "Fan & LP Compression".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let branch = state
+            .versioning
+            .create_branch(&project.id, "higher-bypass", None)
+            .await
+            .unwrap();
+        branch_update_element_body(
+            State(state.clone()),
+            Path((
+                project.id.clone(),
+                branch.name.clone(),
+                "FanLpCompression".to_string(),
+            )),
+            Json(BranchEditBodyRequest {
+                rationale: None,
+                properties: serde_json::json!({ "bypassRatio": 6.5 }),
+                actor: Some("test-actor".to_string()),
+                message: "Trade study: higher bypass ratio".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let report = trade_study::compare(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(trade_study::TradeStudyCompareRequest {
+                branch: "higher-bypass".to_string(),
+                element_id: "FanLpCompression".to_string(),
+                property: "bypassRatio".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(report.branch, "higher-bypass");
+        assert_eq!(report.baseline.bypass_ratio, 5.0);
+        assert_eq!(report.variant.bypass_ratio, 6.5);
+        assert!(
+            report.delta.thrust_lbf < 0.0,
+            "a higher bypass ratio should reduce estimated thrust, got {:?}",
+            report.delta
+        );
+        assert!(
+            report.simulation.converged,
+            "the pilot sim should still converge after the branch edit, got {:?}",
+            report.simulation
+        );
+    }
+
     /// Two projects' elements never leak into each other — the same id string in two different
     /// projects addresses two distinct Neo4j nodes.
     #[tokio::test]
@@ -2884,25 +2986,12 @@ mod tests {
         }
     }
 
-    /// The pilot's Control state machine, exactly as described in the test specs: Idle -> Armed
-    /// (`arm`) -> Running (`ignite`, the one transition with a real guard+effect) -> Shutdown
-    /// (`cutoff`). The Idle->Armed and Running->Shutdown transitions are trivial (empty actions)
-    /// — the docs only ever give one concrete transition action to compile.
-    fn golden_alf_transitions() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
-        vec![
-            ("Idle", "Armed", "arm", ""),
-            (
-                "Armed",
-                "Running",
-                "ignite",
-                "if (Turbine.rpm < 3500.0) { SetTurbineRpm(3500.0); }",
-            ),
-            ("Running", "Shutdown", "cutoff", ""),
-        ]
-    }
-
+    /// Compiles `control_sim::golden_alf_transitions` (the pilot's Idle->Armed->Running->Shutdown
+    /// Control state machine, now `pub(crate)` since `trade_study` needs the same known-good
+    /// program — see that function's doc comment) into wire-format transitions, for tests that
+    /// call `fuml_client::execute_state_machine` directly rather than through the HTTP handler.
     fn compile_golden_transitions() -> Vec<fuml_client::proto::Transition> {
-        golden_alf_transitions()
+        control_sim::golden_alf_transitions()
             .into_iter()
             .map(|(from, to, signal, source)| {
                 let program =
@@ -2917,14 +3006,6 @@ mod tests {
             .collect()
     }
 
-    fn golden_signals() -> Vec<String> {
-        vec![
-            "arm".to_string(),
-            "ignite".to_string(),
-            "cutoff".to_string(),
-        ]
-    }
-
     /// T-P1.4-02: an Alf action using only in-subset constructs (a guard comparison + a behavior
     /// invocation setting `Turbine.rpm`) compiles without error and its produced fUML executes
     /// to the golden trace — `Turbine.rpm` set as specified, surfaced here via the shared
@@ -2936,7 +3017,7 @@ mod tests {
     async fn alf_state_machine_t_p1_4_02_subset_conformance() {
         let events = fuml_client::execute_state_machine(
             compile_golden_transitions(),
-            golden_signals(),
+            control_sim::golden_signals(),
             false,
         )
         .await
@@ -2961,7 +3042,7 @@ mod tests {
                 signal: "ignite".to_string(),
                 alf_source: "let x = Sequence{1, 2, 3};".to_string(),
             }],
-            signals: golden_signals(),
+            signals: control_sim::golden_signals(),
             use_hand_authored_reference: false,
         };
 
@@ -2991,14 +3072,14 @@ mod tests {
     async fn alf_state_machine_t_p1_4_04_compiled_matches_hand_authored() {
         let compiled = fuml_client::execute_state_machine(
             compile_golden_transitions(),
-            golden_signals(),
+            control_sim::golden_signals(),
             false,
         )
         .await
         .expect("connect to fuml-runtime — is the sidecar running? (compiled path)");
         let hand_authored = fuml_client::execute_state_machine(
             compile_golden_transitions(),
-            golden_signals(),
+            control_sim::golden_signals(),
             true,
         )
         .await
@@ -3028,7 +3109,7 @@ mod tests {
     async fn alf_state_machine_full_loop_reaches_all_four_states() {
         let events = fuml_client::execute_state_machine(
             compile_golden_transitions(),
-            golden_signals(),
+            control_sim::golden_signals(),
             false,
         )
         .await
