@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use sysml_core::NodeKind;
 
 use crate::traceability::{run_traversal, Direction};
-use crate::{env_or, ApiError, AppState};
+use crate::{env_or, import, ApiError, AppState};
 
 const PROMPT_TEMPLATE: &str = "You are Axioma's grounded model copilot. Answer the user's \
 question using ONLY the facts listed below — never use outside knowledge. \
@@ -39,12 +39,30 @@ ANSWER: PUMP-1 is a Structure named Coolant Pump. [PUMP-1]\n\n\
 FACTS:\n{facts}\n\nQUESTION: {question}\nANSWER:";
 
 /// FR-CEM-05's "prompt-template hash" — hashing the fixed template text itself (not the filled-in
-/// prompt, which varies per question) is what makes this a stable identifier for "which template
-/// generated this," matching the field's purpose.
-fn prompt_template_hash() -> String {
+/// prompt, which varies per call) is what makes this a stable identifier for "which template
+/// generated this," matching the field's purpose. Takes the template explicitly since three Mode
+/// A capabilities now each have their own fixed template.
+fn prompt_template_hash(template: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(PROMPT_TEMPLATE.as_bytes());
+    hasher.update(template.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// The other two Mode A capabilities (`search_parts`/`lint_requirement`) need the model to
+/// return structured data, not free text — small local models reliably wrap JSON in markdown
+/// code fences or a sentence of preamble even when told not to (confirmed directly, same
+/// "small models don't perfectly follow format instructions" finding as the copilot's own bracket-
+/// citation gap). Finds the outermost `[...]` rather than requiring the whole response to be
+/// clean JSON, then parses just that slice — tolerant of surrounding noise, still strict about
+/// the array's own contents. Returns `None` (callers treat this as "no results," not an error)
+/// if no bracket pair parses as valid JSON.
+fn parse_json_array<T: serde::de::DeserializeOwned>(text: &str) -> Option<Vec<T>> {
+    let start = text.find('[')?;
+    let end = text.rfind(']')?;
+    if end < start {
+        return None;
+    }
+    serde_json::from_str(&text[start..=end]).ok()
 }
 
 /// Deterministic-leaning defaults for a grounded-fact QA task — this isn't a creative-writing
@@ -289,7 +307,7 @@ pub async fn query(
             provenance: ModeAProvenance {
                 model_name: "none".to_string(),
                 model_version: "none".to_string(),
-                prompt_template_hash: prompt_template_hash(),
+                prompt_template_hash: prompt_template_hash(PROMPT_TEMPLATE),
                 temperature: TEMPERATURE,
                 seed: SEED,
                 context_snapshot: Vec::new(),
@@ -339,10 +357,297 @@ pub async fn query(
         provenance: ModeAProvenance {
             model_name,
             model_version,
-            prompt_template_hash: prompt_template_hash(),
+            prompt_template_hash: prompt_template_hash(PROMPT_TEMPLATE),
             temperature: TEMPERATURE,
             seed: SEED,
             context_snapshot: facts,
+        },
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Part search — in-context LLM ranking, not real embeddings/vector search (none exist; building
+// an embedding pipeline is much larger, unrequested scope). The whole element list is put in the
+// prompt and the model ranks/returns matches directly. Deliberately, honestly scoped to
+// reference-fixture size: this does not scale to `Turbofan-Scale`'s 1M elements (nowhere near
+// fitting in any model's context window) — a real, flagged limitation, not silently assumed away,
+// same as several other features in this codebase that are honest about not being verified at
+// 1M-element scale.
+// ---------------------------------------------------------------------------
+
+const PART_SEARCH_PROMPT_TEMPLATE: &str = "You are Axioma's grounded model copilot, helping an \
+engineer find a specific part by natural-language description. Given the description and the \
+list of elements below, identify which ones plausibly match, most-relevant first. \
+Respond with ONLY a JSON array, nothing else, no markdown code fence — each entry exactly \
+{\"elementId\": \"...\", \"reason\": \"...\"}. If nothing plausibly matches, respond with \
+exactly: []\n\n\
+Example of the required format:\n\
+ELEMENTS:\n- [PUMP-1] (Structure) Coolant Pump\n- [VALVE-2] (Structure) Bypass Valve\n\
+DESCRIPTION: something that moves coolant\n\
+MATCHES: [{\"elementId\": \"PUMP-1\", \"reason\": \"a pump moves coolant\"}]\n\n\
+ELEMENTS:\n{elements}\n\nDESCRIPTION: {description}\nMATCHES:";
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PartSearchRequest {
+    pub(crate) description: String,
+}
+
+/// `qwen2.5:1.5b` doesn't reliably follow the object-per-match format even when the example
+/// shows it — confirmed directly: asked for `[{"elementId": "...", "reason": "..."}]`, it
+/// returned a bare `["CoreHpCompressor", "ControlFadecEec"]` instead. Same "be lenient about
+/// form, strict about substance" precedent as `find_bare_known_ids`'s bare-citation handling —
+/// accept either shape rather than losing a real match to a formatting slip.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum RawPartMatch {
+    WithReason {
+        #[serde(rename = "elementId")]
+        element_id: String,
+        #[serde(default)]
+        reason: String,
+    },
+    BareId(String),
+}
+
+impl RawPartMatch {
+    fn into_parts(self) -> (String, String) {
+        match self {
+            RawPartMatch::WithReason { element_id, reason } => (element_id, reason),
+            RawPartMatch::BareId(element_id) => (element_id, String::new()),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PartMatch {
+    #[serde(rename = "elementId")]
+    element_id: String,
+    kind: NodeKind,
+    name: String,
+    reason: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct PartSearchResponse {
+    matches: Vec<PartMatch>,
+    provenance: ModeAProvenance,
+}
+
+/// `POST /api/v0/projects/:projectId/cem/mode-a/part-search`. Every candidate returned by the
+/// model is cross-checked against the real element list before being surfaced — the same
+/// citation-integrity discipline `query`'s fabrication check uses, applied here to "is this a
+/// real element id" instead of "was this id really in the grounding facts."
+pub async fn search_parts(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(payload): Json<PartSearchRequest>,
+) -> Result<Json<PartSearchResponse>, ApiError> {
+    let elements = state.neo4j.list_elements(&project_id).await?;
+    let candidates: Vec<ContextFact> = elements
+        .iter()
+        .map(|e| ContextFact {
+            id: e.id.clone(),
+            kind: e.kind,
+            name: e.name.clone(),
+            relation: None,
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(Json(PartSearchResponse {
+            matches: Vec::new(),
+            provenance: ModeAProvenance {
+                model_name: "none".to_string(),
+                model_version: "none".to_string(),
+                prompt_template_hash: prompt_template_hash(PART_SEARCH_PROMPT_TEMPLATE),
+                temperature: TEMPERATURE,
+                seed: SEED,
+                context_snapshot: Vec::new(),
+            },
+        }));
+    }
+
+    let elements_text = candidates
+        .iter()
+        .map(|f| format!("- [{}] ({:?}) {}", f.id, f.kind, f.name))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = PART_SEARCH_PROMPT_TEMPLATE
+        .replace("{elements}", &elements_text)
+        .replace("{description}", &payload.description);
+
+    let (raw_answer, model_name, model_version) = call_ollama(&prompt).await?;
+
+    let elements_by_id: std::collections::HashMap<&str, &sysml_core::Element> =
+        elements.iter().map(|e| (e.id.as_str(), e)).collect();
+    let matches: Vec<PartMatch> = parse_json_array::<RawPartMatch>(&raw_answer)
+        .unwrap_or_default()
+        .into_iter()
+        .map(RawPartMatch::into_parts)
+        .filter_map(|(element_id, reason)| {
+            elements_by_id.get(element_id.as_str()).map(|e| PartMatch {
+                element_id: e.id.clone(),
+                kind: e.kind,
+                name: e.name.clone(),
+                reason,
+            })
+        })
+        .collect();
+
+    Ok(Json(PartSearchResponse {
+        matches,
+        provenance: ModeAProvenance {
+            model_name,
+            model_version,
+            prompt_template_hash: prompt_template_hash(PART_SEARCH_PROMPT_TEMPLATE),
+            temperature: TEMPERATURE,
+            seed: SEED,
+            context_snapshot: candidates,
+        },
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Requirement linting — LLM-based INCOSE-style wording review (ambiguous terms, missing "shall",
+// multiple requirements crammed into one, non-testable language). A `Requirement`'s `name` field
+// already *is* the requirement statement text in this data model (confirmed against the seed
+// fixture — `REQ-THRUST`'s `name` is "Engine shall provide >= 30,000 lbf takeoff thrust", not a
+// short label with the real text elsewhere), so that's what gets reviewed; no separate
+// structured "shall statement" field exists to prefer instead.
+//
+// **Real, measured quality limitation — tested directly against both locally-available models
+// (`qwen2.5:1.5b`/`qwen2.5:3b`) across several prompt structures, not assumed.** Neither
+// reliably distinguishes "no real issues" from "has real issues" the way the copilot's citation
+// task turned out to: depending on prompt phrasing, they either (a) default to an empty result
+// even for a requirement combining four unrelated, vague clauses in one sentence with no "shall,"
+// (b) echo this prompt's own category labels back verbatim regardless of input (a false-positive
+// failure mode, worse than under-flagging — it erodes trust by "crying wolf" on well-formed
+// text), or (c) drift into generic copyediting (spelling/hyphenation) unrelated to INCOSE-style
+// requirement quality. The prompt/parsing below is the version that produced the best real
+// output in that testing (real "ambiguous-term" issues with sensible categories on a genuinely
+// bad requirement, correctly silent on a well-formed one) — kept over higher-recall variants
+// that returned *something* more often, because false positives here are worse than false
+// negatives. **This is a real, structural limit of the small local models available in this
+// environment, not a code defect** — a production deployment wanting this capability to be
+// reliable would need a materially more capable model. Documented rather than hidden, same
+// honesty stance as every other measured limitation in this codebase.
+// ---------------------------------------------------------------------------
+
+const LINT_REQUIREMENT_PROMPT_TEMPLATE: &str = "You are Axioma's grounded model copilot, \
+performing an INCOSE-style wording review of one requirement. Identify concrete issues: \
+ambiguous or vague terms (e.g. \"user-friendly\", \"sufficient\", \"etc.\", \"and/or\"), a \
+missing \"shall\", multiple distinct requirements combined into one sentence, or language that \
+cannot be objectively verified. Respond with ONLY a JSON array, nothing else, no markdown code \
+fence — each entry exactly {\"category\": \"...\", \"severity\": \"warning\" or \"error\", \
+\"message\": \"...\"}. If the wording has no such issues, respond with exactly: []\n\n\
+Example of the required format:\n\
+REQUIREMENT [REQ-1]: The system shall be sufficiently fast and user-friendly.\n\
+ISSUES: [{\"category\": \"ambiguous-term\", \"severity\": \"warning\", \"message\": \"'sufficiently \
+fast' is not measurable — specify a testable threshold\"}, {\"category\": \"ambiguous-term\", \
+\"severity\": \"warning\", \"message\": \"'user-friendly' is subjective and not verifiable\"}]\n\n\
+REQUIREMENT [{id}]: {text}\nISSUES:";
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LintRequirementRequest {
+    #[serde(rename = "elementId")]
+    pub(crate) element_id: String,
+}
+
+/// Same "be lenient about form, strict about substance" leniency as `RawPartMatch` — a bare
+/// string (missing `category`/`severity`) is treated as a generic warning rather than discarded.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum RawLintIssue {
+    Full {
+        category: String,
+        severity: String,
+        message: String,
+    },
+    BareMessage(String),
+}
+
+#[derive(Debug, serde::Serialize)]
+struct LintIssue {
+    category: String,
+    severity: String,
+    message: String,
+}
+
+impl From<RawLintIssue> for LintIssue {
+    fn from(raw: RawLintIssue) -> Self {
+        match raw {
+            RawLintIssue::Full {
+                category,
+                severity,
+                message,
+            } => LintIssue {
+                category,
+                severity,
+                message,
+            },
+            RawLintIssue::BareMessage(message) => LintIssue {
+                category: "general".to_string(),
+                severity: "warning".to_string(),
+                message,
+            },
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LintRequirementResponse {
+    issues: Vec<LintIssue>,
+    provenance: ModeAProvenance,
+}
+
+/// `POST /api/v0/projects/:projectId/cem/mode-a/lint-requirement`. Deliberately per-requirement,
+/// not a whole-project bulk lint — matches this codebase's established thin-slice precedent
+/// (Mode A's own copilot slice, `fuml_client`, etc.); a bulk variant is a small, obvious
+/// follow-up once this one's actually used, not something to build speculatively now.
+pub async fn lint_requirement(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(payload): Json<LintRequirementRequest>,
+) -> Result<Json<LintRequirementResponse>, ApiError> {
+    let Some(element) = state
+        .neo4j
+        .get_element(&project_id, &payload.element_id)
+        .await?
+    else {
+        return Err(import::BadRequest(format!("no element {}", payload.element_id)).into());
+    };
+    if element.kind != NodeKind::Requirement {
+        return Err(import::BadRequest(format!(
+            "{} is a {:?}, not a Requirement",
+            element.id, element.kind
+        ))
+        .into());
+    }
+
+    let prompt = LINT_REQUIREMENT_PROMPT_TEMPLATE
+        .replace("{id}", &element.id)
+        .replace("{text}", &element.name);
+    let (raw_answer, model_name, model_version) = call_ollama(&prompt).await?;
+    let issues: Vec<LintIssue> = parse_json_array::<RawLintIssue>(&raw_answer)
+        .unwrap_or_default()
+        .into_iter()
+        .map(LintIssue::from)
+        .collect();
+
+    Ok(Json(LintRequirementResponse {
+        issues,
+        provenance: ModeAProvenance {
+            model_name,
+            model_version,
+            prompt_template_hash: prompt_template_hash(LINT_REQUIREMENT_PROMPT_TEMPLATE),
+            temperature: TEMPERATURE,
+            seed: SEED,
+            context_snapshot: vec![ContextFact {
+                id: element.id,
+                kind: element.kind,
+                name: element.name,
+                relation: None,
+            }],
         },
     }))
 }

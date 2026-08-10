@@ -16,9 +16,18 @@ interface BreachDependent {
   name: string;
 }
 
+interface LintIssue {
+  category: string;
+  severity: string;
+  message: string;
+}
+
 interface ElementInspectorProps {
   elementId: string;
   elementLabel: string;
+  /** Gates the "Lint" button (Mode A requirement linting only applies to Requirements) — not
+   * used for anything else here. */
+  elementKind: string;
   projectId: string;
   editMode: boolean;
   onClose: () => void;
@@ -37,6 +46,7 @@ interface ElementInspectorProps {
 export function ElementInspector({
   elementId,
   elementLabel,
+  elementKind,
   projectId,
   editMode,
   onClose,
@@ -50,10 +60,38 @@ export function ElementInspector({
   const [breach, setBreach] = useState<{ message: string; dependents: BreachDependent[] } | null>(
     null,
   );
+  const [linting, setLinting] = useState(false);
+  const [lintIssues, setLintIssues] = useState<LintIssue[] | null>(null);
+  const [lintError, setLintError] = useState<string | null>(null);
+
+  async function handleLint() {
+    setLinting(true);
+    setLintError(null);
+    setLintIssues(null);
+    try {
+      const res = await fetch(`/api/projects/${projectId}/cem/mode-a/lint-requirement`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ elementId }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.error ?? `lint failed with status ${res.status}`);
+      }
+      const data = await res.json();
+      setLintIssues(data.issues);
+    } catch (error) {
+      setLintError(error instanceof Error ? error.message : "failed to lint requirement");
+    } finally {
+      setLinting(false);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
     setState({ status: "loading" });
+    setLintIssues(null);
+    setLintError(null);
 
     async function load() {
       try {
@@ -237,6 +275,47 @@ export function ElementInspector({
           <Button onClick={handleSave} disabled={saving} className="w-full justify-center">
             {saving ? "Saving…" : "Save"}
           </Button>
+
+          {elementKind === "Requirement" && (
+            <div className="border-t border-white/10 pt-3">
+              <div className="mb-1.5 flex items-center justify-between">
+                <p className="text-[10px] uppercase tracking-widest text-white/40">
+                  Mode A Wording Review
+                </p>
+                <Button
+                  variant="ghost"
+                  onClick={handleLint}
+                  disabled={linting}
+                  className="!px-2 !py-1 text-xs"
+                >
+                  {linting ? "Linting…" : "Lint"}
+                </Button>
+              </div>
+              {lintError && <p className="text-xs text-alert">{lintError}</p>}
+              {lintIssues && lintIssues.length === 0 && (
+                <p className="text-xs text-white/40">No wording issues found.</p>
+              )}
+              {lintIssues && lintIssues.length > 0 && (
+                <ul data-lint-issues className="space-y-1.5">
+                  {lintIssues.map((issue, index) => (
+                    <li
+                      // biome-ignore lint/suspicious/noArrayIndexKey: a fresh list each lint run, never reordered
+                      key={index}
+                      data-lint-severity={issue.severity}
+                      className="rounded border border-white/10 p-1.5 text-[11px]"
+                    >
+                      <span
+                        className={issue.severity === "error" ? "text-alert" : "text-cobalt-glow"}
+                      >
+                        {issue.category}
+                      </span>
+                      <p className="text-white/70">{issue.message}</p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
 
           {editMode && (
             <div className="border-t border-white/10 pt-3">

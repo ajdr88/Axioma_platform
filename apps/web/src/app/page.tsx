@@ -41,6 +41,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ElementInspector } from "@/components/ElementInspector";
 import { HazardRiskPanel } from "@/components/HazardRiskPanel";
 import { MissionPlanningPanel } from "@/components/MissionPlanningPanel";
+import { PartSearchPanel } from "@/components/PartSearchPanel";
 import { StageTrackingPanel } from "@/components/StageTrackingPanel";
 import type { TextualEditorPanelHandle } from "@/components/TextualEditorPanel";
 import { TraceabilityPanel } from "@/components/TraceabilityPanel";
@@ -146,6 +147,7 @@ export default function Home() {
   const [showMissionPanel, setShowMissionPanel] = useState(false);
   const [showStagePanel, setShowStagePanel] = useState(false);
   const [showTradeStudyPanel, setShowTradeStudyPanel] = useState(false);
+  const [showPartSearchPanel, setShowPartSearchPanel] = useState(false);
   const [showTraceabilityPanel, setShowTraceabilityPanel] = useState(false);
   /** FR-CORE-08 / T-P1.2-06's "AI-suggested only" filter — "all" shows every origin. */
   const [originFilter, setOriginFilter] = useState<Origin | "all">("all");
@@ -584,6 +586,8 @@ export default function Home() {
         setShowStagePanel={setShowStagePanel}
         showTradeStudyPanel={showTradeStudyPanel}
         setShowTradeStudyPanel={setShowTradeStudyPanel}
+        showPartSearchPanel={showPartSearchPanel}
+        setShowPartSearchPanel={setShowPartSearchPanel}
         showTraceabilityPanel={showTraceabilityPanel}
         setShowTraceabilityPanel={setShowTraceabilityPanel}
         originFilter={originFilter}
@@ -636,6 +640,8 @@ interface CanvasProps {
   setShowStagePanel: React.Dispatch<React.SetStateAction<boolean>>;
   showTradeStudyPanel: boolean;
   setShowTradeStudyPanel: React.Dispatch<React.SetStateAction<boolean>>;
+  showPartSearchPanel: boolean;
+  setShowPartSearchPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showTraceabilityPanel: boolean;
   setShowTraceabilityPanel: React.Dispatch<React.SetStateAction<boolean>>;
   originFilter: Origin | "all";
@@ -690,6 +696,8 @@ function Canvas({
   setShowStagePanel,
   showTradeStudyPanel,
   setShowTradeStudyPanel,
+  showPartSearchPanel,
+  setShowPartSearchPanel,
   showTraceabilityPanel,
   setShowTraceabilityPanel,
   originFilter,
@@ -1054,6 +1062,7 @@ function Canvas({
                   setShowMissionPanel(false);
                   setShowStagePanel(false);
                   setShowTradeStudyPanel(false);
+                  setShowPartSearchPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1068,6 +1077,7 @@ function Canvas({
                   setShowHazardPanel(false);
                   setShowStagePanel(false);
                   setShowTradeStudyPanel(false);
+                  setShowPartSearchPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1082,6 +1092,7 @@ function Canvas({
                   setShowHazardPanel(false);
                   setShowMissionPanel(false);
                   setShowTradeStudyPanel(false);
+                  setShowPartSearchPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1096,12 +1107,28 @@ function Canvas({
                   setShowHazardPanel(false);
                   setShowMissionPanel(false);
                   setShowStagePanel(false);
+                  setShowPartSearchPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
               >
                 Trade Study
+              </Button>
+              <Button
+                variant={showPartSearchPanel ? "primary" : "ghost"}
+                onClick={() => {
+                  setShowPartSearchPanel((v) => !v);
+                  setShowHazardPanel(false);
+                  setShowMissionPanel(false);
+                  setShowStagePanel(false);
+                  setShowTradeStudyPanel(false);
+                  setShowTraceabilityPanel(false);
+                  setSelectedNodeId(null);
+                }}
+                className="!px-2 !py-1 text-xs"
+              >
+                Part Search
               </Button>
               <Button
                 variant={showTraceabilityPanel ? "primary" : "ghost"}
@@ -1111,6 +1138,7 @@ function Canvas({
                   setShowMissionPanel(false);
                   setShowStagePanel(false);
                   setShowTradeStudyPanel(false);
+                  setShowPartSearchPanel(false);
                 }}
                 className="!px-2 !py-1 text-xs"
               >
@@ -1126,10 +1154,11 @@ function Canvas({
             </div>
           </GlassPanel>
 
-          {selectedNode && projectId && !showTraceabilityPanel && (
+          {selectedNode && projectId && !showTraceabilityPanel && !showPartSearchPanel && (
             <ElementInspector
               elementId={selectedNode.id}
               elementLabel={selectedNode.data.label}
+              elementKind={selectedNode.data.kind}
               projectId={projectId}
               editMode={editMode}
               onClose={() => setSelectedNodeId(null)}
@@ -1181,6 +1210,17 @@ function Canvas({
 
           {showTradeStudyPanel && projectId && (
             <TradeStudyPanel projectId={projectId} onClose={() => setShowTradeStudyPanel(false)} />
+          )}
+
+          {showPartSearchPanel && projectId && (
+            <PartSearchPanel
+              projectId={projectId}
+              onClose={() => setShowPartSearchPanel(false)}
+              onSelectElement={(elementId) => {
+                setSelectedNodeId(elementId);
+                setShowPartSearchPanel(false);
+              }}
+            />
           )}
         </ReactFlow>
       </div>

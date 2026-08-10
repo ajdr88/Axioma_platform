@@ -250,6 +250,14 @@ async fn main() -> anyhow::Result<()> {
             post(mode_a::query),
         )
         .route(
+            "/api/v0/projects/:projectId/cem/mode-a/part-search",
+            post(mode_a::search_parts),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/mode-a/lint-requirement",
+            post(mode_a::lint_requirement),
+        )
+        .route(
             "/api/v0/projects/:projectId/simulate/hello-world",
             post(fuml_client::simulate_hello_world),
         )
@@ -2993,6 +3001,137 @@ mod tests {
         assert_eq!(body["groundedFully"], serde_json::json!(true));
         assert_eq!(body["citedElementIds"], serde_json::json!([]));
         assert_eq!(body["provenance"]["contextSnapshot"], serde_json::json!([]));
+    }
+
+    /// Mode A part search — deliberately asserts the deterministic invariant this endpoint
+    /// actually guarantees (every returned match is a real element, the same anti-fabrication
+    /// discipline as `query`'s citation check) rather than exact model output, since which
+    /// specific elements a small local model ranks as "matching" a description is empirically
+    /// not stable enough to hard-assert against (see `mode_a.rs`'s doc comments on both this and
+    /// `lint_requirement` for the direct testing that established that).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` and Ollama"]
+    async fn mode_a_part_search_only_ever_returns_real_elements() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "part-search").await;
+        make_structure(&state.neo4j, &project.id, "CoolantPump").await;
+        make_structure(&state.neo4j, &project.id, "BypassValve").await;
+
+        let response = mode_a::search_parts(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_a::PartSearchRequest {
+                description: "something that moves coolant".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let body = response_json(response).await;
+
+        let real_ids: std::collections::HashSet<&str> = ["CoolantPump", "BypassValve"].into();
+        for m in body["matches"].as_array().unwrap() {
+            let element_id = m["elementId"].as_str().unwrap();
+            assert!(
+                real_ids.contains(element_id),
+                "match {element_id:?} is not a real element in this project — a fabricated id \
+                 should have been filtered out, got {:?}",
+                body["matches"]
+            );
+        }
+        assert_eq!(
+            body["provenance"]["modelName"],
+            serde_json::json!("qwen2.5:1.5b")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mode_a_part_search_with_no_elements_returns_empty_without_calling_the_model() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "part-search-empty").await;
+
+        let response = mode_a::search_parts(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_a::PartSearchRequest {
+                description: "anything at all".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let body = response_json(response).await;
+
+        assert_eq!(body["matches"], serde_json::json!([]));
+        assert_eq!(body["provenance"]["modelName"], serde_json::json!("none"));
+    }
+
+    /// Requirement linting — same "assert the well-formed shape, not exact model judgment"
+    /// approach as part search, for the same empirically-measured reason (see `mode_a.rs`'s doc
+    /// comment on `lint_requirement`).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` and Ollama"]
+    async fn mode_a_lint_requirement_returns_well_formed_response() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "lint-requirement").await;
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "REQ-THRUST".to_string(),
+                    kind: NodeKind::Requirement,
+                    name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = mode_a::lint_requirement(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_a::LintRequirementRequest {
+                element_id: "REQ-THRUST".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let body = response_json(response).await;
+
+        assert!(body["issues"].is_array());
+        assert_eq!(
+            body["provenance"]["modelName"],
+            serde_json::json!("qwen2.5:1.5b")
+        );
+        assert_eq!(
+            body["provenance"]["contextSnapshot"][0]["id"],
+            serde_json::json!("REQ-THRUST")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mode_a_lint_requirement_rejects_a_non_requirement_element() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "lint-rejects-non-req").await;
+        make_structure(&state.neo4j, &project.id, "NotARequirement").await;
+
+        let result = mode_a::lint_requirement(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_a::LintRequirementRequest {
+                element_id: "NotARequirement".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "linting a Structure element should be rejected"
+        );
     }
 
     /// T-P1.4-01: the `Execute` RPC must stream incrementally, and 100 identical runs must
