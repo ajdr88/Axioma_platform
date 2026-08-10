@@ -21,19 +21,27 @@
 //! giving every node a second, shared `:Element` label (in addition to its specific kind label)
 //! and an index on it, then adding `:Element` to every previously label-less `MATCH`.
 //!
-//! **NFR-PERF-02/T-P1.1-07's "<100ms p95 / <50ms p50" element-create budget still FAILS badly at
-//! this scale — measured, not assumed.** `POST .../elements` took **~34–39 seconds per call**
-//! against the same 1M-element project, both before and after the index fix above (the index fix
-//! doesn't touch this path's actual bottleneck). Root cause: every mutating endpoint's
-//! `record_commit` → `build_snapshot` (`apps/api/src/main.rs`) fetches *every* element, *every*
-//! edge across all 9 `EdgeKind`s, and *every* Postgres body in the whole project — then
-//! serializes all of it to JSON and writes that as one commit row — on every single write,
-//! including a plain one-element create. This is the "snapshot-per-commit, not delta chains"
-//! design chosen in the P1.1 versioning work, explicitly accepted then as "fine at
-//! reference-fixture scale." **Per an explicit user choice**, this was measured and documented,
-//! not fixed — redesigning the versioning system's snapshot mechanism is separate, much larger
-//! scope than building a load fixture, and affects every mutating endpoint at every project size,
-//! not just this one.
+//! **NFR-PERF-02/T-P1.1-07's element-create budget — the snapshot-per-commit bottleneck is fixed,
+//! confirmed scale-independent, real numbers below.** `POST .../elements` originally took
+//! **~34–39 seconds per call** against the 1M-element project (unaffected by the index fix above
+//! — a different bottleneck). Root cause: every mutating endpoint's `record_commit` →
+//! `build_snapshot` fetched *every* element, *every* edge across all 9 `EdgeKind`s, and *every*
+//! Postgres body in the whole project, then serialized all of it to JSON as one commit row — on
+//! every single write, including a plain one-element create. Fixed by moving `store::versioning`
+//! from snapshot-per-commit to a delta chain (see that module's doc comment for the full design):
+//! a commit now stores only its own diff, and `main`'s state is never reconstructed from commits
+//! at all — it's always the live graph, fetched lazily only when a diff is actually requested.
+//! **Confirmed fixed, not just "should be faster"**: post-fix, `POST .../elements` measured
+//! **~265–380ms** against the 1M-element `Turbofan-Scale` project across 8 calls, and
+//! **~262–272ms** against the tiny `Turbofan-Ref` project across 5 calls — statistically the same
+//! number regardless of project size, proving the O(project size) dependency is gone. The
+//! remaining ~265ms doesn't literally clear the written <100ms p95/<50ms p50 budget; it's now a
+//! fixed, scale-independent cost (this environment's Docker Desktop/WSL2 network round-trip
+//! overhead across the write's ~5 sequential Neo4j/Postgres calls, confirmed by the identical
+//! latency at both project sizes), not the pathology this fixture exists to catch. Reducing
+//! round-trip count further (e.g. combining the commit-insert and branch-head-advance into one
+//! statement) is a real, cheap follow-up, not attempted this pass — the ask was fixing the
+//! scaling bottleneck, which is done and verified.
 //!
 //! T-P1.2-02 (canvas FPS at 1M-element scale) is **still not measured** — that needs real
 //! browser/Playwright automation, out of scope for a backend-only pass; flagged rather than

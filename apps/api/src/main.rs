@@ -27,7 +27,10 @@ use axum::{
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use store::neo4j::ApplyOpsOutcome;
-use store::versioning::{Branch, DiffEntry, Project, Snapshot, SnapshotEdge, MAIN_BRANCH};
+use store::versioning::{
+    apply_diff, compute_snapshot_diff, Branch, DiffEntry, Project, Snapshot, SnapshotEdge,
+    MAIN_BRANCH,
+};
 use store::{Neo4jStore, ObjectStore, PostgresStore, VersioningStore};
 use sysml_core::{Edge, EdgeKind, Element, ElementBody, NodeKind, Origin, ValidationError};
 use sysml_textual::GraphOp;
@@ -373,10 +376,14 @@ struct CommitResponse {
     diff: Vec<DiffEntry>,
 }
 
-/// T-P1.1-05's Action, made real: applies a property edit to a *copy* of a branch's current
-/// snapshot and commits the result — never touches the live graph (only `main` is ever live; see
-/// `store::versioning`'s doc comment). Returns the new commit's id and its diff (old/new values)
-/// directly, so a caller doesn't need a separate diff request just to see what changed.
+/// T-P1.1-05's Action, made real: applies a property edit to a branch and commits the result —
+/// never touches the live graph (only `main` is ever live; see `store::versioning`'s doc
+/// comment). Returns the new commit's id and its diff (old/new values) directly, so a caller
+/// doesn't need a separate diff request just to see what changed. Only the properties actually
+/// present in `payload.properties` and different from the resolved old value are recorded/
+/// replayed — unlike `update_element_body`'s live wholesale-replace of a Postgres row, a branch
+/// has no live row to replace, so a property this call's payload omits simply isn't touched,
+/// consistent with `PropertyChanged` itself being a per-property diff.
 async fn branch_update_element_body(
     State(state): State<AppState>,
     Path((project_id, branch_name, element_id)): Path<(String, String, String)>,
@@ -399,11 +406,11 @@ async fn branch_update_element_body(
         ))
         .into());
     };
-    let (_, mut snapshot) = state
-        .versioning
-        .get_commit(&head_commit_id)
-        .await?
-        .context("branch head commit not found")?;
+    // Only the element being edited actually needs resolving here — but `resolve_snapshot`
+    // reconstructs (or live-fetches) the whole project state regardless, since a commit's diff
+    // doesn't index by element id. Fine for this deliberately low-volume, human-reviewed path;
+    // see `store::versioning`'s doc comment for why this never runs on the hot write path.
+    let snapshot = resolve_snapshot(&state, &project_id, &head_commit_id).await?;
 
     let actor = payload
         .actor
@@ -434,10 +441,21 @@ async fn branch_update_element_body(
         }
     }
 
-    snapshot.bodies.insert(
-        element_id.clone(),
-        serde_json::json!({ "rationale": payload.rationale, "properties": payload.properties }),
-    );
+    // Wholesale, like `update_element_body`'s live rationale write — not merged key-by-key like
+    // `properties` above, since there's only one rationale value, not a bag of keys.
+    let old_rationale = snapshot
+        .bodies
+        .get(&element_id)
+        .and_then(|b| b.get("rationale"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    if payload.rationale != old_rationale {
+        diff_entries.push(DiffEntry::RationaleChanged {
+            element_id: element_id.clone(),
+            old: old_rationale,
+            new: payload.rationale.clone(),
+        });
+    }
 
     let commit = state
         .versioning
@@ -447,7 +465,6 @@ async fn branch_update_element_body(
             &actor,
             &payload.message,
             &diff_entries,
-            &snapshot,
         )
         .await?;
     for entry in &diff_entries {
@@ -470,23 +487,25 @@ struct DiffQuery {
 }
 
 /// Property-level + structural diff between any two commits — works for any pair, including a
-/// branch's tip against `main`'s head (T-P1.1-05's "diff against main").
+/// branch's tip against `main`'s head (T-P1.1-05's "diff against main"). Resolves both sides
+/// (`resolve_snapshot` — live for `main`'s current head, replayed from a diff chain otherwise)
+/// and diffs the two results directly; no commit stores a full snapshot to compare anymore, see
+/// `store::versioning`'s doc comment.
 async fn diff_commit(
     State(state): State<AppState>,
-    Path((_project_id, commit_id)): Path<(String, String)>,
+    Path((project_id, commit_id)): Path<(String, String)>,
     Query(params): Query<DiffQuery>,
 ) -> Result<Json<Vec<DiffEntry>>, ApiError> {
-    Ok(Json(
-        state
-            .versioning
-            .diff_commits(&commit_id, &params.against)
-            .await?,
-    ))
+    let new_snapshot = resolve_snapshot(&state, &project_id, &commit_id).await?;
+    let old_snapshot = resolve_snapshot(&state, &project_id, &params.against).await?;
+    Ok(Json(compute_snapshot_diff(&old_snapshot, &new_snapshot)))
 }
 
 /// Gathers a project's full current state (every element, every edge kind, every body) into one
 /// versioning snapshot — canvas position is deliberately excluded (UI metadata, not modeling
-/// content, NFR-DATA-01).
+/// content, NFR-DATA-01). This is always `main`'s true state (only `main` is ever live) — never
+/// called from the ordinary mutating-endpoint write path anymore (that was T-P1.1-07's measured
+/// bottleneck), only lazily from `resolve_snapshot` when a diff is actually requested.
 async fn build_snapshot(state: &AppState, project_id: &str) -> anyhow::Result<Snapshot> {
     let elements = state.neo4j.list_elements(project_id).await?;
     let mut edges = Vec::new();
@@ -507,11 +526,78 @@ async fn build_snapshot(state: &AppState, project_id: &str) -> anyhow::Result<Sn
     })
 }
 
+/// Reconstructs the full versioning `Snapshot` as of `commit_id` — see `store::versioning`'s doc
+/// comment for the design this implements. Two base cases: `commit_id` is exactly `main`'s
+/// current head (the overwhelmingly common case for every real caller — `main`'s own head, or a
+/// branch just forked from it) → the live graph, fetched fresh, no replay needed; or a branch
+/// with no fork parent at all → `Snapshot::default()`. Otherwise, recurses to the commit's
+/// branch's fork point and replays that branch's own commits (and only that branch's — the walk
+/// stops the moment a parent's `branch_id` differs) on top, oldest-first.
+///
+/// A plain `fn` returning a manually boxed/pinned future, not `async fn` — this calls itself
+/// (branch-of-a-branch is possible, `create_branch` accepts an arbitrary `from_commit`), and a
+/// self-recursive `async fn` doesn't compile (its future's size would depend on itself). No new
+/// crate needed for this, just the standard boxed-future workaround.
+fn resolve_snapshot<'a>(
+    state: &'a AppState,
+    project_id: &'a str,
+    commit_id: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Snapshot>> + Send + 'a>> {
+    Box::pin(async move {
+        let main_head = state
+            .versioning
+            .get_branch(project_id, MAIN_BRANCH)
+            .await?
+            .and_then(|b| b.head_commit_id);
+        if main_head.as_deref() == Some(commit_id) {
+            return build_snapshot(state, project_id).await;
+        }
+
+        let commit = state
+            .versioning
+            .get_commit(commit_id)
+            .await?
+            .with_context(|| format!("commit {commit_id} not found"))?;
+        let branch = state
+            .versioning
+            .get_branch_by_id(&commit.branch_id)
+            .await?
+            .with_context(|| format!("branch {} not found", commit.branch_id))?;
+
+        let mut snapshot = match &branch.fork_commit_id {
+            Some(fork_id) => resolve_snapshot(state, project_id, fork_id).await?,
+            None => Snapshot::default(),
+        };
+
+        let mut chain = vec![commit];
+        while let Some(parent_id) = chain.last().expect("just pushed").parent_commit_id.clone() {
+            let parent = state
+                .versioning
+                .get_commit(&parent_id)
+                .await?
+                .with_context(|| format!("commit {parent_id} not found"))?;
+            if parent.branch_id != branch.id {
+                break;
+            }
+            chain.push(parent);
+        }
+        chain.reverse();
+        for c in &chain {
+            for d in &c.diff {
+                apply_diff(&mut snapshot, d);
+            }
+        }
+        Ok(snapshot)
+    })
+}
+
 /// Every existing mutating endpoint (except position drags — UI metadata, not modeling content)
-/// calls this after its own write succeeds: snapshots the project's new state, commits it onto
-/// `main`, and records an audit-log entry per diff entry. Makes CLAUDE.md's "every model write
-/// must be traceable to a Git-style commit — never a silent mutation" literally true, not just
-/// aspirational. A no-op if `diff_entries` is empty (e.g. a rename to the same name).
+/// calls this after its own write succeeds: records the diff as a commit onto `main` and an
+/// audit-log entry per diff entry. Makes CLAUDE.md's "every model write must be traceable to a
+/// Git-style commit — never a silent mutation" literally true, not just aspirational. A no-op if
+/// `diff_entries` is empty (e.g. a rename to the same name). **Does not snapshot the graph** —
+/// the diff itself is the only thing stored, which is what makes this O(1) rather than O(project
+/// size); see `store::versioning`'s doc comment for the T-P1.1-07 bottleneck this replaced.
 async fn record_commit(
     state: &AppState,
     project_id: &str,
@@ -527,17 +613,9 @@ async fn record_commit(
         .get_branch(project_id, MAIN_BRANCH)
         .await?
         .context("project has no main branch")?;
-    let snapshot = build_snapshot(state, project_id).await?;
     state
         .versioning
-        .commit(
-            project_id,
-            &branch,
-            actor,
-            message,
-            &diff_entries,
-            &snapshot,
-        )
+        .commit(project_id, &branch, actor, message, &diff_entries)
         .await?;
     for entry in &diff_entries {
         state
@@ -943,6 +1021,11 @@ async fn update_element_body(
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
+    let old_rationale = old_body
+        .as_ref()
+        .and_then(|b| b.get("rationale"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let mut diff_entries = Vec::new();
     if let Some(new_properties) = payload.properties.as_object() {
         for (key, new_val) in new_properties {
@@ -959,6 +1042,13 @@ async fn update_element_body(
                 });
             }
         }
+    }
+    if payload.rationale != old_rationale {
+        diff_entries.push(DiffEntry::RationaleChanged {
+            element_id: id.clone(),
+            old: old_rationale,
+            new: payload.rationale.clone(),
+        });
     }
 
     state
@@ -1027,7 +1117,10 @@ async fn apply_text_model(
                 DEFAULT_ACTOR,
                 "Apply text edit",
                 vec![DiffEntry::TextModelApplied {
-                    ops: payload.ops.clone(),
+                    // Real ids, not the client's temp ids — `apply_diff`/`resolve_snapshot`
+                    // replay this later and need every id to already be resolvable; the raw
+                    // temp-id ops are only ever meaningful within this one `apply_graph_ops` call.
+                    ops: resolve_ops_to_real_ids(&payload.ops, &id_map),
                 }],
             )
             .await?;
@@ -1053,6 +1146,37 @@ async fn apply_text_model(
     }
 }
 
+/// Remaps every id `payload.ops` referenced via a client-minted temp id (a `Create`'s own
+/// `temp_id`, or a `Create`/`Reparent` parent reference to an earlier op's temp id in the same
+/// batch) to the real, server-assigned id from `apply_graph_ops`'s `id_map` — `Rename`/`Reparent`
+/// ids that were already real pass through `resolve` unchanged (`id_map` has no entry for them).
+fn resolve_ops_to_real_ids(ops: &[GraphOp], id_map: &HashMap<String, String>) -> Vec<GraphOp> {
+    let resolve = |raw: &str| id_map.get(raw).cloned().unwrap_or_else(|| raw.to_string());
+    ops.iter()
+        .map(|op| match op {
+            GraphOp::Rename { id, name } => GraphOp::Rename {
+                id: resolve(id),
+                name: name.clone(),
+            },
+            GraphOp::Create {
+                temp_id,
+                kind,
+                name,
+                parent_id,
+            } => GraphOp::Create {
+                temp_id: resolve(temp_id),
+                kind: *kind,
+                name: name.clone(),
+                parent_id: parent_id.as_deref().map(resolve),
+            },
+            GraphOp::Reparent { id, new_parent_id } => GraphOp::Reparent {
+                id: resolve(id),
+                new_parent_id: new_parent_id.as_deref().map(resolve),
+            },
+        })
+        .collect()
+}
+
 /// If no project exists yet, creates the "Turbofan Reference" project and seeds it — a restart
 /// against an already-seeded database skips this (same idempotency the fixture's own
 /// `MERGE`-based upserts already relied on, just gated on project existence instead of running
@@ -1065,17 +1189,13 @@ async fn ensure_seeded(state: &AppState) -> anyhow::Result<()> {
         .versioning
         .create_project("Turbofan Reference")
         .await?;
-    seed_turbofan_ref(state, &project.id).await?;
+    let diff_entries = seed_turbofan_ref(state, &project.id).await?;
     record_commit(
         state,
         &project.id,
         DEFAULT_ACTOR,
         "Seed Turbofan-Ref fixture",
-        vec![DiffEntry::ElementCreated {
-            element_id: "Engine".to_string(),
-            kind: NodeKind::Structure,
-            name: "Engine".to_string(),
-        }],
+        diff_entries,
     )
     .await?;
     Ok(())
@@ -1085,8 +1205,17 @@ async fn ensure_seeded(state: &AppState) -> anyhow::Result<()> {
 /// stores, scoped to one project: `Engine` composed of the five reference subsystems in Neo4j;
 /// `REQ-THRUST` with a 20 KB rationale body in Postgres (mirrors T-P1.1-04's setup); a
 /// placeholder geometry blob for `TurbineHpLp`, with only its pointer recorded — never the bytes
-/// (NFR-DATA-02).
-async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result<()> {
+/// (NFR-DATA-02). Returns an accurate diff of everything created — this becomes the project's
+/// genesis commit, and unlike every later commit, its diff *is* occasionally the only record of
+/// this state (`resolve_snapshot` falls back to replaying it once `main` has moved past it and a
+/// branch still needs it as a fork point) — a placeholder diff here would silently corrupt that
+/// reconstruction. (Rationale text still isn't captured — no `DiffEntry` variant tracks it at
+/// all, a pre-existing gap in the diff model itself, same as `compute_snapshot_diff`'s own doc
+/// comment already notes for the property-diff case; only reachable in the same narrow
+/// replay-past-this-commit scenario.)
+async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result<Vec<DiffEntry>> {
+    let mut diff_entries = Vec::new();
+
     let engine = Element {
         id: "Engine".to_string(),
         kind: NodeKind::Structure,
@@ -1095,6 +1224,11 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
         origin: Origin::Human,
     };
     state.neo4j.upsert_element(project_id, &engine).await?;
+    diff_entries.push(DiffEntry::ElementCreated {
+        element_id: engine.id.clone(),
+        kind: engine.kind,
+        name: engine.name.clone(),
+    });
 
     let subsystems = [
         ("FanLpCompression", "Fan & LP Compression"),
@@ -1118,6 +1252,11 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
                 },
             )
             .await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: id.to_string(),
+            kind: NodeKind::Structure,
+            name: name.to_string(),
+        });
         state
             .neo4j
             .create_edge(
@@ -1129,6 +1268,11 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
                 },
             )
             .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: "Engine".to_string(),
+            target: id.to_string(),
+            kind: EdgeKind::Contains,
+        });
     }
 
     let req_thrust = Element {
@@ -1139,6 +1283,11 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
         origin: Origin::Human,
     };
     state.neo4j.upsert_element(project_id, &req_thrust).await?;
+    diff_entries.push(DiffEntry::ElementCreated {
+        element_id: req_thrust.id.clone(),
+        kind: req_thrust.kind,
+        name: req_thrust.name.clone(),
+    });
     state
         .postgres
         .upsert_body(
@@ -1167,12 +1316,18 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
             &ElementBody {
                 element_id: "TurbineHpLp".to_string(),
                 rationale: None,
-                properties: serde_json::json!({ "geometryPointer": pointer }),
+                properties: serde_json::json!({ "geometryPointer": pointer.clone() }),
             },
         )
         .await?;
+    diff_entries.push(DiffEntry::PropertyChanged {
+        element_id: "TurbineHpLp".to_string(),
+        property: "geometryPointer".to_string(),
+        old: serde_json::Value::Null,
+        new: serde_json::json!(pointer),
+    });
 
-    Ok(())
+    Ok(diff_entries)
 }
 
 /// Integration tests against the real docker-compose stack (`docker compose up -d`) — `#[ignore]`d
@@ -1772,11 +1927,13 @@ mod tests {
             .head_commit_id
             .expect("branch should have a commit now");
 
-        let diff = state
-            .versioning
-            .diff_commits(&branch_head, &main_head)
+        let new_snapshot = resolve_snapshot(&state, &project.id, &branch_head)
             .await
             .unwrap();
+        let old_snapshot = resolve_snapshot(&state, &project.id, &main_head)
+            .await
+            .unwrap();
+        let diff = compute_snapshot_diff(&old_snapshot, &new_snapshot);
         let property_changes: Vec<_> = diff
             .iter()
             .filter(|d| matches!(d, DiffEntry::PropertyChanged { .. }))

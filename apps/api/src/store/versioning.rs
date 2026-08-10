@@ -4,16 +4,35 @@
 //! stores already in place rather than adding a `git2`/`gix` dependency and a from-scratch
 //! serialization format neither the docs nor any test specify.
 //!
-//! Snapshot-per-commit, not delta chains: every commit stores a full JSON snapshot of the
-//! project's elements/edges/bodies at that point, plus the (usually single-entry) diff that
-//! produced it. Diffing between any two commits — needed for "diff against `main`", which isn't
-//! necessarily a parent/child pair — compares their two stored snapshots directly rather than
-//! walking history. Simpler to implement correctly than delta reconstruction, and fine at
-//! reference-fixture scale; the storage cost this trades away is a real follow-up concern only
-//! once projects get much bigger, not a problem yet.
+//! **Delta chain, not snapshot-per-commit** (revised after a real, measured T-P1.1-07 failure —
+//! see `apps/api/src/traceability.rs`'s doc comment for the numbers). Each commit stores only its
+//! own (usually single-entry) diff — no full graph copy. Reconstructing "the state as of commit
+//! X" (needed for `main`-vs-branch diffing and for layering a branch's own edits) replays a
+//! commit chain instead of comparing two stored copies:
+//!
+//! - `main`'s current state is *never* reconstructed from commits at all — it's always exactly
+//!   the live Neo4j/Postgres graph (`apps/api/src/main.rs`'s `build_snapshot`), fetched lazily
+//!   only when a diff is actually requested, never on every write. This is what makes an ordinary
+//!   element create O(1) again: `record_commit` now inserts one small diff row and advances a
+//!   pointer, nothing else.
+//! - Every branch remembers the exact commit it forked from (`Branch::fork_commit_id`, set once
+//!   at creation, never mutated). Reconstructing a branch's head = recursively resolve its fork
+//!   point's snapshot, then replay that branch's own commits (and only that branch's — the walk
+//!   stops the moment it crosses into a different `branch_id`) on top, oldest-first
+//!   (`apps/api/src/main.rs`'s `resolve_snapshot`, `apply_diff` below).
+//!
+//! This trades a cheap, unbounded-scale write path for a reconstruction walk on read — the right
+//! trade here, since only branch-scoped edits and cross-commit diffs (a deliberately rare,
+//! reviewed, human-triggered path — there's no "browse history" feature) ever need
+//! reconstruction; every ordinary create/rename/edge/body mutation never does. **Known, accepted
+//! limit, not solved here**: reconstructing an *old, non-head* `main` commit (unreachable through
+//! any current endpoint — nothing exposes a historical `main` commit id, only branch heads) would
+//! replay `main`'s entire commit history from empty, same as walking any other branch's chain to
+//! its root; fine for how few ordinary commits a project accumulates today, a real cost only if
+//! that ever changes and something starts asking for it.
 //!
 //! Only a project's `main` branch is ever "live" in Neo4j/Postgres — every other branch exists
-//! purely as stored commit snapshots and never mutates the live graph, matching how impl §2.4
+//! purely as a chain of stored diffs and never mutates the live graph, matching how impl §2.4
 //! describes a CEM proposal: "lands as branch/Commit like human changes" (i.e. reviewable and
 //! diffable before anything is live).
 
@@ -39,6 +58,11 @@ pub struct Branch {
     pub project_id: String,
     pub name: String,
     pub head_commit_id: Option<String>,
+    /// The commit this branch was forked from, fixed forever at creation time (`None` for
+    /// `main`, which forks from nothing). Unlike `head_commit_id`, this never advances — it's
+    /// the anchor `resolve_snapshot` recurses to once it walks this branch's own commits back to
+    /// their root.
+    pub fork_commit_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -53,11 +77,13 @@ pub struct Commit {
     pub diff: Vec<DiffEntry>,
 }
 
-/// Full graph state at one commit — elements, every edge kind (including `Contains`), and
+/// Full graph state as of some commit — elements, every edge kind (including `Contains`), and
 /// element bodies (rationale + properties). Postgres canvas position is deliberately excluded
 /// (UI metadata, not modeling content, same NFR-DATA-01 stance the rest of the app already
-/// takes toward position).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// takes toward position). Never stored wholesale anymore (see the module doc comment) — always
+/// either the live graph (`main`'s current state) or reconstructed by replaying a diff chain
+/// onto `Snapshot::default()` via `apply_diff`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub elements: Vec<Element>,
     pub edges: Vec<SnapshotEdge>,
@@ -85,6 +111,11 @@ pub enum DiffEntry {
         property: String,
         old: serde_json::Value,
         new: serde_json::Value,
+    },
+    RationaleChanged {
+        element_id: ElementId,
+        old: Option<String>,
+        new: Option<String>,
     },
     ElementRenamed {
         element_id: ElementId,
@@ -149,6 +180,13 @@ async fn create_versioning_tables(conn: &mut sqlx::PgConnection) -> Result<()> {
     .execute(&mut *conn)
     .await
     .context("creating branches table")?;
+    // Migration for pre-existing dev databases (see `postgres.rs`'s identical pattern for
+    // `project_id`) — fixed forever per branch once set, see `Branch::fork_commit_id`'s doc
+    // comment.
+    sqlx::query("ALTER TABLE branches ADD COLUMN IF NOT EXISTS fork_commit_id TEXT")
+        .execute(&mut *conn)
+        .await
+        .context("adding branches.fork_commit_id column")?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS commits (\
@@ -159,13 +197,19 @@ async fn create_versioning_tables(conn: &mut sqlx::PgConnection) -> Result<()> {
             message TEXT NOT NULL, \
             actor TEXT NOT NULL, \
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-            diff JSONB NOT NULL, \
-            snapshot JSONB NOT NULL\
+            diff JSONB NOT NULL\
         )",
     )
     .execute(&mut *conn)
     .await
     .context("creating commits table")?;
+    // Migration for pre-existing dev databases: commits used to carry a full-graph `snapshot`
+    // column (the T-P1.1-07 bottleneck this module's doc comment describes) — no longer written
+    // or read anywhere, dropped rather than left as unused dead weight.
+    sqlx::query("ALTER TABLE commits DROP COLUMN IF EXISTS snapshot")
+        .execute(&mut *conn)
+        .await
+        .context("dropping commits.snapshot column")?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS audit_log (\
@@ -264,7 +308,8 @@ impl VersioningStore {
 
         let branch_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO branches (id, project_id, name, head_commit_id) VALUES ($1, $2, $3, NULL)",
+            "INSERT INTO branches (id, project_id, name, head_commit_id, fork_commit_id) \
+             VALUES ($1, $2, $3, NULL, NULL)",
         )
         .bind(&branch_id)
         .bind(&id)
@@ -302,25 +347,53 @@ impl VersioningStore {
     }
 
     pub async fn get_branch(&self, project_id: &str, name: &str) -> Result<Option<Branch>> {
-        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, name, head_commit_id FROM branches WHERE project_id = $1 AND name = $2",
+        let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, head_commit_id, fork_commit_id FROM branches \
+             WHERE project_id = $1 AND name = $2",
         )
         .bind(project_id)
         .bind(name)
         .fetch_optional(&self.pool)
         .await
         .context("fetching branch")?;
-        Ok(row.map(|(id, name, head_commit_id)| Branch {
-            id,
-            project_id: project_id.to_string(),
-            name,
-            head_commit_id,
-        }))
+        Ok(
+            row.map(|(id, name, head_commit_id, fork_commit_id)| Branch {
+                id,
+                project_id: project_id.to_string(),
+                name,
+                head_commit_id,
+                fork_commit_id,
+            }),
+        )
+    }
+
+    /// Looks up a branch by its own id rather than `(project_id, name)` — needed once a commit
+    /// is in hand (`Commit::branch_id`) and the branch's name isn't known, e.g. mid-`resolve_snapshot`.
+    pub async fn get_branch_by_id(&self, branch_id: &str) -> Result<Option<Branch>> {
+        type BranchRow = (String, String, String, Option<String>, Option<String>);
+        let row: Option<BranchRow> = sqlx::query_as(
+            "SELECT id, project_id, name, head_commit_id, fork_commit_id FROM branches \
+             WHERE id = $1",
+        )
+        .bind(branch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetching branch by id")?;
+        Ok(row.map(
+            |(id, project_id, name, head_commit_id, fork_commit_id)| Branch {
+                id,
+                project_id,
+                name,
+                head_commit_id,
+                fork_commit_id,
+            },
+        ))
     }
 
     pub async fn list_branches(&self, project_id: &str) -> Result<Vec<Branch>> {
-        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, name, head_commit_id FROM branches WHERE project_id = $1 ORDER BY created_at",
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, head_commit_id, fork_commit_id FROM branches \
+             WHERE project_id = $1 ORDER BY created_at",
         )
         .bind(project_id)
         .fetch_all(&self.pool)
@@ -328,18 +401,20 @@ impl VersioningStore {
         .context("listing branches")?;
         Ok(rows
             .into_iter()
-            .map(|(id, name, head_commit_id)| Branch {
+            .map(|(id, name, head_commit_id, fork_commit_id)| Branch {
                 id,
                 project_id: project_id.to_string(),
                 name,
                 head_commit_id,
+                fork_commit_id,
             })
             .collect())
     }
 
-    /// Creates a branch pointing at `from_commit_id` (defaults to `main`'s current head) —
-    /// a lightweight pointer with no snapshot of its own until the first commit lands on it,
-    /// same as a fresh git branch before any commits.
+    /// Creates a branch pointing at `from_commit_id` (defaults to `main`'s current head) — a
+    /// lightweight pointer with no commits of its own until the first one lands on it, same as a
+    /// fresh git branch. `fork_commit_id` is set to that same starting point and never changes
+    /// again — see its doc comment on `Branch`.
     pub async fn create_branch(
         &self,
         project_id: &str,
@@ -355,7 +430,8 @@ impl VersioningStore {
         };
         let id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO branches (id, project_id, name, head_commit_id) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO branches (id, project_id, name, head_commit_id, fork_commit_id) \
+             VALUES ($1, $2, $3, $4, $4)",
         )
         .bind(&id)
         .bind(project_id)
@@ -368,12 +444,14 @@ impl VersioningStore {
             id,
             project_id: project_id.to_string(),
             name: name.to_string(),
+            fork_commit_id: head_commit_id.clone(),
             head_commit_id,
         })
     }
 
     /// Inserts a commit and advances its branch's head pointer — the one write path every
     /// mutation (existing endpoints on `main`, or a branch-scoped property edit) goes through.
+    /// Stores only `diff` — no full-graph snapshot, see the module doc comment for why.
     pub async fn commit(
         &self,
         project_id: &str,
@@ -381,16 +459,13 @@ impl VersioningStore {
         actor: &str,
         message: &str,
         diff: &[DiffEntry],
-        snapshot: &Snapshot,
     ) -> Result<Commit> {
         let id = uuid::Uuid::new_v4().to_string();
         let diff_json = serde_json::to_value(diff).context("serializing commit diff")?;
-        let snapshot_json = serde_json::to_value(snapshot).context("serializing snapshot")?;
 
         sqlx::query(
-            "INSERT INTO commits \
-                (id, project_id, branch_id, parent_commit_id, message, actor, diff, snapshot) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO commits (id, project_id, branch_id, parent_commit_id, message, actor, diff) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&id)
         .bind(project_id)
@@ -399,7 +474,6 @@ impl VersioningStore {
         .bind(message)
         .bind(actor)
         .bind(&diff_json)
-        .bind(&snapshot_json)
         .execute(&self.pool)
         .await
         .context("inserting commit")?;
@@ -422,7 +496,7 @@ impl VersioningStore {
         })
     }
 
-    pub async fn get_commit(&self, commit_id: &str) -> Result<Option<(Commit, Snapshot)>> {
+    pub async fn get_commit(&self, commit_id: &str) -> Result<Option<Commit>> {
         type CommitRow = (
             String,
             String,
@@ -430,10 +504,9 @@ impl VersioningStore {
             String,
             String,
             serde_json::Value,
-            serde_json::Value,
         );
         let row: Option<CommitRow> = sqlx::query_as(
-            "SELECT project_id, branch_id, parent_commit_id, message, actor, diff, snapshot \
+            "SELECT project_id, branch_id, parent_commit_id, message, actor, diff \
              FROM commits WHERE id = $1",
         )
         .bind(commit_id)
@@ -441,50 +514,20 @@ impl VersioningStore {
         .await
         .context("fetching commit")?;
 
-        let Some((
+        let Some((project_id, branch_id, parent_commit_id, message, actor, diff_json)) = row else {
+            return Ok(None);
+        };
+        let diff: Vec<DiffEntry> =
+            serde_json::from_value(diff_json).context("parsing stored diff")?;
+        Ok(Some(Commit {
+            id: commit_id.to_string(),
             project_id,
             branch_id,
             parent_commit_id,
             message,
             actor,
-            diff_json,
-            snapshot_json,
-        )) = row
-        else {
-            return Ok(None);
-        };
-        let diff: Vec<DiffEntry> =
-            serde_json::from_value(diff_json).context("parsing stored diff")?;
-        let snapshot: Snapshot =
-            serde_json::from_value(snapshot_json).context("parsing stored snapshot")?;
-        Ok(Some((
-            Commit {
-                id: commit_id.to_string(),
-                project_id,
-                branch_id,
-                parent_commit_id,
-                message,
-                actor,
-                diff,
-            },
-            snapshot,
-        )))
-    }
-
-    /// Property-level + structural diff of `commit_id` relative to `against` — e.g. a branch's
-    /// tip (`commit_id`) diffed against `main`'s head (`against`) reports old = `against`'s
-    /// value, new = `commit_id`'s value, the same "diff X against baseline Y" convention `git
-    /// diff Y..X` uses. Works for any pair of commits, not just parent/child.
-    pub async fn diff_commits(&self, commit_id: &str, against: &str) -> Result<Vec<DiffEntry>> {
-        let (_, new_snapshot) = self
-            .get_commit(commit_id)
-            .await?
-            .with_context(|| format!("commit {commit_id} not found"))?;
-        let (_, old_snapshot) = self
-            .get_commit(against)
-            .await?
-            .with_context(|| format!("commit {against} not found"))?;
-        Ok(compute_snapshot_diff(&old_snapshot, &new_snapshot))
+            diff,
+        }))
     }
 
     pub async fn record_audit(
@@ -508,8 +551,11 @@ impl VersioningStore {
 }
 
 /// Compares `old` against `new`: property changes (bodies present in both), renames/active/
-/// origin changes (elements present in both), created elements, and created/deleted edges.
-fn compute_snapshot_diff(old: &Snapshot, new: &Snapshot) -> Vec<DiffEntry> {
+/// origin changes (elements present in both), created elements, and created/deleted edges. `pub`
+/// since `apps/api/src/main.rs`'s `diff_commit` handler calls this directly on two snapshots it
+/// resolved itself (`resolve_snapshot`) — this module no longer has enough context (no live
+/// Neo4j/Postgres access) to resolve snapshots itself, only to diff two already-resolved ones.
+pub fn compute_snapshot_diff(old: &Snapshot, new: &Snapshot) -> Vec<DiffEntry> {
     let mut out = Vec::new();
 
     let old_by_id: HashMap<&str, &Element> =
@@ -582,6 +628,16 @@ fn compute_snapshot_diff(old: &Snapshot, new: &Snapshot) -> Vec<DiffEntry> {
                 }
             }
         }
+
+        let new_rationale = new_body.get("rationale").and_then(|v| v.as_str());
+        let old_rationale = old_body.get("rationale").and_then(|v| v.as_str());
+        if new_rationale != old_rationale {
+            out.push(DiffEntry::RationaleChanged {
+                element_id: id.clone(),
+                old: old_rationale.map(String::from),
+                new: new_rationale.map(String::from),
+            });
+        }
     }
 
     let old_edges: HashSet<&SnapshotEdge> = old.edges.iter().collect();
@@ -602,4 +658,176 @@ fn compute_snapshot_diff(old: &Snapshot, new: &Snapshot) -> Vec<DiffEntry> {
     }
 
     out
+}
+
+/// Applies one commit's diff onto a snapshot representing the state immediately *before* that
+/// commit, mutating it into the state immediately *after* — the inverse of `compute_snapshot_diff`,
+/// used by `apps/api/src/main.rs`'s `resolve_snapshot` to replay a commit chain instead of
+/// storing/reading a full copy at every commit (see the module doc comment).
+///
+/// `GraphOp::Create`'s `temp_id` field is expected to already hold the server-assigned *real* id
+/// by the time it reaches here, not the client's original temp id — `apps/api/src/main.rs`'s
+/// `apply_text_model` handler remaps every op through `ApplyOpsOutcome::Applied`'s `id_map`
+/// before constructing the `TextModelApplied` diff entry, specifically so replay has real,
+/// resolvable ids to work with (the raw client ops are only ever meaningful within their own
+/// single `apply_graph_ops` call).
+pub fn apply_diff(snapshot: &mut Snapshot, diff: &DiffEntry) {
+    match diff {
+        DiffEntry::PropertyChanged {
+            element_id,
+            property,
+            new,
+            ..
+        } => {
+            let body = snapshot
+                .bodies
+                .entry(element_id.clone())
+                .or_insert_with(|| serde_json::json!({"rationale": null, "properties": {}}));
+            if body.get("properties").and_then(|v| v.as_object()).is_none() {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("properties".to_string(), serde_json::json!({}));
+                }
+            }
+            if let Some(obj) = body.get_mut("properties").and_then(|v| v.as_object_mut()) {
+                obj.insert(property.clone(), new.clone());
+            }
+        }
+        DiffEntry::RationaleChanged {
+            element_id, new, ..
+        } => {
+            let body = snapshot
+                .bodies
+                .entry(element_id.clone())
+                .or_insert_with(|| serde_json::json!({"rationale": null, "properties": {}}));
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "rationale".to_string(),
+                    new.clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+        DiffEntry::ElementRenamed {
+            element_id,
+            new_name,
+            ..
+        } => {
+            if let Some(e) = snapshot.elements.iter_mut().find(|e| &e.id == element_id) {
+                e.name = new_name.clone();
+            }
+        }
+        DiffEntry::ElementCreated {
+            element_id,
+            kind,
+            name,
+        } => {
+            if !snapshot.elements.iter().any(|e| &e.id == element_id) {
+                snapshot.elements.push(Element {
+                    id: element_id.clone(),
+                    kind: *kind,
+                    name: name.clone(),
+                    active: true,
+                    origin: Origin::Human,
+                });
+            }
+        }
+        DiffEntry::ElementDeleted { element_id, .. } => {
+            snapshot.elements.retain(|e| &e.id != element_id);
+            snapshot.bodies.remove(element_id);
+            // The live delete only ever diffs `ElementDeleted` itself, not the cascade-deleted
+            // edges Neo4j drops alongside it (a pre-existing gap, not introduced here) — replay
+            // strips them explicitly instead, so a reconstructed snapshot never carries a
+            // dangling edge a real delete would have removed.
+            snapshot
+                .edges
+                .retain(|e| &e.source != element_id && &e.target != element_id);
+        }
+        DiffEntry::ElementActiveChanged { element_id, active } => {
+            if let Some(e) = snapshot.elements.iter_mut().find(|e| &e.id == element_id) {
+                e.active = *active;
+            }
+        }
+        DiffEntry::ElementOriginChanged { element_id, origin } => {
+            if let Some(e) = snapshot.elements.iter_mut().find(|e| &e.id == element_id) {
+                e.origin = *origin;
+            }
+        }
+        DiffEntry::EdgeCreated {
+            source,
+            target,
+            kind,
+        } => {
+            let edge = SnapshotEdge {
+                source: source.clone(),
+                target: target.clone(),
+                kind: *kind,
+            };
+            if !snapshot.edges.contains(&edge) {
+                snapshot.edges.push(edge);
+            }
+        }
+        DiffEntry::EdgeDeleted {
+            source,
+            target,
+            kind,
+        } => {
+            snapshot
+                .edges
+                .retain(|e| !(&e.source == source && &e.target == target && &e.kind == kind));
+        }
+        DiffEntry::TextModelApplied { ops } => {
+            for op in ops {
+                apply_graph_op(snapshot, op);
+            }
+        }
+    }
+}
+
+fn apply_graph_op(snapshot: &mut Snapshot, op: &GraphOp) {
+    match op {
+        GraphOp::Rename { id, name } => {
+            if let Some(e) = snapshot.elements.iter_mut().find(|e| &e.id == id) {
+                e.name = name.clone();
+            }
+        }
+        GraphOp::Create {
+            temp_id: real_id,
+            kind,
+            name,
+            parent_id,
+        } => {
+            if !snapshot.elements.iter().any(|e| &e.id == real_id) {
+                snapshot.elements.push(Element {
+                    id: real_id.clone(),
+                    kind: *kind,
+                    name: name.clone(),
+                    active: true,
+                    origin: Origin::Human,
+                });
+            }
+            if let Some(parent) = parent_id {
+                let edge = SnapshotEdge {
+                    source: parent.clone(),
+                    target: real_id.clone(),
+                    kind: EdgeKind::Contains,
+                };
+                if !snapshot.edges.contains(&edge) {
+                    snapshot.edges.push(edge);
+                }
+            }
+        }
+        GraphOp::Reparent { id, new_parent_id } => {
+            snapshot
+                .edges
+                .retain(|e| !(&e.target == id && e.kind == EdgeKind::Contains));
+            if let Some(parent) = new_parent_id {
+                snapshot.edges.push(SnapshotEdge {
+                    source: parent.clone(),
+                    target: id.clone(),
+                    kind: EdgeKind::Contains,
+                });
+            }
+        }
+    }
 }
