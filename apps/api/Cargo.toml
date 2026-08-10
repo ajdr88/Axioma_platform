@@ -40,6 +40,11 @@ roxmltree = "0.21"
 # Server-generated ids for canvas-created elements (POST /api/v0/elements).
 uuid = { version = "1", features = ["v4"] }
 
+# NFR-COMP-03 auth abstraction (apps/api/src/auth.rs) — Bearer-JWT validation for
+# `OidcAuthProvider`. No OIDC-discovery/JWKS crate needed yet (see that module's doc comment on
+# scope): a single configured HMAC secret, not a live IdP's rotating keys.
+jsonwebtoken = "9"
+
 # Mode A grounded-copilot slice (apps/api/src/mode_a.rs) — a local Ollama call, no llm-gateway
 # package yet (ADR-004, deliberately deferred until a second consumer needs the abstraction).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -8,6 +8,7 @@
 //! nouns impl §1 names, made real rather than a `/api/v0/elements` stand-in.
 
 mod alf_ir;
+mod auth;
 mod control_sim;
 mod fuml_client;
 mod import;
@@ -17,11 +18,12 @@ mod traceability;
 mod trade_study;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Context;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
     Json, Router,
@@ -30,16 +32,16 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use store::neo4j::ApplyOpsOutcome;
 use store::versioning::{
     apply_diff, compute_snapshot_diff, Branch, DiffEntry, Project, Snapshot, SnapshotEdge,
-    MAIN_BRANCH,
+    DEFAULT_REGION, MAIN_BRANCH,
 };
 use store::{Neo4jStore, ObjectStore, PostgresStore, VersioningStore};
 use sysml_core::{Edge, EdgeKind, Element, ElementBody, NodeKind, Origin, ValidationError};
 use sysml_textual::GraphOp;
 
-/// Every mutating endpoint in this file commits/audits under this actor — there's no auth system
-/// yet ("no cross-session locking, single-user assumption is explicit and intentional" already
-/// governs canvas Edit Mode); the one endpoint T-P1.1-05 actually cares about the actor for
-/// (the branch-scoped property edit) accepts an explicit override instead.
+/// Every mutating endpoint in this file resolves its actor through `AppState::auth`
+/// (NFR-COMP-03 — see `auth.rs`'s doc comment) rather than using this directly; it's what
+/// `auth::LocalAuthProvider` (the default) falls back to when no `X-Actor` header override is
+/// present, preserving the exact identity every call site resolved to before that module existed.
 const DEFAULT_ACTOR: &str = "local-user";
 
 /// Every `EdgeKind` — used to build a full versioning snapshot across every relationship kind,
@@ -62,6 +64,7 @@ struct AppState {
     postgres: PostgresStore,
     objects: ObjectStore,
     versioning: VersioningStore,
+    auth: Arc<dyn auth::AuthProvider>,
     prometheus_handle: PrometheusHandle,
 }
 
@@ -79,6 +82,9 @@ impl IntoResponse for ApiError {
         }
         if let Some(bad_request) = self.0.downcast_ref::<import::BadRequest>() {
             return (StatusCode::BAD_REQUEST, bad_request.0.clone()).into_response();
+        }
+        if let Some(auth_err) = self.0.downcast_ref::<auth::AuthError>() {
+            return (StatusCode::UNAUTHORIZED, auth_err.to_string()).into_response();
         }
         tracing::error!(error = ?self.0, "request failed");
         (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
@@ -136,11 +142,23 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    let auth: Arc<dyn auth::AuthProvider> = match env_or("AUTH_PROVIDER", "local").as_str() {
+        // NFR-COMP-03 / T-X-07: this match arm is the entire "swap the identity provider" config
+        // change — no handler above or below this line changes.
+        "oidc" => Arc::new(auth::OidcAuthProvider::new(
+            &std::env::var("OIDC_HMAC_SECRET")
+                .context("OIDC_HMAC_SECRET must be set when AUTH_PROVIDER=oidc")?,
+            env_or("OIDC_ACTOR_CLAIM", "sub"),
+        )),
+        _ => Arc::new(auth::LocalAuthProvider),
+    };
+
     let state = AppState {
         neo4j,
         postgres,
         objects,
         versioning,
+        auth,
         prometheus_handle,
     };
 
@@ -297,6 +315,14 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 #[derive(Debug, serde::Deserialize)]
 struct CreateProjectRequest {
     name: String,
+    /// NFR-COMP-02 (data residency) — defaults to `DEFAULT_REGION` when omitted, matching every
+    /// project created before this field existed.
+    #[serde(default = "default_region")]
+    region: String,
+}
+
+fn default_region() -> String {
+    DEFAULT_REGION.to_string()
 }
 
 async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Project>>, ApiError> {
@@ -310,7 +336,12 @@ async fn create_project(
     if payload.name.trim().is_empty() {
         return Err(import::BadRequest("name must not be empty".to_string()).into());
     }
-    Ok(Json(state.versioning.create_project(&payload.name).await?))
+    Ok(Json(
+        state
+            .versioning
+            .create_project(&payload.name, &payload.region)
+            .await?,
+    ))
 }
 
 async fn get_project(
@@ -391,6 +422,7 @@ struct CommitResponse {
 /// consistent with `PropertyChanged` itself being a per-property diff.
 async fn branch_update_element_body(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((project_id, branch_name, element_id)): Path<(String, String, String)>,
     Json(payload): Json<BranchEditBodyRequest>,
 ) -> Result<Response, ApiError> {
@@ -417,10 +449,10 @@ async fn branch_update_element_body(
     // see `store::versioning`'s doc comment for why this never runs on the hot write path.
     let snapshot = resolve_snapshot(&state, &project_id, &head_commit_id).await?;
 
-    let actor = payload
-        .actor
-        .clone()
-        .unwrap_or_else(|| DEFAULT_ACTOR.to_string());
+    let actor = match payload.actor.clone() {
+        Some(actor) => actor,
+        None => state.auth.resolve_actor(&headers)?,
+    };
     let old_properties = snapshot
         .bodies
         .get(&element_id)
@@ -683,6 +715,7 @@ struct CreateElementRequest {
 /// generates the id, so there's no kind-conflict risk (it's always fresh).
 async fn create_element(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(project_id): Path<String>,
     Json(payload): Json<CreateElementRequest>,
 ) -> Result<Json<Element>, ApiError> {
@@ -700,7 +733,7 @@ async fn create_element(
     record_commit(
         &state,
         &project_id,
-        DEFAULT_ACTOR,
+        &state.auth.resolve_actor(&headers)?,
         "Create element",
         vec![DiffEntry::ElementCreated {
             element_id: element.id.clone(),
@@ -720,6 +753,7 @@ struct RenameRequest {
 /// Canvas inline rename (Edit Mode) — preserves the element's existing `kind`/`active`.
 async fn rename_element(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((project_id, id)): Path<(String, String)>,
     Json(payload): Json<RenameRequest>,
 ) -> Result<Response, ApiError> {
@@ -745,7 +779,7 @@ async fn rename_element(
         record_commit(
             &state,
             &project_id,
-            DEFAULT_ACTOR,
+            &state.auth.resolve_actor(&headers)?,
             "Rename element",
             vec![DiffEntry::ElementRenamed {
                 element_id: id.clone(),
@@ -768,6 +802,7 @@ struct SetActiveRequest {
 /// see `sysml_core::Element::active`'s doc comment). Nothing filters by this yet.
 async fn set_element_active(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((project_id, id)): Path<(String, String)>,
     Json(payload): Json<SetActiveRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -778,7 +813,7 @@ async fn set_element_active(
     record_commit(
         &state,
         &project_id,
-        DEFAULT_ACTOR,
+        &state.auth.resolve_actor(&headers)?,
         "Set element active flag",
         vec![DiffEntry::ElementActiveChanged {
             element_id: id,
@@ -798,6 +833,7 @@ struct SetOriginRequest {
 /// `set_element_active` exactly — never touches `name`/`active`.
 async fn set_element_origin(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((project_id, id)): Path<(String, String)>,
     Json(payload): Json<SetOriginRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -808,7 +844,7 @@ async fn set_element_origin(
     record_commit(
         &state,
         &project_id,
-        DEFAULT_ACTOR,
+        &state.auth.resolve_actor(&headers)?,
         "Set element origin",
         vec![DiffEntry::ElementOriginChanged {
             element_id: id,
@@ -829,6 +865,7 @@ struct CreateContainsRequest {
 /// `Neo4jStore::create_edge` the batch importers use (containment-acyclicity, FR-CORE-05).
 async fn create_contains_edge(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(project_id): Path<String>,
     Json(payload): Json<CreateContainsRequest>,
 ) -> Result<Json<Edge>, ApiError> {
@@ -841,7 +878,7 @@ async fn create_contains_edge(
     record_commit(
         &state,
         &project_id,
-        DEFAULT_ACTOR,
+        &state.auth.resolve_actor(&headers)?,
         "Create containment edge",
         vec![DiffEntry::EdgeCreated {
             source: edge.source.clone(),
@@ -857,6 +894,7 @@ async fn create_contains_edge(
 /// removing an edge can only heal a cycle/conflict, never create one.
 async fn delete_contains_edge(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(project_id): Path<String>,
     Json(payload): Json<CreateContainsRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -869,7 +907,7 @@ async fn delete_contains_edge(
     record_commit(
         &state,
         &project_id,
-        DEFAULT_ACTOR,
+        &state.auth.resolve_actor(&headers)?,
         "Delete containment edge",
         vec![DiffEntry::EdgeDeleted {
             source: edge.source.clone(),
@@ -911,6 +949,7 @@ async fn list_edges(
 /// containment-acyclicity when `kind` is `Contains`).
 async fn create_edge(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(project_id): Path<String>,
     Json(payload): Json<CreateEdgeRequest>,
 ) -> Result<Json<Edge>, ApiError> {
@@ -923,7 +962,7 @@ async fn create_edge(
     record_commit(
         &state,
         &project_id,
-        DEFAULT_ACTOR,
+        &state.auth.resolve_actor(&headers)?,
         "Create edge",
         vec![DiffEntry::EdgeCreated {
             source: edge.source.clone(),
@@ -938,6 +977,7 @@ async fn create_edge(
 /// Generic edge removal — no validation gate needed, same reasoning as `delete_contains_edge`.
 async fn delete_edge(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(project_id): Path<String>,
     Json(payload): Json<CreateEdgeRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -950,7 +990,7 @@ async fn delete_edge(
     record_commit(
         &state,
         &project_id,
-        DEFAULT_ACTOR,
+        &state.auth.resolve_actor(&headers)?,
         "Delete edge",
         vec![DiffEntry::EdgeDeleted {
             source: edge.source.clone(),
@@ -1016,6 +1056,7 @@ struct UpdateBodyRequest {
 /// changed, the same shape T-P1.1-05 expects from the branch-scoped edit endpoint.
 async fn update_element_body(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((project_id, id)): Path<(String, String)>,
     Json(payload): Json<UpdateBodyRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -1070,7 +1111,7 @@ async fn update_element_body(
     record_commit(
         &state,
         &project_id,
-        DEFAULT_ACTOR,
+        &state.auth.resolve_actor(&headers)?,
         "Update element properties",
         diff_entries,
     )
@@ -1107,6 +1148,7 @@ struct OpErrorResponse {
 /// a `500` via `ApiError`.
 async fn apply_text_model(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(project_id): Path<String>,
     Json(payload): Json<ApplyTextModelRequest>,
 ) -> Result<Json<ApplyTextModelResponse>, ApiError> {
@@ -1119,7 +1161,7 @@ async fn apply_text_model(
             record_commit(
                 &state,
                 &project_id,
-                DEFAULT_ACTOR,
+                &state.auth.resolve_actor(&headers)?,
                 "Apply text edit",
                 vec![DiffEntry::TextModelApplied {
                     // Real ids, not the client's temp ids — `apply_diff`/`resolve_snapshot`
@@ -1192,7 +1234,7 @@ async fn ensure_seeded(state: &AppState) -> anyhow::Result<()> {
     }
     let project = state
         .versioning
-        .create_project("Turbofan Reference")
+        .create_project("Turbofan Reference", DEFAULT_REGION)
         .await?;
     let diff_entries = seed_turbofan_ref(state, &project.id).await?;
     record_commit(
@@ -1377,7 +1419,7 @@ mod tests {
     /// A fresh project per test — real isolation, no cross-test id collisions to worry about.
     async fn test_project(versioning: &VersioningStore, name: &str) -> Project {
         versioning
-            .create_project(&format!("{name}-{}", uuid::Uuid::new_v4()))
+            .create_project(&format!("{name}-{}", uuid::Uuid::new_v4()), DEFAULT_REGION)
             .await
             .expect("creating a test project")
     }
@@ -1403,6 +1445,7 @@ mod tests {
             postgres,
             objects,
             versioning,
+            auth: Arc::new(auth::LocalAuthProvider),
             prometheus_handle: shared_prometheus_handle(),
         }
     }
@@ -1909,6 +1952,7 @@ mod tests {
 
         let response = branch_update_element_body(
             State(state.clone()),
+            HeaderMap::new(),
             Path((project.id.clone(), branch.name.clone(), "Fan".to_string())),
             Json(BranchEditBodyRequest {
                 rationale: None,
@@ -2018,6 +2062,7 @@ mod tests {
             .unwrap();
         branch_update_element_body(
             State(state.clone()),
+            HeaderMap::new(),
             Path((
                 project.id.clone(),
                 branch.name.clone(),
@@ -2059,6 +2104,35 @@ mod tests {
             "the pilot sim should still converge after the branch edit, got {:?}",
             report.simulation
         );
+    }
+
+    /// NFR-COMP-02 — a project's declared region round-trips through creation, `GET
+    /// /api/v0/projects`, and `GET /api/v0/projects/:id` unchanged; a project created without
+    /// specifying one (the pre-existing call shape, e.g. `ensure_seeded`'s) gets `DEFAULT_REGION`.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn project_region_round_trips_through_create_list_and_get() {
+        let (_neo4j, _postgres, _objects, versioning) = connect_test_stores().await;
+        let created = versioning
+            .create_project(&format!("region-test-{}", uuid::Uuid::new_v4()), "eu-west")
+            .await
+            .unwrap();
+        assert_eq!(created.region, "eu-west");
+
+        let fetched = versioning.get_project(&created.id).await.unwrap().unwrap();
+        assert_eq!(fetched.region, "eu-west");
+
+        let listed = versioning
+            .list_projects()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == created.id)
+            .expect("just-created project should be listed");
+        assert_eq!(listed.region, "eu-west");
+
+        let default_region_project = test_project(&versioning, "region-default").await;
+        assert_eq!(default_region_project.region, DEFAULT_REGION);
     }
 
     /// Two projects' elements never leak into each other — the same id string in two different
@@ -2541,6 +2615,7 @@ mod tests {
 
         let response = traceability::delete_element(
             State(state.clone()),
+            HeaderMap::new(),
             Path((project.id.clone(), "Hub".to_string())),
             Query(traceability::DeleteElementQuery { acknowledge: false }),
         )
@@ -2568,6 +2643,7 @@ mod tests {
 
         let response = traceability::delete_element(
             State(state.clone()),
+            HeaderMap::new(),
             Path((project.id.clone(), "Hub".to_string())),
             Query(traceability::DeleteElementQuery { acknowledge: true }),
         )
@@ -2591,6 +2667,7 @@ mod tests {
 
         let response = traceability::delete_element(
             State(state.clone()),
+            HeaderMap::new(),
             Path((project.id.clone(), "Lonely".to_string())),
             Query(traceability::DeleteElementQuery { acknowledge: false }),
         )

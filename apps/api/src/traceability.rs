@@ -51,13 +51,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use sysml_core::{EdgeKind, NodeKind};
 
-use crate::{import, record_commit, ApiError, AppState, DiffEntry, DEFAULT_ACTOR};
+use crate::{import, record_commit, ApiError, AppState, DiffEntry};
 
 /// A request above either cap is rejected outright (400) — CLAUDE.md's "rejected, not merely
 /// discouraged." Depth 10 / fanout 500 are this project's own reasonable ceilings; NFR-PERF-04
@@ -330,6 +330,7 @@ struct TraceabilityBreach {
 /// before retrying the delete.
 pub async fn delete_element(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((project_id, element_id)): Path<(String, String)>,
     Query(params): Query<DeleteElementQuery>,
 ) -> Result<Response, ApiError> {
@@ -380,7 +381,7 @@ pub async fn delete_element(
     record_commit(
         &state,
         &project_id,
-        DEFAULT_ACTOR,
+        &state.auth.resolve_actor(&headers)?,
         "Delete element",
         vec![DiffEntry::ElementDeleted {
             element_id,

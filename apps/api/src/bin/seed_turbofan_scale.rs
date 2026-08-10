@@ -34,6 +34,7 @@ mod store;
 
 use std::time::Instant;
 
+use store::versioning::DEFAULT_REGION;
 use store::{Neo4jStore, VersioningStore};
 use sysml_core::{EdgeKind, Element, ElementId, NodeKind, Origin};
 
@@ -81,7 +82,11 @@ async fn main() -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        None => versioning.create_project(PROJECT_NAME).await?,
+        None => {
+            versioning
+                .create_project(PROJECT_NAME, DEFAULT_REGION)
+                .await?
+        }
     };
     println!("created project {PROJECT_NAME:?} (id={})", project.id);
 

@@ -49,7 +49,17 @@ pub const MAIN_BRANCH: &str = "main";
 pub struct Project {
     pub id: String,
     pub name: String,
+    /// NFR-COMP-02 (data residency): the region this project's data is declared to live in.
+    /// Recorded and returned as a first-class fact from creation on — this alone doesn't
+    /// physically place the bytes in that region (this deployment has one Postgres/Neo4j/object
+    /// store, not a real per-region topology); it's the hook a real multi-region deployment
+    /// (`infrastructure/`'s `region` variable) wires actual placement to.
+    pub region: String,
 }
+
+/// The default when a caller doesn't specify one — not a real region-pinning decision on its
+/// own, just what a brand-new single-region dev/local deployment already is.
+pub const DEFAULT_REGION: &str = "us-east";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,6 +176,16 @@ async fn create_versioning_tables(conn: &mut sqlx::PgConnection) -> Result<()> {
     .execute(&mut *conn)
     .await
     .context("creating projects table")?;
+    // Migration for pre-existing dev databases (see `branches.fork_commit_id`'s identical
+    // pattern above) — `NOT NULL DEFAULT` backfills every existing row in the same statement.
+    // The literal below must match `DEFAULT_REGION` — sqlx's compile-time SQL-injection lint
+    // requires a `&'static str`, so it can't be interpolated from the Rust constant directly.
+    sqlx::query(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS region TEXT NOT NULL DEFAULT 'us-east'",
+    )
+    .execute(&mut *conn)
+    .await
+    .context("adding projects.region column")?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS branches (\
@@ -296,12 +316,15 @@ impl VersioningStore {
 
     /// Creates a project and its `main` branch (no commits yet) in one call — every project
     /// always has a `main` branch, the same "every git repo starts with a default branch"
-    /// invariant this borrows the vocabulary from.
-    pub async fn create_project(&self, name: &str) -> Result<Project> {
+    /// invariant this borrows the vocabulary from. `region` is NFR-COMP-02's data-residency
+    /// declaration (see `Project::region`'s doc comment) — pass `DEFAULT_REGION` if the caller
+    /// doesn't care.
+    pub async fn create_project(&self, name: &str, region: &str) -> Result<Project> {
         let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO projects (id, name) VALUES ($1, $2)")
+        sqlx::query("INSERT INTO projects (id, name, region) VALUES ($1, $2, $3)")
             .bind(&id)
             .bind(name)
+            .bind(region)
             .execute(&self.pool)
             .await
             .context("inserting project")?;
@@ -321,29 +344,30 @@ impl VersioningStore {
         Ok(Project {
             id,
             name: name.to_string(),
+            region: region.to_string(),
         })
     }
 
     pub async fn list_projects(&self) -> Result<Vec<Project>> {
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT id, name FROM projects ORDER BY created_at")
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, name, region FROM projects ORDER BY created_at")
                 .fetch_all(&self.pool)
                 .await
                 .context("listing projects")?;
         Ok(rows
             .into_iter()
-            .map(|(id, name)| Project { id, name })
+            .map(|(id, name, region)| Project { id, name, region })
             .collect())
     }
 
     pub async fn get_project(&self, id: &str) -> Result<Option<Project>> {
-        let row: Option<(String, String)> =
-            sqlx::query_as("SELECT id, name FROM projects WHERE id = $1")
+        let row: Option<(String, String, String)> =
+            sqlx::query_as("SELECT id, name, region FROM projects WHERE id = $1")
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await
                 .context("fetching project")?;
-        Ok(row.map(|(id, name)| Project { id, name }))
+        Ok(row.map(|(id, name, region)| Project { id, name, region }))
     }
 
     pub async fn get_branch(&self, project_id: &str, name: &str) -> Result<Option<Branch>> {

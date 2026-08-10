@@ -12,6 +12,15 @@ build/
 target/
 Cargo.lock.bak
 
+# Terraform (infrastructure/) — local provider plugin cache and per-run state/plan artifacts.
+# .terraform.lock.hcl is NOT ignored — that's the dependency lock file, committed like Cargo.lock.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
 # Env / secrets
 .env
 .env.*

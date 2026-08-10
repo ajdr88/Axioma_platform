@@ -66,7 +66,14 @@ interface PositionEntry {
 interface Project {
   id: string;
   name: string;
+  /** NFR-COMP-02 (data residency) — declared, not (yet) physically enforced; see
+   * `store::versioning::Project::region`'s doc comment on the Rust side. */
+  region: string;
 }
+
+/** A representative sample, not an exhaustive list — matches the regions a real
+ * `infrastructure/` deployment would plausibly parameterize (roadmap: NFR-COMP-01/02). */
+const REGIONS = ["us-east", "eu-west", "ap-south"] as const;
 
 /** Every read/write in this file is scoped to the current project (roadmap: Git-backed model
  * versioning) — `/api/projects/:projectId/...` mirrors `apps/api`'s own route restructuring. */
@@ -148,6 +155,7 @@ export default function Home() {
    * fresh install); switching projects re-runs the load effect below from scratch. */
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState<string | null>(null);
+  const [newProjectRegion, setNewProjectRegion] = useState<string>(REGIONS[0]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode<AxiomaBlockData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge<AxiomaEdgeData>>([]);
@@ -531,7 +539,10 @@ export default function Home() {
     const res = await fetch("/api/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: `New Project ${projects.length + 1}` }),
+      body: JSON.stringify({
+        name: `New Project ${projects.length + 1}`,
+        region: newProjectRegion,
+      }),
     });
     if (!res.ok) {
       showNotice(await readErrorMessage(res));
@@ -557,6 +568,8 @@ export default function Home() {
         projects={projects}
         projectId={projectId}
         setProjectId={setProjectId}
+        newProjectRegion={newProjectRegion}
+        setNewProjectRegion={setNewProjectRegion}
         handleCreateProject={handleCreateProject}
         reloadModel={reloadModel}
         editMode={editMode}
@@ -607,6 +620,8 @@ interface CanvasProps {
   projects: Project[];
   projectId: string | null;
   setProjectId: (id: string) => void;
+  newProjectRegion: string;
+  setNewProjectRegion: (region: string) => void;
   handleCreateProject: () => Promise<void>;
   reloadModel: () => Promise<void>;
   editMode: boolean;
@@ -659,6 +674,8 @@ function Canvas({
   projects,
   projectId,
   setProjectId,
+  newProjectRegion,
+  setNewProjectRegion,
   handleCreateProject,
   reloadModel,
   editMode,
@@ -959,6 +976,19 @@ function Canvas({
                 {projects.map((project) => (
                   <option key={project.id} value={project.id}>
                     {project.name}
+                  </option>
+                ))}
+              </select>
+              <select
+                id="new-project-region"
+                title="Region for the next new project (NFR-COMP-02)"
+                value={newProjectRegion}
+                onChange={(event) => setNewProjectRegion(event.target.value)}
+                className="rounded border border-white/10 bg-obsidian/60 px-1 py-1 text-xs text-white/80"
+              >
+                {REGIONS.map((region) => (
+                  <option key={region} value={region}>
+                    {region}
                   </option>
                 ))}
               </select>
