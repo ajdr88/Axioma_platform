@@ -4,6 +4,7 @@ members = [
     "apps/api",
     "apps/lsp",
     "packages/alf-lite",
+    "packages/cem-core",
     "packages/sysml-core",
     "packages/sysml-textual",
 ]

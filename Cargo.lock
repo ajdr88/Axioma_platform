@@ -36,6 +36,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
+ "cem-core",
  "dotenvy",
  "http-body-util",
  "jsonwebtoken",
@@ -792,6 +793,14 @@ dependencies = [
  "jobserver",
  "libc",
  "shlex",
+]
+
+[[package]]
+name = "cem-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

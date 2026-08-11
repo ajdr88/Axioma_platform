@@ -13,6 +13,7 @@ mod control_sim;
 mod fuml_client;
 mod import;
 mod mode_a;
+mod mode_b;
 mod store;
 mod traceability;
 mod trade_study;
@@ -256,6 +257,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/cem/mode-a/lint-requirement",
             post(mode_a::lint_requirement),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/mode-b/optimize",
+            post(mode_b::optimize),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/mode-b/accept",
+            post(mode_b::accept),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/mode-b/interface-contract/:subsystemId",
+            get(mode_b::interface_contract),
         )
         .route(
             "/api/v0/projects/:projectId/simulate/hello-world",
@@ -2112,6 +2125,169 @@ mod tests {
             "the pilot sim should still converge after the branch edit, got {:?}",
             report.simulation
         );
+    }
+
+    /// T-P2.1-01: two identical `optimize` calls on identical input produce identical rankings.
+    /// No LLM is ever in the decision path — structurally true, not just procedurally followed
+    /// (`cem-core` has no LLM-adjacent dependency at all; see that crate's own `Cargo.toml`).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mode_b_optimize_is_deterministic_across_identical_calls() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "mode-b-optimize").await;
+        state
+            .postgres
+            .upsert_body(
+                &project.id,
+                &ElementBody {
+                    element_id: "REQ-THRUST".to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "thrustLbfMin": 28_000.0 }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let make_request = || {
+            Json(mode_b::OptimizeRequest {
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints: cem_core::Constraints {
+                    max_total_mass_kg: Some(4_500.0),
+                },
+            })
+        };
+
+        let first = mode_b::optimize(
+            State(state.clone()),
+            Path(project.id.clone()),
+            make_request(),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let second = mode_b::optimize(
+            State(state.clone()),
+            Path(project.id.clone()),
+            make_request(),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        let first_body = response_json(first).await;
+        let second_body = response_json(second).await;
+        assert_eq!(first_body, second_body);
+        assert!(
+            !first_body["candidates"].as_array().unwrap().is_empty(),
+            "expected at least one feasible candidate, got {first_body}"
+        );
+    }
+
+    /// T-P2.1-03 (Interface Contract emission) + T-P2.1-06 (auto-traceability on accept):
+    /// accepting one candidate persists all six Interface Contract fields per varied subsystem,
+    /// wires a real `Satisfy` edge to the source requirement, and marks the subsystem
+    /// `Origin::AiSuggested` with generation provenance — all via already-existing store
+    /// primitives, no new proposal/branch/autonomy machinery (see `mode_b.rs`'s doc comment).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mode_b_accept_wires_traceability_and_interface_contract_is_fully_populated() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "mode-b-accept").await;
+
+        for id in [
+            "FanLpCompression",
+            "CoreHpCompressor",
+            "Combustor",
+            "TurbineHpLp",
+        ] {
+            make_structure(&state.neo4j, &project.id, id).await;
+        }
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "REQ-THRUST".to_string(),
+                    kind: NodeKind::Requirement,
+                    name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+
+        let candidates = mode_b::optimize(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_b::OptimizeRequest {
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints: cem_core::Constraints::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .candidates;
+        let chosen = candidates[0];
+
+        let accept_response = mode_b::accept(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::AcceptRequest {
+                candidate: chosen,
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(accept_response.updated_subsystem_ids.len(), 4);
+
+        // T-P2.1-06: a real Satisfy edge + Origin::AiSuggested on each varied subsystem.
+        let satisfy_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::Satisfy)
+            .await
+            .unwrap();
+        for subsystem_id in &accept_response.updated_subsystem_ids {
+            assert!(
+                satisfy_edges
+                    .iter()
+                    .any(|e| &e.source == subsystem_id && e.target == "REQ-THRUST"),
+                "expected a Satisfy edge from {subsystem_id} to REQ-THRUST, got {satisfy_edges:?}"
+            );
+            let element = state
+                .neo4j
+                .get_element(&project.id, subsystem_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(element.origin, Origin::AiSuggested);
+        }
+
+        // T-P2.1-03: all six Interface Contract fields populated for the Turbine subsystem.
+        let contract_response = mode_b::interface_contract(
+            State(state.clone()),
+            Path((project.id.clone(), "TurbineHpLp".to_string())),
+        )
+        .await
+        .unwrap();
+        let contract = response_json(contract_response).await;
+        for field in [
+            "performanceTargets",
+            "boundaryConditions",
+            "geometricEnvelope",
+            "interfacePortDefinitions",
+            "massCostTargets",
+            "materialProcessConstraints",
+        ] {
+            assert!(
+                !contract[field].is_null(),
+                "{field} should be populated, got {contract}"
+            );
+        }
     }
 
     /// NFR-COMP-02 — a project's declared region round-trips through creation, `GET
