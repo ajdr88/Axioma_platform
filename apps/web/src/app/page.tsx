@@ -38,6 +38,7 @@ import {
 } from "@xyflow/react";
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AutonomyPanel } from "@/components/AutonomyPanel";
 import { ElementInspector } from "@/components/ElementInspector";
 import { HazardRiskPanel } from "@/components/HazardRiskPanel";
 import { MissionPlanningPanel } from "@/components/MissionPlanningPanel";
@@ -148,6 +149,7 @@ export default function Home() {
   const [showStagePanel, setShowStagePanel] = useState(false);
   const [showTradeStudyPanel, setShowTradeStudyPanel] = useState(false);
   const [showPartSearchPanel, setShowPartSearchPanel] = useState(false);
+  const [showAutonomyPanel, setShowAutonomyPanel] = useState(false);
   const [showTraceabilityPanel, setShowTraceabilityPanel] = useState(false);
   /** FR-CORE-08 / T-P1.2-06's "AI-suggested only" filter — "all" shows every origin. */
   const [originFilter, setOriginFilter] = useState<Origin | "all">("all");
@@ -588,6 +590,8 @@ export default function Home() {
         setShowTradeStudyPanel={setShowTradeStudyPanel}
         showPartSearchPanel={showPartSearchPanel}
         setShowPartSearchPanel={setShowPartSearchPanel}
+        showAutonomyPanel={showAutonomyPanel}
+        setShowAutonomyPanel={setShowAutonomyPanel}
         showTraceabilityPanel={showTraceabilityPanel}
         setShowTraceabilityPanel={setShowTraceabilityPanel}
         originFilter={originFilter}
@@ -642,6 +646,8 @@ interface CanvasProps {
   setShowTradeStudyPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showPartSearchPanel: boolean;
   setShowPartSearchPanel: React.Dispatch<React.SetStateAction<boolean>>;
+  showAutonomyPanel: boolean;
+  setShowAutonomyPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showTraceabilityPanel: boolean;
   setShowTraceabilityPanel: React.Dispatch<React.SetStateAction<boolean>>;
   originFilter: Origin | "all";
@@ -698,6 +704,8 @@ function Canvas({
   setShowTradeStudyPanel,
   showPartSearchPanel,
   setShowPartSearchPanel,
+  showAutonomyPanel,
+  setShowAutonomyPanel,
   showTraceabilityPanel,
   setShowTraceabilityPanel,
   originFilter,
@@ -1063,6 +1071,7 @@ function Canvas({
                   setShowStagePanel(false);
                   setShowTradeStudyPanel(false);
                   setShowPartSearchPanel(false);
+                  setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1078,6 +1087,7 @@ function Canvas({
                   setShowStagePanel(false);
                   setShowTradeStudyPanel(false);
                   setShowPartSearchPanel(false);
+                  setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1093,6 +1103,7 @@ function Canvas({
                   setShowMissionPanel(false);
                   setShowTradeStudyPanel(false);
                   setShowPartSearchPanel(false);
+                  setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1108,6 +1119,7 @@ function Canvas({
                   setShowMissionPanel(false);
                   setShowStagePanel(false);
                   setShowPartSearchPanel(false);
+                  setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
@@ -1123,12 +1135,29 @@ function Canvas({
                   setShowMissionPanel(false);
                   setShowStagePanel(false);
                   setShowTradeStudyPanel(false);
+                  setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
               >
                 Part Search
+              </Button>
+              <Button
+                variant={showAutonomyPanel ? "primary" : "ghost"}
+                onClick={() => {
+                  setShowAutonomyPanel((v) => !v);
+                  setShowHazardPanel(false);
+                  setShowMissionPanel(false);
+                  setShowStagePanel(false);
+                  setShowTradeStudyPanel(false);
+                  setShowPartSearchPanel(false);
+                  setShowTraceabilityPanel(false);
+                  setSelectedNodeId(null);
+                }}
+                className="!px-2 !py-1 text-xs"
+              >
+                Autonomy
               </Button>
               <Button
                 variant={showTraceabilityPanel ? "primary" : "ghost"}
@@ -1139,6 +1168,7 @@ function Canvas({
                   setShowStagePanel(false);
                   setShowTradeStudyPanel(false);
                   setShowPartSearchPanel(false);
+                  setShowAutonomyPanel(false);
                 }}
                 className="!px-2 !py-1 text-xs"
               >
@@ -1221,6 +1251,10 @@ function Canvas({
                 setShowPartSearchPanel(false);
               }}
             />
+          )}
+
+          {showAutonomyPanel && projectId && (
+            <AutonomyPanel projectId={projectId} onClose={() => setShowAutonomyPanel(false)} />
           )}
         </ReactFlow>
       </div>

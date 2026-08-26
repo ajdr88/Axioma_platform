@@ -9,6 +9,7 @@
 
 mod alf_ir;
 mod auth;
+mod autonomy;
 mod control_sim;
 mod fuml_client;
 mod import;
@@ -26,7 +27,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
     Json, Router,
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -269,6 +270,30 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/cem/mode-b/interface-contract/:subsystemId",
             get(mode_b::interface_contract),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/mode-b/propose",
+            post(mode_b::propose),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/proposals/:branchId",
+            get(mode_b::list_proposals),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/proposals/:proposalId/accept",
+            post(mode_b::accept_proposal),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/proposals/:proposalId/reject",
+            post(mode_b::reject_proposal),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/autonomy-level",
+            put(mode_b::set_autonomy_level),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/autonomy-level/:scope",
+            get(mode_b::get_autonomy_level),
         )
         .route(
             "/api/v0/projects/:projectId/simulate/hello-world",
@@ -2288,6 +2313,582 @@ mod tests {
                 "{field} should be populated, got {contract}"
             );
         }
+    }
+
+    /// T-P2.2-01: at `L1`, `propose`'s output never touches `main` at all — every subsystem lands
+    /// as an individually accept/reject-able `pending` proposal on a fresh branch instead.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mode_b_propose_at_l1_lands_on_a_branch_as_pending_proposals_not_on_main() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "propose-l1").await;
+
+        for id in [
+            "FanLpCompression",
+            "CoreHpCompressor",
+            "Combustor",
+            "TurbineHpLp",
+        ] {
+            make_structure(&state.neo4j, &project.id, id).await;
+        }
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "REQ-THRUST".to_string(),
+                    kind: NodeKind::Requirement,
+                    name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+
+        mode_b::set_autonomy_level(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::SetAutonomyLevelRequest {
+                scope: "project".to_string(),
+                level: "L1".to_string(),
+                mass_deviation_threshold_percent: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let candidates = mode_b::optimize(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_b::OptimizeRequest {
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints: cem_core::Constraints::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .candidates;
+        let chosen = candidates[0];
+
+        let response = mode_b::propose(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::ProposeRequest {
+                candidate: chosen,
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints: cem_core::Constraints::default(),
+                expected_main_head_commit_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response.outcomes.len(), 4, "{response:?}");
+        assert!(
+            response.outcomes.iter().all(|o| o.outcome == "review"),
+            "{response:?}"
+        );
+        let branch_id = response
+            .branch_id
+            .expect("L1 should always produce a review branch");
+
+        let main_branch = state
+            .versioning
+            .get_branch(&project.id, MAIN_BRANCH)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            main_branch.head_commit_id.is_none(),
+            "L1 must not commit anything to main"
+        );
+        for subsystem_id in [
+            "FanLpCompression",
+            "CoreHpCompressor",
+            "Combustor",
+            "TurbineHpLp",
+        ] {
+            let element = state
+                .neo4j
+                .get_element(&project.id, subsystem_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                element.origin,
+                Origin::Human,
+                "an un-accepted proposal must not touch the graph"
+            );
+        }
+
+        let proposals =
+            mode_b::list_proposals(State(state.clone()), Path((project.id.clone(), branch_id)))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(proposals.len(), 4);
+        assert!(proposals.iter().all(|p| p.status == "pending"));
+    }
+
+    /// T-P2.2-02: an `L3` project with a 5% mass-deviation threshold auto-merges a candidate 3%
+    /// over its baseline and drops a 12%-over candidate to review, unchanged config either way.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mode_b_propose_at_l3_merges_within_threshold_and_reviews_beyond_it() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "propose-l3").await;
+
+        make_structure(&state.neo4j, &project.id, "FanLpCompression").await;
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "REQ-THRUST".to_string(),
+                    kind: NodeKind::Requirement,
+                    name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+
+        mode_b::set_autonomy_level(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::SetAutonomyLevelRequest {
+                scope: "project".to_string(),
+                level: "L3".to_string(),
+                mass_deviation_threshold_percent: Some(5.0),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let base_candidate = cem_core::Candidate {
+            params: cem_core::SubsystemParams {
+                bypass_ratio: 5.0,
+                pressure_ratio: 30.0,
+                turbine_inlet_temp_k: 1_800.0,
+                turbine_stage_count: 2,
+            },
+            thrust_lbf: 20_000.0,
+            sfc: 0.6,
+            total_mass_kg: 1_000.0,
+        };
+        let constraints = cem_core::Constraints {
+            max_total_mass_kg: Some(1_000.0),
+        };
+
+        let within = mode_b::propose(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::ProposeRequest {
+                candidate: cem_core::Candidate {
+                    total_mass_kg: 1_030.0,
+                    ..base_candidate
+                },
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints,
+                expected_main_head_commit_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(
+            within.outcomes.iter().all(|o| o.outcome == "merged"),
+            "3% over a 5% threshold should auto-merge, got {within:?}"
+        );
+        assert!(within.branch_id.is_none());
+
+        let beyond = mode_b::propose(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::ProposeRequest {
+                candidate: cem_core::Candidate {
+                    total_mass_kg: 1_120.0,
+                    ..base_candidate
+                },
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints,
+                expected_main_head_commit_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(
+            beyond.outcomes.iter().all(|o| o.outcome == "review"
+                && o.reason.as_deref() == Some("below_l3_threshold_review")),
+            "12% over a 5% threshold should drop to review, got {beyond:?}"
+        );
+        assert!(beyond.branch_id.is_some());
+    }
+
+    /// T-P2.2-03 (FR-CEM-18): at `L4`, a subsystem that `Causes` an unmitigated, Major hazard is
+    /// still forced to individual review — while an unrelated subsystem in the very same
+    /// candidate still auto-merges per the base `L4` decision.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mode_b_propose_at_l4_forces_review_for_a_hazard_linked_subsystem_only() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "propose-hazard").await;
+
+        for id in [
+            "FanLpCompression",
+            "CoreHpCompressor",
+            "Combustor",
+            "TurbineHpLp",
+        ] {
+            make_structure(&state.neo4j, &project.id, id).await;
+        }
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "REQ-THRUST".to_string(),
+                    kind: NodeKind::Requirement,
+                    name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "HAZ-OVERSPEED".to_string(),
+                    kind: NodeKind::Hazard,
+                    name: "Overspeed".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .postgres
+            .upsert_body(
+                &project.id,
+                &ElementBody {
+                    element_id: "HAZ-OVERSPEED".to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "severity": "Major", "likelihood": "Probable" }),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "TurbineHpLp".to_string(),
+                    target: "HAZ-OVERSPEED".to_string(),
+                    kind: EdgeKind::Causes,
+                },
+            )
+            .await
+            .unwrap();
+
+        mode_b::set_autonomy_level(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::SetAutonomyLevelRequest {
+                scope: "project".to_string(),
+                level: "L4".to_string(),
+                mass_deviation_threshold_percent: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let candidates = mode_b::optimize(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_b::OptimizeRequest {
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints: cem_core::Constraints::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .candidates;
+        let chosen = candidates[0];
+
+        let response = mode_b::propose(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::ProposeRequest {
+                candidate: chosen,
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints: cem_core::Constraints::default(),
+                expected_main_head_commit_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let turbine_outcome = response
+            .outcomes
+            .iter()
+            .find(|o| o.subsystem_id == "TurbineHpLp")
+            .expect("TurbineHpLp should have an outcome");
+        assert_eq!(turbine_outcome.outcome, "review", "{response:?}");
+        assert_eq!(
+            turbine_outcome.reason.as_deref(),
+            Some("hazard_override"),
+            "{response:?}"
+        );
+
+        for other in ["FanLpCompression", "CoreHpCompressor", "Combustor"] {
+            let outcome = response
+                .outcomes
+                .iter()
+                .find(|o| o.subsystem_id == other)
+                .unwrap_or_else(|| panic!("{other} should have an outcome, got {response:?}"));
+            assert_eq!(
+                outcome.outcome, "merged",
+                "{other} has no hazard link and should merge at L4, got {response:?}"
+            );
+        }
+    }
+
+    /// T-P2.2-04 (NFR-CEM-06): an autonomy-level change is audited with the actor plus the
+    /// exact old/new levels — checked by reading the audit log back, not just trusting the write
+    /// succeeded.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn autonomy_level_change_is_audited_with_actor_and_old_new_levels() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "autonomy-audit").await;
+
+        mode_b::set_autonomy_level(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::SetAutonomyLevelRequest {
+                scope: "project".to_string(),
+                level: "L1".to_string(),
+                mass_deviation_threshold_percent: None,
+            }),
+        )
+        .await
+        .unwrap();
+        mode_b::set_autonomy_level(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::SetAutonomyLevelRequest {
+                scope: "project".to_string(),
+                level: "L4".to_string(),
+                mass_deviation_threshold_percent: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let audit_log = state.versioning.list_audit_log(&project.id).await.unwrap();
+        let level_changes: Vec<_> = audit_log
+            .iter()
+            .filter(|e| matches!(e.diff, DiffEntry::AutonomyLevelChanged { .. }))
+            .collect();
+        assert_eq!(level_changes.len(), 2, "{audit_log:?}");
+
+        let DiffEntry::AutonomyLevelChanged {
+            scope,
+            old_level,
+            new_level,
+        } = &level_changes[0].diff
+        else {
+            unreachable!()
+        };
+        assert_eq!(scope, "project");
+        assert_eq!(old_level, &None);
+        assert_eq!(new_level, "L1");
+        assert!(!level_changes[0].actor.is_empty());
+        assert!(!level_changes[0].created_at.is_empty());
+
+        let DiffEntry::AutonomyLevelChanged {
+            old_level,
+            new_level,
+            ..
+        } = &level_changes[1].diff
+        else {
+            unreachable!()
+        };
+        assert_eq!(old_level, &Some("L1".to_string()));
+        assert_eq!(new_level, "L4");
+    }
+
+    /// T-P2.2-05 (NFR-OPS-04): a stale `expectedMainHeadCommitId` forces every subsystem to
+    /// review even at `L4` — the concrete stand-in for "a human edit lands while an autonomous
+    /// write is in flight" (Mode C doesn't exist to test the literal scenario against). PASS is
+    /// the concurrent human edit surviving untouched, never force-merged over.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn mode_b_propose_with_a_stale_main_head_forces_review_and_preserves_the_concurrent_edit()
+    {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "propose-concurrency").await;
+
+        for id in [
+            "FanLpCompression",
+            "CoreHpCompressor",
+            "Combustor",
+            "TurbineHpLp",
+        ] {
+            make_structure(&state.neo4j, &project.id, id).await;
+        }
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "REQ-THRUST".to_string(),
+                    kind: NodeKind::Requirement,
+                    name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        record_commit(
+            &state,
+            &project.id,
+            "test-setup",
+            "Seed reference fixture",
+            vec![DiffEntry::ElementCreated {
+                element_id: "REQ-THRUST".to_string(),
+                kind: NodeKind::Requirement,
+                name: "Engine shall provide >= 30,000 lbf takeoff thrust".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        mode_b::set_autonomy_level(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::SetAutonomyLevelRequest {
+                scope: "project".to_string(),
+                level: "L4".to_string(),
+                mass_deviation_threshold_percent: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The caller captures main's head before computing a candidate against it...
+        let captured_head = state
+            .versioning
+            .get_branch(&project.id, MAIN_BRANCH)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_commit_id;
+        assert!(captured_head.is_some());
+
+        // ...meanwhile a human renames FanLpCompression, advancing main past that snapshot.
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "FanLpCompression".to_string(),
+                    kind: NodeKind::Structure,
+                    name: "Fan & LP Compression (renamed)".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        record_commit(
+            &state,
+            &project.id,
+            "human-reviewer",
+            "Rename FanLpCompression",
+            vec![DiffEntry::ElementRenamed {
+                element_id: "FanLpCompression".to_string(),
+                old_name: "FanLpCompression".to_string(),
+                new_name: "Fan & LP Compression (renamed)".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let candidates = mode_b::optimize(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(mode_b::OptimizeRequest {
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints: cem_core::Constraints::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+        .candidates;
+        let chosen = candidates[0];
+
+        let response = mode_b::propose(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(mode_b::ProposeRequest {
+                candidate: chosen,
+                top_level_requirement_ids: vec!["REQ-THRUST".to_string()],
+                constraints: cem_core::Constraints::default(),
+                expected_main_head_commit_id: captured_head,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(
+            response
+                .outcomes
+                .iter()
+                .all(|o| o.outcome == "review" && o.reason.as_deref() == Some("concurrent_change")),
+            "a stale expected main head should force review at every subsystem, got {response:?}"
+        );
+        assert!(response.branch_id.is_some());
+
+        let fan = state
+            .neo4j
+            .get_element(&project.id, "FanLpCompression")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fan.name, "Fan & LP Compression (renamed)");
+        assert_eq!(
+            fan.origin,
+            Origin::Human,
+            "the concurrent human edit must survive untouched, never force-merged over"
+        );
     }
 
     /// NFR-COMP-02 — a project's declared region round-trips through creation, `GET

@@ -163,6 +163,15 @@ pub enum DiffEntry {
     TextModelApplied {
         ops: Vec<GraphOp>,
     },
+    /// NFR-CEM-06 (Autonomy Auditability) — recorded via `record_audit` directly, never through
+    /// `record_commit`: an autonomy-level change isn't a graph mutation (nothing for `apply_diff`
+    /// below to actually replay — see its own no-op arm), it's project-level config, so it never
+    /// touches `main`'s commit history, only the audit log.
+    AutonomyLevelChanged {
+        scope: String,
+        old_level: Option<String>,
+        new_level: String,
+    },
 }
 
 async fn create_versioning_tables(conn: &mut sqlx::PgConnection) -> Result<()> {
@@ -243,6 +252,45 @@ async fn create_versioning_tables(conn: &mut sqlx::PgConnection) -> Result<()> {
     .execute(&mut *conn)
     .await
     .context("creating audit_log table")?;
+
+    // P2.2 (FR-CEM-16/17) — `scope` is an opaque caller-assigned string ("project" for
+    // project-wide, the only scope this pass's UI/tests exercise; finer-grained scopes per
+    // FR-CEM-17 are a natural extension of the same column, not a schema change).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS autonomy_config (\
+            project_id TEXT NOT NULL, \
+            scope TEXT NOT NULL, \
+            level TEXT NOT NULL, \
+            mass_deviation_threshold_percent DOUBLE PRECISION, \
+            updated_by TEXT NOT NULL, \
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+            PRIMARY KEY (project_id, scope)\
+        )",
+    )
+    .execute(&mut *conn)
+    .await
+    .context("creating autonomy_config table")?;
+
+    // P2.2 (T-P2.2-01) — one row per *subsystem*, not per `propose` call, so "each element
+    // individually accept/reject-able" is real rather than all-or-nothing; see
+    // `store::versioning`'s module doc comment and `mode_b.rs`'s `propose` for how the
+    // containing `branch_id` and these rows relate.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS proposals (\
+            id TEXT PRIMARY KEY, \
+            project_id TEXT NOT NULL, \
+            branch_id TEXT NOT NULL, \
+            subsystem_id TEXT NOT NULL, \
+            status TEXT NOT NULL, \
+            candidate JSONB NOT NULL, \
+            top_level_requirement_ids JSONB NOT NULL, \
+            reason TEXT NOT NULL, \
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+        )",
+    )
+    .execute(&mut *conn)
+    .await
+    .context("creating proposals table")?;
 
     Ok(())
 }
@@ -572,6 +620,265 @@ impl VersioningStore {
             .context("inserting audit log entry")?;
         Ok(())
     }
+
+    /// NFR-CEM-06 (Autonomy Auditability) — the read side of `record_audit`, oldest-first.
+    /// `created_at` comes back as its `text` cast rather than a typed timestamp: nothing else in
+    /// this store decodes `TIMESTAMPTZ` today, and a plain non-empty string is enough to prove the
+    /// column's own `NOT NULL DEFAULT now()` did its job without pulling in a new date/time crate
+    /// just for this.
+    ///
+    /// `#[allow(dead_code)]`: this pass's autonomy work verifies auditing directly against this
+    /// accessor (see `main.rs`'s `autonomy_level_change_is_audited_with_actor_and_old_new_levels`)
+    /// rather than through a dedicated HTTP endpoint — no `GET .../audit-log` was in scope, so
+    /// nothing in the non-test build calls this yet.
+    #[allow(dead_code)]
+    pub async fn list_audit_log(&self, project_id: &str) -> Result<Vec<AuditLogEntry>> {
+        let rows: Vec<(String, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT actor, created_at::text, diff FROM audit_log \
+             WHERE project_id = $1 ORDER BY created_at",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("listing audit log")?;
+        rows.into_iter()
+            .map(|(actor, created_at, diff_json)| {
+                let diff: DiffEntry =
+                    serde_json::from_value(diff_json).context("parsing audit diff")?;
+                Ok(AuditLogEntry {
+                    actor,
+                    created_at,
+                    diff,
+                })
+            })
+            .collect()
+    }
+
+    /// P2.2 (FR-CEM-16/17) — `level` is stored as a plain string here (like `Commit.message`),
+    /// not a Rust enum: `apps/api/src/autonomy.rs` owns the `Level` type and its parsing/decision
+    /// logic, this store layer just persists whatever string it's given.
+    pub async fn get_autonomy_config(
+        &self,
+        project_id: &str,
+        scope: &str,
+    ) -> Result<Option<AutonomyConfig>> {
+        let row: Option<(String, Option<f64>)> = sqlx::query_as(
+            "SELECT level, mass_deviation_threshold_percent FROM autonomy_config \
+             WHERE project_id = $1 AND scope = $2",
+        )
+        .bind(project_id)
+        .bind(scope)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetching autonomy config")?;
+        Ok(
+            row.map(|(level, mass_deviation_threshold_percent)| AutonomyConfig {
+                scope: scope.to_string(),
+                level,
+                mass_deviation_threshold_percent,
+            }),
+        )
+    }
+
+    pub async fn set_autonomy_config(
+        &self,
+        project_id: &str,
+        scope: &str,
+        level: &str,
+        mass_deviation_threshold_percent: Option<f64>,
+        updated_by: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO autonomy_config \
+                (project_id, scope, level, mass_deviation_threshold_percent, updated_by) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (project_id, scope) DO UPDATE SET \
+                level = EXCLUDED.level, \
+                mass_deviation_threshold_percent = EXCLUDED.mass_deviation_threshold_percent, \
+                updated_by = EXCLUDED.updated_by, \
+                updated_at = now()",
+        )
+        .bind(project_id)
+        .bind(scope)
+        .bind(level)
+        .bind(mass_deviation_threshold_percent)
+        .bind(updated_by)
+        .execute(&self.pool)
+        .await
+        .context("upserting autonomy config")?;
+        Ok(())
+    }
+
+    /// P2.2 (T-P2.2-01) — one row per subsystem; `reason` is the honest "why does this need
+    /// review" string a UI would surface (see `apps/api/src/autonomy.rs::Decision`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_proposal(
+        &self,
+        project_id: &str,
+        branch_id: &str,
+        subsystem_id: &str,
+        candidate: &serde_json::Value,
+        top_level_requirement_ids: &[String],
+        reason: &str,
+    ) -> Result<Proposal> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let requirement_ids_json = serde_json::to_value(top_level_requirement_ids)
+            .context("serializing requirement ids")?;
+        sqlx::query(
+            "INSERT INTO proposals \
+                (id, project_id, branch_id, subsystem_id, status, candidate, \
+                 top_level_requirement_ids, reason) \
+             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)",
+        )
+        .bind(&id)
+        .bind(project_id)
+        .bind(branch_id)
+        .bind(subsystem_id)
+        .bind(candidate)
+        .bind(&requirement_ids_json)
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .context("inserting proposal")?;
+        Ok(Proposal {
+            id,
+            project_id: project_id.to_string(),
+            branch_id: branch_id.to_string(),
+            subsystem_id: subsystem_id.to_string(),
+            status: "pending".to_string(),
+            candidate: candidate.clone(),
+            top_level_requirement_ids: top_level_requirement_ids.to_vec(),
+            reason: reason.to_string(),
+        })
+    }
+
+    pub async fn list_proposals(&self, project_id: &str, branch_id: &str) -> Result<Vec<Proposal>> {
+        type Row = (
+            String,
+            String,
+            String,
+            serde_json::Value,
+            serde_json::Value,
+            String,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, subsystem_id, status, candidate, top_level_requirement_ids, reason \
+             FROM proposals WHERE project_id = $1 AND branch_id = $2 ORDER BY created_at",
+        )
+        .bind(project_id)
+        .bind(branch_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("listing proposals")?;
+        rows.into_iter()
+            .map(
+                |(id, subsystem_id, status, candidate, requirement_ids_json, reason)| {
+                    let top_level_requirement_ids: Vec<String> =
+                        serde_json::from_value(requirement_ids_json)
+                            .context("parsing proposal requirement ids")?;
+                    Ok(Proposal {
+                        id,
+                        project_id: project_id.to_string(),
+                        branch_id: branch_id.to_string(),
+                        subsystem_id,
+                        status,
+                        candidate,
+                        top_level_requirement_ids,
+                        reason,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub async fn get_proposal(
+        &self,
+        project_id: &str,
+        proposal_id: &str,
+    ) -> Result<Option<Proposal>> {
+        type Row = (
+            String,
+            String,
+            String,
+            serde_json::Value,
+            serde_json::Value,
+            String,
+        );
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT branch_id, subsystem_id, status, candidate, top_level_requirement_ids, reason \
+             FROM proposals WHERE project_id = $1 AND id = $2",
+        )
+        .bind(project_id)
+        .bind(proposal_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetching proposal")?;
+        row.map(
+            |(branch_id, subsystem_id, status, candidate, requirement_ids_json, reason)| {
+                let top_level_requirement_ids: Vec<String> =
+                    serde_json::from_value(requirement_ids_json)
+                        .context("parsing proposal requirement ids")?;
+                Ok(Proposal {
+                    id: proposal_id.to_string(),
+                    project_id: project_id.to_string(),
+                    branch_id,
+                    subsystem_id,
+                    status,
+                    candidate,
+                    top_level_requirement_ids,
+                    reason,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub async fn set_proposal_status(
+        &self,
+        project_id: &str,
+        proposal_id: &str,
+        status: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE proposals SET status = $1 WHERE project_id = $2 AND id = $3")
+            .bind(status)
+            .bind(project_id)
+            .bind(proposal_id)
+            .execute(&self.pool)
+            .await
+            .context("updating proposal status")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutonomyConfig {
+    pub scope: String,
+    pub level: String,
+    pub mass_deviation_threshold_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Proposal {
+    pub id: String,
+    pub project_id: String,
+    pub branch_id: String,
+    pub subsystem_id: String,
+    pub status: String,
+    pub candidate: serde_json::Value,
+    pub top_level_requirement_ids: Vec<String>,
+    pub reason: String,
+}
+
+/// See `list_audit_log`'s own doc comment for why `#[allow(dead_code)]` is warranted here too.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditLogEntry {
+    pub actor: String,
+    pub created_at: String,
+    pub diff: DiffEntry,
 }
 
 /// Compares `old` against `new`: property changes (bodies present in both), renames/active/
@@ -805,6 +1112,9 @@ pub fn apply_diff(snapshot: &mut Snapshot, diff: &DiffEntry) {
                 apply_graph_op(snapshot, op);
             }
         }
+        // Not a graph mutation — project-level config, nothing in a Snapshot to update. See the
+        // variant's own doc comment.
+        DiffEntry::AutonomyLevelChanged { .. } => {}
     }
 }
 
