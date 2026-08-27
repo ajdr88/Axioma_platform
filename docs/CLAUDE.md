@@ -1,18 +1,17 @@
 # Axioma — Project Context for Claude Code
 
-**Source of truth:** `docs/Axioma_requirements_v5.md`, `docs/Axioma_implementation_v5.md`,
-`docs/Axioma_test_specification_v4.md`, `docs/Axioma_design_philosophy.md`. These four supersede
-any earlier v1–v4 docs or prior drafts of this file — if something here conflicts with those docs,
-the docs win; flag it and ask. (v3/v4 requirements/implementation docs are kept in `docs/` for
-history, not deleted — do not treat their presence as ambiguity about which is current.)
+**Source of truth:** `Axioma_requirements_v3.md`, `Axioma_implementation_v3.md`,
+`Axioma_test_specification_v3.md`, `Axioma_design_philosophy.md` (all Rev B, post-architecture-review).
+These four supersede any earlier v1/v2 docs or prior drafts of this file — if something here
+conflicts with those docs, the docs win; flag it and ask.
 
-**v5/v4 status (2026-08-27):** these are the result of `docs/IMPLEMENTATION_KICKOFF.md`'s Phase 0
-doc-consolidation pass — a large body of new capability (Parametrics, Information/Data Architecture,
-Interaction/Timing modeling, Export/Reporting, a documents→draft-model pipeline, compressor
-subsystem requirements, and a full turbofan ADSG system model + Mode B design-space representation)
-is now **accepted spec**, not yet implemented. See the Data model and Roadmap sections below for
-what that adds. `docs/claude/*.md` holds the original amendment/analysis docs this pass merged, kept
-for history.
+> **Sync note (added when this file was copied into `docs/` from the project on 2026-08-27):**
+> `Axioma_requirements_v3.md`/`Axioma_implementation_v3.md` have since been superseded by
+> **`Axioma_requirements_v4.md`/`Axioma_implementation_v4.md`** (Rev C — adds Program & Subsystem
+> Lifecycle Tracking, FR-PM group) — also now in this `docs/` folder. Treat v4 as current source of
+> truth; v3 is kept for history. In addition, six amendment documents in `docs/claude/` are drafted
+> but **not yet folded into** the v4 docs — read them alongside v4, not instead of it. See
+> `docs/IMPLEMENTATION_KICKOFF.md` for the current priority order.
 
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2
@@ -85,14 +84,11 @@ global acyclicity.
 - **Edges:** `contains` (acyclic only), `Satisfy`/`Verify`/`Refine`, `causes`/`mitigatedBy`,
   `validatedBy`, `Suspect`. Edges carry metadata (stereotype, multiplicity, provenance).
 
-**Confirmed spec, not yet implemented (v5, reqs §2.6–§2.11/§5.9–§5.17):** node labels
-`:Constraint`/`:Parameter` (Parametrics), `:InformationElement` (Info/Data Architecture),
-`:Interaction`/`:InteractionFragment` (pending ADR-009 on the SysML v2 mapping), `:Collection`
-(Dynamic/Static element collections), `:CandidateStructureSuggestion` (proposal-scoped only,
-document-import), `:Function`/`:SelectionChoice`/`:ConnectionChoice` (Mode B architecture
-design-space, FR-ARCH); edge types `Bound`, `Derive`, `Copy`, `member`, `derives` (cycles
-permitted), `incompatibleWith`, `choiceConstraint`. Full detail in
-`docs/Axioma_implementation_v5.md` §2.3.
+> **Pending additions (not yet merged):** `docs/claude/Axioma_gap_closure_amendment.md` adds
+> `:Constraint`/`:Parameter`/`:InformationElement`/`:Interaction`/`:Collection` + `Derive`/`Copy`/`Bound`/`member`
+> edges. `docs/claude/Axioma_turbofan_system_model_amendment.md` Part 3 adds `:Function`/`:SelectionChoice`/
+> `:ConnectionChoice` + `derives`/`incompatibleWith`/`choiceConstraint` edges. `docs/claude/Axioma_document_import_pipeline_amendment.md`
+> adds a `citation`/`confidence` property set and `:CandidateStructureSuggestion`.
 
 ## Non-negotiable architectural rules
 1. **Convergence ≠ validity.** The CRDT layer only guarantees clients converge to the same
@@ -152,39 +148,22 @@ test-validated — corner badge), **Staleness** (current / `Suspect` — red pul
 **Product 1:**
 1. **P1.1 Core Graph (Mo 1–2):** KerML/SysML v2 meta-model incl. Hazard/Control/Mission/
    Stakeholder; polyglot persistence wired; CRUD + semantic-validation layer; Git versioning;
-   ReqIF/SysML v2 import. *Also here (v5): `:InformationElement`/`:Constraint`/`:Parameter`,
-   `Derive`/`Copy` edges — pure data-model additions.*
+   ReqIF/SysML v2 import.
 2. **P1.2 IDE Experience (Mo 3–4):** Monaco + LSP; canvas with viewport virtualization;
-   Hazard/Risk panel; Mission timeline; provenance visual language scaffolding. *Also here (v5):
-   Dynamic/Static Collections (FR-CORE-10/11), Swimlane allocation + orphan-Action validation
-   (FR-CORE-12/13).*
+   Hazard/Risk panel; Mission timeline; provenance visual language scaffolding.
 3. **P1.3 Digital Thread (Mo 5):** budgeted traceability + change-impact; standards-aligned
-   safety reporting (ARP4761 / MIL-STD-882 / ISO 26262). *Also here (v5): diagram/table export
-   (FR-EXPORT-01/02), the full documents→draft-model pipeline (FR-CORE-14…18).*
+   safety reporting (ARP4761 / MIL-STD-882 / ISO 26262).
 4. **P1.4 Behavioral Simulation + Pilot (Mo 6):** `fuml-runtime` execution via gRPC;
-   `alf-lite` for the pilot's behaviors; 1M-element load fixture in CI. *Also here (v5):
-   Interaction/timing modeling (FR-INTX, pending ADR-009), Parametrics evaluation (FR-PARAM).*
+   `alf-lite` for the pilot's behaviors; 1M-element load fixture in CI.
 
 **Mode A fast-follow** (after P1 stable): grounded copilot, part search, requirement linting.
-*Also here (v5): report generation + file attachments (FR-EXPORT-03/04) — no hard phase
-dependency, lowest urgency of the merged groups.*
 
 **Product 2 (independent track):**
 5. **P2.1 Mode B (Mo 7–9):** `cem-core` optimizer, trade-study runner, Interface Contract schema.
-   **[v5, re-scoping flag]** This estimate predates the FR-ARCH gap (Mode B's architecture
-   design-space representation — what it actually searches over, reqs §5.17). FR-ARCH-01…06,
-   FR-COMP-01…06 (compressor requirements), and ADR-011's spike (adopt `adsg-core`+`SBArchOpt`
-   behind a Python gRPC sidecar, MIT-licensed, mirrors the `fuml-runtime` pattern) belong here —
-   **re-scope Mo 7–9 once the spike runs, don't assume it fits unchanged.**
 6. **P2.2 Contract + Autonomy + Review (Mo 9–10):** proposal/branch workflow, L0–L4 autonomy.
-   *Also here (v5): FR-ARCH-07/08 (architecture instance generation/comparison, non-convergent
-   handling) alongside the proposal/branch workflow.*
 7. **P2.3 Mode C — one subsystem (Mo 11–14, research-risk):** Fan & LP Compression casing/mounts
    (structural-only), one external FEA solver, end-to-end.
 8. **P2.4 Expand (Mo 15+):** more subsystems, increasing physics complexity.
-
-**FR-COMP/FR-ARCH have no test-spec rows yet** (unlike every other v5 addition) — authoring them
-is `docs/IMPLEMENTATION_KICKOFF.md` Phase 6 work, not done as part of the Phase 0 doc merge.
 
 ## Working conventions
 - Check the **ADR log** (implementation doc §2.5) before making any technology decision —
@@ -197,7 +176,7 @@ is `docs/IMPLEMENTATION_KICKOFF.md` Phase 6 work, not done as part of the Phase 
   don't introduce bespoke REST for a new external-tool boundary.
 - Run `cargo clippy` + `cargo fmt` and Biome checks before considering work done.
 
-## Testing expectations (see `Axioma_test_specification_v4.md` for the full suite)
+## Testing expectations (see `Axioma_test_specification_v3.md` for the full suite)
 Tests run against a shared reference fixture, **`Turbofan-Ref`**, grown per phase, plus a
 synthetic 1M-element **`Turbofan-Scale`** fixture for performance-only tests. Each test has
 binary PASS/FAIL criteria with numeric thresholds where the source NFR defines one. Examples:
@@ -209,5 +188,3 @@ binary PASS/FAIL criteria with numeric thresholds where the source NFR defines o
 - `alf-lite`: each supported construct needs a golden test (source → fUML → executed trace);
   an out-of-subset construct must yield a precise compile error, never a silent partial compile.
 - Deterministic replay: 100 identical simulation runs produce identical results.
-
-

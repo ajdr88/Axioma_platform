@@ -1,22 +1,24 @@
 # Axioma: Test Specification (Turbofan Pilot)
 
-**Version:** 3.0
-**Status:** Draft for Architecture Review — Rev B
-**Companion documents:** Axioma_requirements_v3.md, Axioma_implementation_v3.md
+**Version:** 4.0
+**Status:** Draft — Phase 0 doc-consolidation pass
+**Supersedes:** Axioma_test_specification_v3.md
+**Companion documents:** Axioma_requirements_v5.md, Axioma_implementation_v5.md
 **Scope:** One acceptance-level test per implementation step, expressed against a single running example — the **turbofan engine** SoI and its five reference subsystems (Fan & LP Compression, Core/HP Compressor, Combustor, Turbine HP&LP, Control/FADEC). Each test states a concrete setup, the action, and **binary PASS/FAIL criteria** with numeric thresholds where the source NFR defines one.
+**Change basis (v4):** Renamed from v3 per `docs/IMPLEMENTATION_KICKOFF.md` Phase 0's own recommendation ("candidate for a v4 rename... given the volume of additions"). All v3 tests carried forward unchanged; new tests appended for every FR group merged into `Axioma_requirements_v5.md` that already specifies concrete test scenarios (`FR-PARAM`, `FR-INFO`, `FR-INTX`, `FR-EXPORT`, `FR-CORE-10/11/12/13`, the amended `FR-CORE-03`, `FR-CORE-14…18`). **`FR-COMP-01…06` and `FR-ARCH-01…08` have no test rows yet** — the amendment that introduced them didn't specify test scenarios the way the others did; authoring those is `IMPLEMENTATION_KICKOFF.md` Phase 6 work, not done in this pass.
 
 ---
 
 ## 0. Conventions
 
 * **Running fixture — `Turbofan-Ref`.** A shared, versioned reference model reused across phases and grown as phases unlock features:
-  - **P1.1+** structural: `Engine` block composed of the five subsystem blocks, each with the ports from Axioma_requirements_v3.md §5.5.
+  - **P1.1+** structural: `Engine` block composed of the five subsystem blocks, each with the ports from Axioma_requirements_v5.md §5.5.
   - **P1.2+** a top requirement `REQ-THRUST` ("Engine shall provide ≥ 30,000 lbf takeoff thrust") and `REQ-SFC` ("... below a specified fuel rate"), plus one `Hazard` (`HAZ-OVERSPEED`) and one `Mission` (`MSN-CLIMB`).
   - **P1.4+** a State Machine for the Control subsystem (`Idle → Armed → Running → Shutdown`).
   - **P2+** the `Turbine` and `Fan` Interface Contracts.
 * **`Turbofan-Scale`.** A synthetic 1,000,000-element engine model (five subsystems recursively elaborated to part level) used only for performance/scale tests (NFR-PERF-06).
 * **Result states.** A test is **PASS** only if *all* listed criteria hold; any single failed criterion is **FAIL**. "Observed via" names where evidence is captured (API response, audit log, trace, screenshot-diff).
-* **Traceability.** Each test cites the requirement(s) it verifies; the reverse mapping lives in Axioma_implementation_v3.md §7.
+* **Traceability.** Each test cites the requirement(s) it verifies; the reverse mapping lives in Axioma_implementation_v5.md §7.
 
 ---
 
@@ -82,6 +84,27 @@
 **PASS:** p95 element-create < 100 ms; p50 < 50 ms; zero errors.
 **FAIL:** p95 ≥ 100 ms or any error.
 
+### T-CORE-03-EXT — Requirements dependency taxonomy (`Derive`/`Copy`) **[REV-D]**
+**Verifies:** FR-CORE-03 (amended)
+**Setup:** `Turbofan-Ref` with `REQ-THRUST` and a lower-level requirement `REQ-LOW` feeding into it.
+**Action:** Create a `Derive` edge from `REQ-LOW` to `REQ-THRUST`, and a `Copy` edge duplicating `REQ-LOW` into another scope.
+**PASS:** Both edges queryable via the same traceability endpoint as Satisfy/Verify/Refine; `Derive` is distinguishable from a Containment edge in query results.
+**FAIL:** Edge type not persisted, or indistinguishable from Containment.
+
+### T-INFO-01 — Information element modeling & specialization **[REV-D]**
+**Verifies:** FR-INFO-01, FR-INFO-02
+**Setup:** Empty information-architecture view.
+**Action:** Create an Information Element `ControlData` at Conceptual level; specialize to a Logical element `PowerLevelParam` with a custom Data Type `Watts`.
+**PASS:** Specialization traceable; `Watts` Data Type usable to type a Value Property elsewhere in the model.
+**FAIL:** Specialization edge missing, or Data Type not reusable outside its defining scope.
+
+### T-INFO-02 — Information flow typing **[REV-D]**
+**Verifies:** FR-INFO-04
+**Setup:** Two Actions connected by an Object Flow.
+**Action:** Type the flow using an Information Element.
+**PASS:** Flow's typed content is queryable back to the Information Element (not an untyped string label).
+**FAIL:** Flow content is a free-text label with no graph link.
+
 ---
 
 ## Phase P1.2 — IDE Experience
@@ -145,6 +168,20 @@
 **PASS:** the two render with distinct origin encodings (border style per §6.3); the filter shows only the AI-suggested block.
 **FAIL:** indistinguishable rendering or incorrect filter result.
 
+### T-CORE-10-01 — Dynamic Query live re-evaluation **[REV-D]**
+**Verifies:** FR-CORE-10
+**Setup:** `Turbofan-Ref`.
+**Action:** Save a Dynamic Query for "all Blocks with stereotype `subsystem`"; add a new matching Block after save.
+**PASS:** New Block appears in the collection on next re-evaluation without manual action.
+**FAIL:** New Block absent, or the query required unbounded traversal (should be rejected per NFR-PERF-04, not silently allowed).
+
+### T-CORE-12-01 — Swimlane allocation & orphan-Action rejection **[REV-D]**
+**Verifies:** FR-CORE-12, FR-CORE-13
+**Setup:** An Activity-equivalent diagram with 3 Swimlanes allocated to 3 of the five subsystem Blocks.
+**Action:** Add an Action with no incoming/outgoing flow.
+**PASS:** Orphan Action rejected per FR-CORE-13; allocated Actions show the correct owning-Block stereotype.
+**FAIL:** Orphan Action silently accepted, or allocation not visible/queryable.
+
 ---
 
 ## Phase P1.3 — Digital Thread
@@ -183,6 +220,76 @@
 **Action:** Run the mission-coverage check.
 **PASS:** the one orphan requirement is flagged; all Mission→Requirement→Block chains resolve.
 **FAIL:** orphan not flagged, or a valid chain not resolved.
+
+### T-EXPORT-01 — Full-diagram image export at scale **[REV-D]**
+**Verifies:** FR-EXPORT-01
+**Setup:** A 500-element diagram (the `Turbine` expansion fixture from T-P1.2-03).
+**Action:** Export as PNG at full extent, not just viewport.
+**PASS:** Full diagram rendered server-side; client does not need to instantiate all 500 elements to trigger it.
+**FAIL:** Export limited to visible viewport, or client-side memory spike.
+
+### T-EXPORT-02 — Filtered tabular export **[REV-D]**
+**Verifies:** FR-EXPORT-02
+**Setup:** A 50-requirement Requirements Table (T-P1.1-06's imported set).
+**Action:** Filter to 10 requirements and 4 of 8 columns; export to XLSX.
+**PASS:** Exported file matches exactly the filtered/column-selected view.
+**FAIL:** Export includes unfiltered rows/columns.
+
+### T-EXPORT-03 — Model report generation, shared template mechanism **[REV-D]**
+**Verifies:** FR-EXPORT-03
+**Setup:** `MSN-CLIMB` with its linked Requirements.
+**Action:** Generate a report scoped to the Mission.
+**PASS:** Includes the Mission's Requirements and scenario reference; uses the same template mechanism as FR-SAFE-05 (verified: no second, divergent template engine in the codebase).
+**FAIL:** Missing content, or a parallel/divergent report pipeline exists.
+
+### T-DOCIMPORT-01 — Document requirement extraction **[REV-D]**
+**Verifies:** FR-CORE-14
+**Setup:** Upload a 10-page turbofan requirements PDF with 20 clear "shall" statements.
+**Action:** `POST /import/documents`; poll job status.
+**PASS:** Job completes; 20 `Requirement` candidates produced, each with name/ID/text/category.
+**FAIL:** Any statement dropped without being surfaced as low-confidence (FR-CORE-18), or the job blocks synchronously instead of running as a job.
+
+### T-DOCIMPORT-02 — Citation & generation provenance **[REV-D]**
+**Verifies:** FR-CORE-15
+**Setup:** A completed extraction job from T-DOCIMPORT-01.
+**Action:** Inspect a drafted Requirement's provenance via `GET /import/documents/{jobId}/candidates`.
+**PASS:** Citation present (page + offset where extractable); LLM generation provenance fields all present; missing any one of these fails validation before the proposal is created.
+**FAIL:** Requirement reaches the review UI with a missing citation or missing generation provenance.
+
+### T-DOCIMPORT-03 — Review-gate reuse (`document-import` origin) **[REV-D]**
+**Verifies:** FR-CORE-16
+**Setup:** A completed extraction job.
+**Action:** `POST /import/documents/{jobId}/proposal`; open the resulting proposal.
+**PASS:** Proposal appears via the existing `GET /cem/proposals/{branchId}` endpoint with `origin: document-import`, `autonomyLevel: n/a`; accept/reject works identically to a `human-authored` or `cem-generated` proposal.
+**FAIL:** A second, divergent review UI/endpoint exists for document-import proposals.
+
+### T-DOCIMPORT-04 — Candidate structure suggestions, non-binding **[REV-D]**
+**Verifies:** FR-CORE-17
+**Setup:** Upload a document that mentions "the Combustor assembly" in prose with no prior Combustor Block in the model.
+**Action:** Inspect `GET /import/documents/{jobId}/suggestions`.
+**PASS:** "Combustor" appears as a candidate structure suggestion, display-only; no `:Structure` element is created automatically.
+**FAIL:** A Block is auto-created without human action.
+
+### T-DOCIMPORT-05 — Low-confidence / malformed extraction handling **[REV-D]**
+**Verifies:** FR-CORE-18
+**Setup:** Upload a document with one requirement split across a page break and one requirement embedded in a table.
+**Action:** Inspect candidates.
+**PASS:** Both are surfaced with a lower confidence score and a flag explaining why, not silently merged incorrectly or dropped.
+**FAIL:** Either statement is missing from the candidate list with no failure/flag recorded.
+
+### T-DOCIMPORT-06 — Product-2 independence **[REV-D]**
+**Verifies:** FR-CORE-14, NFR-CEM-03
+**Setup:** A local-Ollama-only deployment with no CEM services running (`cem-core`/`cem-connectors`/`scheduler` absent).
+**Action:** Run the full pipeline against a reference requirements PDF.
+**PASS:** Pipeline completes successfully — confirms FR-CORE-07 has no hidden Product-2 dependency.
+**FAIL:** Pipeline fails or silently calls a CEM-tier service.
+
+### T-DOCIMPORT-07 — Scanned PDF / OCR **[REV-D]**
+**Verifies:** FR-CORE-14
+**Setup:** A scanned (image-only) PDF of requirements.
+**Action:** Upload; run extraction.
+**PASS:** OCR runs automatically; extraction proceeds without a separate user action.
+**FAIL:** Job fails or requires a manual OCR step outside the platform.
 
 ---
 
@@ -228,6 +335,34 @@
 **Action:** CI loads the fixture and runs the P1.2/P1.3 perf assertions.
 **PASS:** load < 5 s; client memory < 2 GB; all referenced perf budgets green; a regression fails the build.
 **FAIL:** any budget breached or the gate not wired into CI.
+
+### T-INTX-01 — Message-based interaction with timing constraint **[REV-D]**
+**Verifies:** FR-INTX-01, FR-INTX-02
+**Setup:** Control (FADEC/EEC) and Turbine (HP & LP) as the two participating Blocks.
+**Action:** Model a 3-step message exchange (arm → ignite → cutoff acknowledgment) with a Duration Constraint between steps 1 and 3.
+**PASS:** Exchange renders in time order; Duration Constraint evaluable/checkable against a supplied timing value.
+**FAIL:** Steps unordered, or constraint not attached to the correct pair of points.
+
+### T-INTX-02 — Bounded loop sub-interaction **[REV-D]**
+**Verifies:** FR-INTX-03
+**Setup:** The Interaction from T-INTX-01.
+**Action:** Add a loop sub-sequence (a repeated sensor poll) with a guard condition.
+**PASS:** Guard editable and evaluated at simulation/evaluation time; loop bounded (no infinite-loop acceptance without an explicit bound or budget).
+**FAIL:** Unbounded loop accepted with no safeguard.
+
+### T-PARAM-01 — Constraint definition & binding **[REV-D]**
+**Verifies:** FR-PARAM-01, FR-PARAM-02
+**Setup:** The `Turbine` block, with two Value Properties (`PowerLevel`, `TimeValue`).
+**Action:** Define Constraint `CookEnergy = PowerLevel * TimeValue`; bind to both properties.
+**PASS:** Binding succeeds with type-checked parameters; Constraint appears in the `Turbine` block's Relations.
+**FAIL:** Binding accepted with mismatched types, or Constraint not visible in traceability queries.
+
+### T-PARAM-02 — Parametric evaluation, no CEM dispatch **[REV-D]**
+**Verifies:** FR-PARAM-03
+**Setup:** The Constraint from T-PARAM-01.
+**Action:** Set `PowerLevel=750`, `TimeValue=120`; evaluate.
+**PASS:** Returns `CookEnergy=90000` without invoking `cem-core`/`cem-connectors`/`scheduler` (verified via trace — no spans from those services).
+**FAIL:** Wrong value, or evaluation dispatches to a Product-2 service.
 
 ---
 
@@ -463,13 +598,22 @@
 | :--- | :--- |
 | FR-CORE-01 | T-P1.1-01, T-P1.1-05, T-P1.1-06 |
 | FR-CORE-02 | T-P1.2-01, T-P1.2-03, T-P1.4-05 |
-| FR-CORE-03 | T-P1.3-01, T-P1.3-03 |
+| FR-CORE-03 | T-P1.3-01, T-P1.3-03, T-CORE-03-EXT |
 | FR-CORE-04 | T-P1.4-01, T-P1.4-05 |
 | FR-CORE-05 | T-P1.1-02, T-X-01 |
 | FR-CORE-06 | T-X-01 |
 | FR-CORE-07 | T-P1.1-06 |
 | FR-CORE-08 | T-P1.2-06 |
 | FR-CORE-09 | T-P1.4-02, T-P1.4-03, T-P1.4-04 |
+| **FR-CORE-10** | T-CORE-10-01 |
+| **FR-CORE-11** | T-CORE-10-01 |
+| **FR-CORE-12** | T-CORE-12-01 |
+| **FR-CORE-13** | T-CORE-12-01 |
+| **FR-CORE-14** | T-DOCIMPORT-01, T-DOCIMPORT-06, T-DOCIMPORT-07 |
+| **FR-CORE-15** | T-DOCIMPORT-02 |
+| **FR-CORE-16** | T-DOCIMPORT-03 |
+| **FR-CORE-17** | T-DOCIMPORT-04 |
+| **FR-CORE-18** | T-DOCIMPORT-05 |
 | FR-CEM-01 | T-P2.1-05 |
 | FR-CEM-02 | T-P2.1-01 |
 | FR-CEM-03 | T-P2.3-09 |
@@ -489,6 +633,12 @@
 | FR-CEM-17 | T-P2.2-02 |
 | FR-CEM-18 | T-P2.2-03 |
 | FR-CEM-19 | T-P2.3-03 |
+| **FR-PARAM-01…04** | T-PARAM-01, T-PARAM-02 |
+| **FR-INFO-01…04** | T-INFO-01, T-INFO-02 |
+| **FR-INTX-01…04** | T-INTX-01, T-INTX-02 |
+| **FR-EXPORT-01…04** | T-EXPORT-01, T-EXPORT-02, T-EXPORT-03 |
+| **FR-COMP-01…06** | *none yet — Phase 6* |
+| **FR-ARCH-01…08** | *none yet — Phase 6* |
 | FR-SAFE-01 | T-P1.2-04 |
 | FR-SAFE-02 | T-P1.2-04 |
 | FR-SAFE-03 | T-P1.2-07 |
@@ -510,6 +660,7 @@
 | NFR-REL-04 | T-X-05 |
 | NFR-REL-05 | T-X-06 |
 | NFR-CEM-02 | T-P1.4-01, T-P2.1-01 |
+| NFR-CEM-03 | T-DOCIMPORT-06 |
 | NFR-CEM-04 | T-P2.1-04 |
 | NFR-CEM-05 | T-P2.1-02 |
 | NFR-CEM-06 | T-P2.2-04 |
@@ -521,4 +672,4 @@
 | NFR-COMP-01/02/03/05 | T-X-07 |
 | NFR-COMP-04 | T-P1.1-05 |
 
-**Coverage note:** every FR and NFR in Axioma_requirements_v3.md is verified by at least one test above. Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 rather than a runtime assertion).
+**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` is verified by at least one test above, **except FR-COMP-01…06 and FR-ARCH-01…08**, which have no test-spec rows yet (see this document's header — Phase 6 work, not part of this doc-consolidation pass). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
