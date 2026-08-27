@@ -18,4 +18,17 @@ fn main() {
         .build_server(false)
         .compile_protos(&[proto_path], &["../../packages/fuml-runtime/proto"])
         .expect("compiling fuml_runtime.proto");
+
+    // docs/IMPLEMENTATION_KICKOFF.md Phase 2 (ADR-011) — the cem-archspace Python sidecar's
+    // contract. Same protoc.exe reuse as above; a second, independent proto (own package,
+    // `axioma.archspace`), not merged into fuml_runtime.proto.
+    let archspace_proto_path = "../../packages/cem-archspace/proto/cem_archspace.proto";
+    println!("cargo:rerun-if-changed={archspace_proto_path}");
+    tonic_build::configure()
+        .build_server(false)
+        .compile_protos(
+            &[archspace_proto_path],
+            &["../../packages/cem-archspace/proto"],
+        )
+        .expect("compiling cem_archspace.proto");
 }

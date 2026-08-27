@@ -1,0 +1,8 @@
+# The venv and the protoc-generated Python stubs are regenerated locally (see README.md) /
+# at Docker build time — neither belongs in git, same reasoning as fuml-runtime's own .gitignore
+# for its fetched jars/generated Java sources.
+.venv/
+__pycache__/
+*.pyc
+src/cem_archspace_pb2.py
+src/cem_archspace_pb2_grpc.py

@@ -8,6 +8,7 @@
 //! nouns impl §1 names, made real rather than a `/api/v0/elements` stand-in.
 
 mod alf_ir;
+mod archspace_client;
 mod auth;
 mod autonomy;
 mod control_sim;
@@ -3977,6 +3978,68 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 2 (ADR-011) — the round-trip proof that Phase's own
+    /// text asks for: define the spike's Core (HP) Compressor / Turbine test problem (reqs v5
+    /// §5.16) via `cem-archspace`'s `DefineDesignSpace`, then exercise every RPC against the real
+    /// sidecar. See `packages/cem-archspace/README.md` for the exact same assertions already
+    /// verified directly in Python before this Rust test existed.
+    #[tokio::test]
+    #[ignore = "requires the cem-archspace sidecar running (docker compose up -d cem-archspace, or packages/cem-archspace/run.sh)"]
+    async fn archspace_design_space_round_trips_through_the_sidecar() {
+        let handle_id = archspace_client::define_design_space(
+            archspace_client::spike_compressor_design_space(),
+        )
+        .await
+        .expect("connect to cem-archspace — is the sidecar running?");
+        assert!(!handle_id.is_empty());
+
+        // FR-ARCH-06: a real, computed Imputation Ratio comes back, not a placeholder.
+        let stats = archspace_client::get_design_space_stats(&handle_id)
+            .await
+            .expect("fetching design space stats");
+        assert_eq!(
+            stats.n_design_variables, 4,
+            "the LINKED stage-count constraint should collapse n_HP_stages/n_HP_turbine_stages \
+             into one shared design variable, leaving 4 total (3 selection choices + 1 stage \
+             axis), got {stats:?}"
+        );
+        assert!(
+            stats.imputation_ratio >= 1.0,
+            "imputation ratio should be >= 1.0 (1.0 = no hierarchy), got {}",
+            stats.imputation_ratio
+        );
+        assert!(stats.n_declared > 0 && stats.n_valid > 0 && stats.n_valid <= stats.n_declared);
+
+        // FR-ARCH-05: decoding a random vector returns a real, internally-consistent instance —
+        // the root and every design variable/connector must be present regardless of which
+        // choices got resolved which way.
+        let instance = archspace_client::decode_instance(&handle_id, vec![])
+            .await
+            .expect("decoding a random instance");
+        assert!(!instance.design_vector.is_empty());
+        assert!(instance
+            .present_node_names
+            .contains(&"CoreHpCompressor".to_string()));
+        assert!(instance
+            .present_node_names
+            .contains(&"n_HP_stages".to_string()));
+
+        // ADR-011's other half: SBArchOpt actually consumes the adsg-core-built problem and
+        // optimizes it — a real, non-NaN best objective comes back, not just "did not error".
+        let opt_result = archspace_client::run_optimization(&handle_id, 10, 3, 42)
+            .await
+            .expect("running the optimization RPC");
+        assert!(
+            opt_result.best_objective_value.is_finite(),
+            "expected a real optimized objective value, got {}",
+            opt_result.best_objective_value
+        );
+
+        // A bogus handle must be rejected loudly (NOT_FOUND), never silently.
+        let bogus = archspace_client::get_design_space_stats("does-not-exist").await;
+        assert!(bogus.is_err(), "a bogus handle should be rejected");
     }
 
     /// Compiles `control_sim::golden_alf_transitions` (the pilot's Idle->Armed->Running->Shutdown

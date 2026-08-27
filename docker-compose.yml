@@ -83,6 +83,16 @@ services:
     ports:
       - "50051:50051"
 
+  # docs/IMPLEMENTATION_KICKOFF.md Phase 2 spike (ADR-011) — a Python sidecar wrapping
+  # adsg-core/SBArchOpt for Mode B's architecture design-space representation, driven from
+  # apps/api over gRPC. Same "no health check yet" gap as fuml-runtime above, for the same reason
+  # (no gRPC health-check service registered anywhere in this repo yet) — see
+  # packages/cem-archspace/README.md for what this spike proved and what's still open.
+  cem-archspace:
+    build: ./packages/cem-archspace
+    ports:
+      - "50052:50052"
+
 volumes:
   neo4j-data:
   postgres-data:

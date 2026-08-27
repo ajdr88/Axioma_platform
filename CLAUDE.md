@@ -171,11 +171,14 @@ dependency, lowest urgency of the merged groups.*
 
 **Product 2 (independent track):**
 5. **P2.1 Mode B (Mo 7–9):** `cem-core` optimizer, trade-study runner, Interface Contract schema.
-   **[v5, re-scoping flag]** This estimate predates the FR-ARCH gap (Mode B's architecture
-   design-space representation — what it actually searches over, reqs §5.17). FR-ARCH-01…06,
-   FR-COMP-01…06 (compressor requirements), and ADR-011's spike (adopt `adsg-core`+`SBArchOpt`
-   behind a Python gRPC sidecar, MIT-licensed, mirrors the `fuml-runtime` pattern) belong here —
-   **re-scope Mo 7–9 once the spike runs, don't assume it fits unchanged.**
+   **[v5, re-scoping flag — still open]** This estimate predates the FR-ARCH gap (Mode B's
+   architecture design-space representation — what it actually searches over, reqs §5.17).
+   **ADR-011 is now ratified**: `packages/cem-archspace/` (Python gRPC sidecar, `adsg-core` +
+   `SBArchOpt`, MIT-licensed) is built and verified end-to-end — see its README and impl v5 §10.
+   FR-ARCH-01…06 (wiring it into a real `apps/api` HTTP surface + `cem-core`'s own encode/decode
+   logic) and FR-COMP-01…06 (compressor requirements) still belong in this phase's real build-out.
+   **Don't assume the Mo 7–9 window absorbs that unchanged just because the spike is done** — the
+   spike de-risked *whether* the approach works, not *how long* the real build takes.
 6. **P2.2 Contract + Autonomy + Review (Mo 9–10):** proposal/branch workflow, L0–L4 autonomy.
    *Also here (v5): FR-ARCH-07/08 (architecture instance generation/comparison, non-convergent
    handling) alongside the proposal/branch workflow.*

@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+// P2.2-follow-on (roadmap: docs/IMPLEMENTATION_KICKOFF.md Phase 2, ADR-011) — the gRPC contract
+// between apps/api and the cem-archspace Python sidecar wrapping adsg-core/SBArchOpt for Mode B's
+// architecture design-space representation (reqs v5 §5.17, FR-ARCH). Deliberately a spike-scoped
+// contract: a `DesignSpaceDefinition` models the four primitives the kickoff doc's Phase 2 calls
+// out (design variables, selection choices, connection choices, incompatibility/choice
+// constraints) as explicit message types — not an opaque blob — mirroring how fuml_runtime.proto's
+// compiled-AST messages mirror alf-lite's AST rather than shipping opaque XMI bytes (impl v5
+// §9.5's stated preference, applied here). No persistence, no versioning, no auth — everything is
+// held in-memory server-side per `DesignSpaceHandle`, matching "in-memory ADSG instance" in the
+// kickoff doc's own Phase 2 text. Wiring this into Mode B's real optimize/propose flow, and giving
+// design spaces identity beyond a process-lifetime handle, is P2.1 proper — explicitly not this.
+package axioma.archspace;
+
+service CemArchspace {
+  // Builds a real adsg_core.BasicDSG server-side from the declarative definition and holds it
+  // in-memory keyed by the returned handle. Fails (gRPC INVALID_ARGUMENT) if adsg-core itself
+  // rejects the graph as infeasible (e.g. a self-contradictory incompatibility constraint) --
+  // the same "reject, don't silently accept" discipline sysml-core's own semantic-validation
+  // layer already follows for the rest of the graph.
+  rpc DefineDesignSpace(DesignSpaceDefinition) returns (DesignSpaceHandle);
+
+  // FR-ARCH-06 (Design-Space Health Metrics). Only the metrics adsg_core.GraphProcessor exposes
+  // as plain numbers are populated this pass (n_declared/n_valid/imputation_ratio) -- Correction
+  // Ratio, Correction Fraction, and Max Rate Diversity are real adsg-core concepts but reading
+  // them out requires its own pandas-DataFrame-shaped `get_statistics()` call, deliberately not
+  // wired into this spike's proto surface; see README.md for the honest scope note.
+  rpc GetDesignSpaceStats(DesignSpaceHandle) returns (DesignSpaceStats);
+
+  // FR-ARCH-05 (Design Vector Encode/Decode). An empty `design_vector` asks the server to sample
+  // one at random first (adsg_core.GraphProcessor.get_random_design_vector) before decoding --
+  // covers both "decode this exact vector" and "give me a random valid instance" with one RPC.
+  rpc DecodeInstance(DecodeRequest) returns (ArchitectureInstance);
+
+  // Proves the *other* half of ADR-011 (SBArchOpt actually consumes an adsg-core-built problem
+  // and optimizes it) -- wraps the design space in a DSGEvaluator/DSGArchOptProblem and runs
+  // SBArchOpt's own NSGA-II wrapper (sb_arch_opt.algo.pymoo_interface.get_nsga2) for a fixed
+  // number of generations against the single declared objective.
+  rpc RunOptimization(OptimizeRequest) returns (OptimizeResult);
+}
+
+message DesignVariable {
+  string name = 1;
+  double lower_bound = 2;
+  double upper_bound = 3;
+}
+
+// Pick-one-of-N (FR-ARCH-02). `option_names` become sibling NamedNodes derived from the design
+// space's root node only through this choice -- never pre-wired with a plain derivation edge too,
+// which adsg-core rejects as an infeasible graph (confirmed directly while spiking this).
+message SelectionChoice {
+  string choice_id = 1;
+  repeated string option_names = 2;
+}
+
+// Source-port(s) to target-port(s) (FR-ARCH-03). Connector names must be declared as
+// `connector_names` on the enclosing DesignSpaceDefinition first.
+message ConnectionChoice {
+  string choice_id = 1;
+  repeated string source_connector_names = 2;
+  repeated string target_connector_names = 3;
+}
+
+// Mutual exclusion across named nodes (FR-ARCH-04) -- names must reference selection-choice
+// option names or design-variable names declared elsewhere in the same definition.
+message IncompatibilityConstraint {
+  repeated string node_names = 1;
+}
+
+// Mirrors adsg_core.graph.choice_constraints.ChoiceConstraintType exactly -- confirmed against
+// the real installed API, not the amendment docs' secondhand description.
+enum ChoiceConstraintKind {
+  LINKED = 0;
+  PERMUTATION = 1;
+  UNORDERED = 2;
+  UNORDERED_NOREPL = 3;
+}
+
+// FR-ARCH-04's other half (choice constraints, as opposed to incompatibility constraints).
+// `node_names` reference design-variable names (LINKED is the only kind adsg-core allows on
+// design-variable nodes directly -- confirmed via BasicDSG.constrain_choices's own docstring)
+// or selection-choice option/choice-id names.
+message ChoiceConstraint {
+  ChoiceConstraintKind kind = 1;
+  repeated string node_names = 2;
+}
+
+// Spike-scoped: exactly one objective, direction mirrors adsg_core's MetricNode.direction
+// (-1 = minimize, +1 = maximize). Multi-objective/constraint metrics are real adsg-core/SBArchOpt
+// capability, just not exercised by this pass's single-objective placeholder evaluator.
+message Objective {
+  string name = 1;
+  int32 direction = 2;
+}
+
+message DesignSpaceDefinition {
+  string root_name = 1;
+  repeated string connector_names = 2;
+  repeated DesignVariable design_variables = 3;
+  repeated SelectionChoice selection_choices = 4;
+  repeated ConnectionChoice connection_choices = 5;
+  repeated IncompatibilityConstraint incompatibility_constraints = 6;
+  repeated ChoiceConstraint choice_constraints = 7;
+  Objective objective = 8;
+}
+
+message DesignSpaceHandle {
+  string id = 1;
+}
+
+message DesignSpaceStats {
+  int32 n_design_variables = 1;
+  int64 n_declared = 2;
+  int64 n_valid = 3;
+  double imputation_ratio = 4;
+}
+
+message DecodeRequest {
+  string handle_id = 1;
+  repeated double design_vector = 2;
+}
+
+message ArchitectureInstance {
+  repeated double design_vector = 1;
+  repeated bool is_active = 2;
+  // Every node adsg-core reports as present in the resolved graph instance -- the "which options
+  // actually got chosen" answer, not just the raw numeric vector.
+  repeated string present_node_names = 3;
+}
+
+message OptimizeRequest {
+  string handle_id = 1;
+  int32 population_size = 2;
+  int32 n_generations = 3;
+  int32 seed = 4;
+}
+
+message OptimizeResult {
+  double best_objective_value = 1;
+  repeated double best_design_vector = 2;
+}

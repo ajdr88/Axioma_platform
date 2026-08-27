@@ -25,6 +25,22 @@ the doc set gives a concrete equation, only "deterministic 0D/1D... mass-budget 
 Study's thrust formula elsewhere in this codebase. See `src/lib.rs`'s doc comments for the exact
 formulas and reference constants.
 
-**Explicitly not built here**: the L0–L4 autonomy policy engine and proposal/branch review
-workflow (P2.2's own deliverable — `mode_b::accept` is a direct, unconditional write, not a
-reviewable proposal); any UI; `cem-geometry`/`cem-connectors`/Mode C; the `scheduler`/Campaigns.
+**P2.2 (L0–L4 autonomy, hazard override, proposal/branch review) is also built** —
+`apps/api/src/autonomy.rs`/`mode_b.rs`'s `propose`/`accept_proposal`/`reject_proposal`. This crate
+itself is untouched by that work: autonomy is a review-gate concern layered on top of `optimize`'s
+output, not something `cem-core` needs to know about.
+
+**`docs/IMPLEMENTATION_KICKOFF.md` Phase 2 (ADR-011) is also built and verified** —
+`packages/cem-archspace/`, a Python gRPC sidecar wrapping `adsg-core`/`SBArchOpt` for Mode B's
+architecture *design-space* representation (reqs v5 §5.17, FR-ARCH: what a future, fuller Mode B
+would search over — selection choices, connection choices, incompatibility/choice constraints —
+as opposed to this crate's current fixed parameter-grid enumeration). **This crate is untouched by
+that spike, deliberately**: `cem-core` stays "pure computation, no I/O"; a real FR-ARCH build-out
+would add a `cem-core`-owned client calling into `cem-archspace` (mirroring
+`apps/api/src/archspace_client.rs`'s existing spike client) rather than pulling gRPC/networking
+into this crate directly. See `packages/cem-archspace/README.md` and
+`Axioma_implementation_v5.md` §10 for what the spike proved.
+
+**Explicitly not built here**: any UI; `cem-geometry`/`cem-connectors`/Mode C; the
+`scheduler`/Campaigns; wiring `cem-archspace` into this crate's own `optimize` (P2.1's FR-ARCH
+re-scoping, still open — see `Axioma_implementation_v5.md` §4.1's P2.1 note).

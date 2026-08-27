@@ -1,0 +1,7 @@
+# Pinned to what actually resolved in this spike's venv (`uv pip install`), not guessed —
+# see README.md for how to regenerate this environment.
+adsg-core[opt]==1.4.1
+sb-arch-opt==1.6.3
+grpcio==1.83.0
+grpcio-tools==1.83.0
+protobuf==7.36.0

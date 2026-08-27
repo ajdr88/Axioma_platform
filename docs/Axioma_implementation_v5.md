@@ -172,7 +172,7 @@ This log is the **single source of truth for technology choices**; any conflicti
 | **ADR-008** | **gRPC** is the standard transport for external-tool/process boundaries — the Java fUML sidecar (§9.5), the `cem-connectors` solver adapters, and **[REV-D]** the proposed `cem-archspace` sidecar (ADR-011) all use it; no mixing with bespoke REST. | Accepted |
 | **ADR-009** **[REV-D]** | SysML v2 metaclass mapping for Interaction/timing modeling (FR-INTX group, reqs §5.11). Recommendation: treat the Lifeline/Message *view* as a `diagram-engine` concern, decoupled from the underlying SysML v2 storage representation (option 2 of two evaluated). | Proposed |
 | **ADR-010** **[REV-D]** | Report-template mechanism for FR-EXPORT-03 (reqs §5.12) — generalize FR-SAFE-05's existing safety-register template pipeline rather than building a second one, mirroring the FR-PM-05/FR-CORE-16 "one mechanism, multiple origins" precedent. | Proposed |
-| **ADR-011** **[REV-D]** | Mode B design-space representation (FR-ARCH group, reqs §5.17): **adopt `adsg-core` + `SBArchOpt`** (both MIT-licensed) behind a Python gRPC sidecar (`cem-archspace`, §2.1) as the encoder/optimizer foundation, mirroring the `fuml-runtime` sidecar pattern — rather than a ground-up Rust reimplementation. Updated from an initial "survey needed" placeholder by a live tool-landscape evaluation confirming licensing and capability; no adjacent open-source platform (SysON, the SysML v2 Pilot Implementation, ADORE, Sinelabore) is adoptable wholesale — this is a library-level adoption. Final ratification pending a short spike (same shape as ADR-005's), against a small test problem, before P2.1's estimate is finalized. | Proposed — spike to ratify |
+| **ADR-011** **[REV-D]** | Mode B design-space representation (FR-ARCH group, reqs §5.17): **ADOPT `adsg-core` + `SBArchOpt`** (both MIT-licensed) behind a Python gRPC sidecar (`cem-archspace`, §2.1) as the encoder/optimizer foundation, mirroring the `fuml-runtime` sidecar pattern — rather than a ground-up Rust reimplementation. Spike (§10) confirmed both libraries compose end-to-end over the real gRPC boundary: all four design-space primitives (selection choice, connection choice, incompatibility constraint, `LINKED` choice constraint) round-trip correctly, a real Imputation Ratio (1.333 on the spike's test problem) comes back, and SBArchOpt's NSGA-II genuinely drives an adsg-core-built evaluation loop to a real optimized result. | **Ratified — spike complete, see §10** |
 | **ADR-012** **[REV-D]** | Confirm `llm-gateway` as a Product-1-tier shared dependency (not CEM-exclusive, §2.1), and confirm local-Ollama-by-default satisfies a CEM-absent, Product-1-only deployment's need for the documents→draft-model pipeline (reqs §5.14). | Proposed |
 
 *(This revision resolves a numbering collision in its source material: two independently-drafted amendments each proposed their own "ADR-011" — one for the adsg-core/SBArchOpt decision above, one for the llm-gateway confirmation now at ADR-012. See `Axioma_requirements_v5.md`'s header.)*
@@ -272,7 +272,7 @@ The roadmap is no longer a single linear sequence. Product 1 ships independently
 **Mode A fast-follow (after P1 stable):** grounded copilot, part search, requirement linting, docs→draft-model import. Delivery-risk. **[REV-D]** FR-EXPORT-03/04 (report generation, attachments) can land opportunistically anywhere after P1.3 — no hard phase dependency, lowest-risk/lowest-urgency of the merged groups.
 
 **Product 2 — CEM (independent track):**
-* **P2.1 Mode B (Mo 7–9):** `cem-core` deterministic optimizer; trade-study runner; Interface Contract schema. **[REV-D — re-scoping flag]** This estimate was set before the FR-ARCH gap (design-space/optimizer representation, reqs §5.17) was identified. FR-ARCH-01…06 and ADR-011's sidecar spike belong here — this *is* what "deterministic optimizer; trade-study runner" currently under-specifies. **Re-scope the Mo 7–9 window once ADR-011's spike runs; do not assume it absorbs this unchanged.** FR-COMP-01…06 (compressor-subsystem requirements, reqs §5.15/§5.16) also belong here as concrete content against this same design-space model.
+* **P2.1 Mode B (Mo 7–9):** `cem-core` deterministic optimizer; trade-study runner; Interface Contract schema. **[REV-D — re-scoping flag, still open]** This estimate was set before the FR-ARCH gap (design-space/optimizer representation, reqs §5.17) was identified. ADR-011 is now ratified (§10) — the sidecar spike is done, `adsg-core`/`SBArchOpt` are confirmed to work — but re-scoping the Mo 7–9 *estimate* itself is a separate, still-undone task: FR-ARCH-01…06 (wiring `archspace_client.rs` into a real HTTP surface, `cem-core`'s own encode/decode logic against the sidecar) and FR-COMP-01…06 (compressor-subsystem requirements, reqs §5.15/§5.16) both still belong in this phase's actual build-out. **Do not assume the original Mo 7–9 window absorbs this unchanged just because the spike is complete** — the spike de-risked *whether* the approach works, not *how long* building the real thing takes.
 * **P2.2 Contract + Autonomy + Review (Mo 9–10):** proposal/branch workflow; L0–L4 autonomy with Hazard override; generative-path concurrency policy. Validate the Interface Contract manually (humans consume it) before automating Mode C. **[REV-D]** FR-ARCH-07/08 (architecture instance generation/comparison, non-convergent-evaluation handling) are a natural fit alongside the proposal/branch workflow already scheduled here; the `diagram-engine` additions for choice-node interaction/design-space-stats sidebar/instance comparison follow once the schema (§2.3) and API (§1.2a) exist, sequenced within this same window rather than a separate phase.
 * **P2.3 Mode C — one subsystem (Mo 11–14, research-risk):** `cem-geometry` + `cem-connectors` against the Fan & LP Compression subsystem's casing/mounts (coldest, structural-only); one external FEA solver end-to-end; `scheduler` + typed result states live.
 * **P2.4 Expand (Mo 15+):** more subsystems in increasing physics complexity (structural → aero → thermal); more solvers.
@@ -551,3 +551,87 @@ The Rust-backend ↔ Java-fUML-sidecar boundary is a **process boundary regardle
 - *Subset conformance:* each supported construct has a golden test — Alf source → expected fUML → executed by `fuml-runtime` → expected trace.
 - *Unsupported-construct safety:* an out-of-subset construct yields a precise compile error identifying the feature, never a partial/incorrect compile.
 - *Round-trip with the sidecar:* an `alf-lite`-compiled behavior and the same behavior authored directly as fUML produce identical execution traces (confirms `alf-lite` is a faithful front-end, not a divergent semantics).
+
+---
+
+## 10. ADR-011 Resolution: `cem-archspace` Spike Findings **[REV-D]**
+
+`docs/IMPLEMENTATION_KICKOFF.md` Phase 2 called for a spike proving `adsg-core`/`SBArchOpt` can be
+wrapped as a gRPC sidecar (`cem-archspace`, `packages/cem-archspace/`) and round-trip a small
+synthetic design space — the same "spike to ratify" shape ADR-005 used for fUML/Alf (§9). This
+records what was actually built and verified, not what was planned; see
+`packages/cem-archspace/README.md` for the full detail this section summarizes.
+
+### 10.1 What was proven, with real numbers
+
+Every claim below was exercised twice: first directly against the installed libraries in a Python
+REPL, then a second time over the real gRPC wire against the running sidecar (and a third time
+from a Rust integration test, `apps/api/src/main.rs`'s
+`archspace_design_space_round_trips_through_the_sidecar`, against the Dockerized service).
+
+- **All four design-space primitives round-trip correctly**: a selection choice, a connection
+  choice, an incompatibility constraint, and a `LINKED` choice constraint — using the exact test
+  problem `Axioma_sysml_tool_landscape_evaluation.md` itself suggested (Core (HP) Compressor /
+  Turbine stage-count and bleed-offtake choices, reqs v5 §5.16, FR-COMP-04).
+- **The `LINKED` constraint does exactly what FR-COMP-04 needs**: two linked design-variable nodes
+  collapse into one shared search axis (`GraphProcessor.des_vars` reports 4, not 5, for a
+  definition with 2 linked DVs + 3 selection choices) — Mode B only ever has to search one stage-
+  count axis for a linked spool, not two independently.
+- **A real Imputation Ratio**: `1.333...` (32 declared, 24 valid) on this spike's design space —
+  FR-ARCH-06's IR half genuinely computed, not asserted. Correction Ratio/Correction Fraction/Max
+  Rate Diversity are real `adsg-core` concepts too, just not wired into this pass's minimal
+  `DesignSpaceStats` message (see §10.3).
+- **`DecodeInstance` returns a real, internally-consistent architecture instance** — a design
+  vector, an activeness mask, and the actual resolved node names, not merely "no error."
+  Confirms FR-ARCH-05's decode half.
+- **SBArchOpt genuinely drives adsg-core's evaluation loop** — wrapping a `DSGEvaluator` in
+  `adsg_core.optimization.problem.DSGArchOptProblem` and running SBArchOpt's own
+  `get_nsga2()` wrapper for 3 generations converged to a best objective of `1.0688` against a
+  placeholder "minimize stage count" objective whose true minimum is `1.0`. This is ADR-011's
+  *other* half — SBArchOpt actually consumes an adsg-core-built problem, not just "the two
+  libraries are compatible on paper."
+- **Errors surface loudly, not silently**: a bogus design-space handle returns gRPC `NOT_FOUND`;
+  `adsg-core` itself rejecting a malformed definition (e.g. a name referenced before it's declared)
+  surfaces as `INVALID_ARGUMENT` — same "reject, don't silently accept" discipline `sysml-core`'s
+  own semantic-validation layer already follows.
+
+### 10.2 A real, non-obvious finding about `adsg-core`'s actual API
+
+**There is no literal `FUN`/`COMP`/`MULTI`/`NOF`/`DE`/`CON` class hierarchy in `adsg-core`** —
+confirmed by reading `adsg_core/graph/adsg_nodes.py` directly. The library's real node vocabulary
+is `NamedNode`/`ConnectorNode`/`DesignVariableNode`/`MetricNode`; that FUN/COMP/etc. vocabulary is
+Bussemaker's thesis terminology for graph *topology* (derivation edges, choices), not distinct
+Python types. This **validates, rather than contradicts**, reqs v5 §5.17's own design (a
+fulfillment-mechanism *tag* on `:Function`↔`:Structure` edges, not a type hierarchy) — it was the
+right call going in, not a gap this spike needed to fix.
+
+Also found only by building something real, not documented anywhere in the public guide/API-
+reference pages: a selection choice's option nodes (and a connection choice's connectors) must be
+derived **only** through the choice/connection call itself — pre-wiring them with a plain
+derivation edge first, then also passing them as choice options, makes `GraphProcessor` reject the
+whole graph as infeasible.
+
+### 10.3 What's still open (not resolved by this spike, on purpose)
+
+- **Native storage vs. sidecar-owned working representation** — reqs v5 §5.17 and impl v5 §2.3
+  both flagged this as an open question before this spike; it's still open after it. This spike's
+  `cem-archspace` holds every `BasicDSG` in-memory only, keyed by a process-lifetime handle, with
+  no persistence and no sync back into Axioma's own Neo4j graph. **Recommendation based on what
+  actually got built**: keep the sidecar as the working representation for active design-space
+  editing/optimization (matching how `fuml-runtime` never persists execution state either), and
+  only materialize a *resolved architecture instance* (FR-ARCH-07, a chosen candidate) into
+  Axioma's graph as a `:Structure` subgraph — mirroring how Mode B's existing `accept`/`propose`
+  flow (`mode_b.rs`) already treats an accepted candidate, not a live search state, as the thing
+  that gets written to `main`. The unresolved *search space itself* stays sidecar-side.
+- **Correction Ratio / Correction Fraction / Max Rate Diversity** (the other three of FR-ARCH-06's
+  four health metrics) are real `adsg-core` capability (behind `GraphProcessor.get_statistics()`'s
+  richer, `pandas`-DataFrame-shaped output) not yet mapped into `DesignSpaceStats`'s proto fields.
+- **Multi-objective/constraint metrics, hierarchical-BO (`ArchSBO`) instead of plain NSGA-II,
+  Probability-of-Viability hidden-constraint handling (FR-ARCH-08's fuller form)** — all real
+  SBArchOpt/adsg-core capability this spike's single-objective NSGA-II smoke test didn't need to
+  exercise to prove the pipeline works.
+- **Not wired into Mode B's real `optimize`/`propose` flow** — `cem-core` remains untouched by
+  this pass, deliberately: it stays "pure computation, no I/O" (its own README's existing claim).
+  Wiring `archspace_client.rs` into a real `/cem/mode-b/design-space/*` HTTP surface (§1.2a) and
+  building `cem-core`'s own encode/decode logic against it is P2.1 proper's job, now re-scoped
+  (impl §4.1) on the strength of this ratified ADR rather than an unresolved "Proposed" one.
