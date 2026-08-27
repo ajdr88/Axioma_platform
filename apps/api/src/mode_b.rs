@@ -403,6 +403,7 @@ pub async fn propose(
                 &candidate_json,
                 &payload.top_level_requirement_ids,
                 &reason,
+                "cem-generated",
             )
             .await?;
         outcomes.push(ProposeOutcome {

@@ -14,7 +14,19 @@ export type NodeKind =
   | "Control"
   | "Mission"
   | "Stakeholder"
-  | "SimulationRun";
+  | "SimulationRun"
+  // docs/IMPLEMENTATION_KICKOFF.md Phase 1 — mirrors packages/sysml-core/src/lib.rs's NodeKind
+  // exactly; see that enum's own doc comments for what each addition is for.
+  | "Constraint"
+  | "Parameter"
+  | "InformationElement"
+  | "Interaction"
+  | "InteractionFragment"
+  | "Collection"
+  | "CandidateStructureSuggestion"
+  | "Function"
+  | "SelectionChoice"
+  | "ConnectionChoice";
 
 export type EdgeKind =
   | "Contains"
@@ -25,7 +37,15 @@ export type EdgeKind =
   | "MitigatedBy"
   | "ValidatedBy"
   | "Suspect"
-  | "Concerns";
+  | "Concerns"
+  // Phase 1 — mirrors packages/sysml-core/src/lib.rs's EdgeKind exactly.
+  | "Bound"
+  | "Derive"
+  | "Copy"
+  | "Member"
+  | "ArchDerives"
+  | "IncompatibleWith"
+  | "ChoiceConstraint";
 
 /** FR-CORE-08 provenance origin — who/what created an element. */
 export type Origin = "Human" | "AiSuggested" | "AiAutoMerged";

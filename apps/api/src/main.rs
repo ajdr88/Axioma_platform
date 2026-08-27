@@ -2434,6 +2434,22 @@ mod tests {
                 .0;
         assert_eq!(proposals.len(), 4);
         assert!(proposals.iter().all(|p| p.status == "pending"));
+        // docs/IMPLEMENTATION_KICKOFF.md Phase 1: every proposal `mode_b::propose` files is
+        // `cem-generated` -- the only real caller today, confirmed round-tripping through
+        // create_proposal -> list_proposals rather than defaulting silently.
+        assert!(
+            proposals.iter().all(|p| p.origin == "cem-generated"),
+            "{proposals:?}"
+        );
+
+        // Also confirmed via get_proposal directly, not just the list endpoint.
+        let single = state
+            .versioning
+            .get_proposal(&project.id, &proposals[0].id)
+            .await
+            .unwrap()
+            .expect("the just-listed proposal should be fetchable by id");
+        assert_eq!(single.origin, "cem-generated");
     }
 
     /// T-P2.2-02: an `L3` project with a 5% mass-deviation threshold auto-merges a candidate 3%

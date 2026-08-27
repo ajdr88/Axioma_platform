@@ -41,7 +41,7 @@ pub struct Neo4jStore {
 /// Every `NodeKind` label — used to create the `(id, project_id)` index on each one (roadmap:
 /// T-P1.4-06). Cypher can't parameterize a label, so this is a fixed list of statements, not a
 /// loop over a query template with a bound label.
-const ALL_LABELS: [&str; 9] = [
+const ALL_LABELS: [&str; 19] = [
     "Element",
     "Structure",
     "Requirement",
@@ -51,6 +51,21 @@ const ALL_LABELS: [&str; 9] = [
     "Mission",
     "Stakeholder",
     "SimulationRun",
+    // docs/IMPLEMENTATION_KICKOFF.md Phase 1 — added alongside the `NodeKind` variants
+    // themselves (`packages/sysml-core/src/lib.rs`); this const isn't compiler-enforced to stay
+    // in sync with that enum (confirmed directly: the `SimulationRun` precedent, commit
+    // `695cadd`, needed this exact same follow-up fix) — a forgotten entry here means a silent
+    // unindexed label, not a build failure.
+    "Constraint",
+    "Parameter",
+    "InformationElement",
+    "Interaction",
+    "InteractionFragment",
+    "Collection",
+    "CandidateStructureSuggestion",
+    "Function",
+    "SelectionChoice",
+    "ConnectionChoice",
 ];
 
 impl Neo4jStore {
@@ -377,9 +392,12 @@ impl Neo4jStore {
             .with_context(|| format!("deleting element {id}"))
     }
 
-    /// One hop of {`Satisfy`, `Verify`, `Refine`} out of this element (this element is the edge's
-    /// source) — the traceability BFS engine's (`apps/api/src/traceability.rs`) "outgoing"
-    /// direction (FR-CORE-03).
+    /// One hop of {`Satisfy`, `Verify`, `Refine`, `Derive`, `Copy`} out of this element (this
+    /// element is the edge's source) — the traceability BFS engine's
+    /// (`apps/api/src/traceability.rs`) "outgoing" direction (FR-CORE-03). `Derive`/`Copy` added
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 1 (reqs v5 §5.3's amended taxonomy) — required for
+    /// T-CORE-03-EXT's own PASS criterion ("queryable via the same traceability endpoint as
+    /// Satisfy/Verify/Refine") to actually hold.
     pub async fn trace_outgoing_neighbors(
         &self,
         project_id: &str,
@@ -388,9 +406,9 @@ impl Neo4jStore {
         self.trace_neighbors(project_id, id, "->").await
     }
 
-    /// One hop of {`Satisfy`, `Verify`, `Refine`} into this element (this element is the edge's
-    /// target) — "what depends on / satisfies / verifies / refines me," the change-impact
-    /// direction (T-P1.3-01/03).
+    /// One hop of {`Satisfy`, `Verify`, `Refine`, `Derive`, `Copy`} into this element (this
+    /// element is the edge's target) — "what depends on / satisfies / verifies / refines /
+    /// derives-from / copies me," the change-impact direction (T-P1.3-01/03).
     pub async fn trace_incoming_neighbors(
         &self,
         project_id: &str,
@@ -408,10 +426,10 @@ impl Neo4jStore {
         // `arrow` is always one of the two literal strings above, never caller/user input —
         // same "fixed, closed set, safe to interpolate" reasoning as `EdgeKind::as_rel_type`.
         let cypher = if arrow == "->" {
-            "MATCH (a:Element {id: $id, project_id: $project_id})-[r:SATISFY|VERIFY|REFINE]->\
+            "MATCH (a:Element {id: $id, project_id: $project_id})-[r:SATISFY|VERIFY|REFINE|DERIVE|COPY]->\
              (b:Element {project_id: $project_id}) RETURN b.id AS neighbor_id, type(r) AS rel_type"
         } else {
-            "MATCH (a:Element {id: $id, project_id: $project_id})<-[r:SATISFY|VERIFY|REFINE]-\
+            "MATCH (a:Element {id: $id, project_id: $project_id})<-[r:SATISFY|VERIFY|REFINE|DERIVE|COPY]-\
              (b:Element {project_id: $project_id}) RETURN b.id AS neighbor_id, type(r) AS rel_type"
         };
         let mut result = self

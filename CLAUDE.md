@@ -10,9 +10,11 @@ history, not deleted — do not treat their presence as ambiguity about which is
 doc-consolidation pass — a large body of new capability (Parametrics, Information/Data Architecture,
 Interaction/Timing modeling, Export/Reporting, a documents→draft-model pipeline, compressor
 subsystem requirements, and a full turbofan ADSG system model + Mode B design-space representation)
-is now **accepted spec**, not yet implemented. See the Data model and Roadmap sections below for
-what that adds. `docs/claude/*.md` holds the original amendment/analysis docs this pass merged, kept
-for history.
+became **accepted spec** there. Since then: **Phase 1** (schema — new node/edge types, see Data
+model below) and **Phase 2** (the `adsg-core`/`SBArchOpt` sidecar spike, `packages/cem-archspace/`,
+ADR-011 ratified) are both built and verified. Phases 3–6 (content authoring, turbofan instance
+seeding, UI/API surface, test-scenario authoring) are still open. `docs/claude/*.md` holds the
+original amendment/analysis docs Phase 0 merged, kept for history.
 
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2
@@ -81,18 +83,25 @@ legitimately form cycles. All traversal must use visited-set cycle detection, ne
 global acyclicity.
 
 - **Node labels:** `:Element` (base), `:Structure`, `:Requirement`, `:Port`, `:Hazard`,
-  `:Control`, `:Mission`, `:Stakeholder`, `:SimulationRun`.
+  `:Control`, `:Mission`, `:Stakeholder`, `:SimulationRun`; plus (v5, `docs/IMPLEMENTATION_KICKOFF.md`
+  Phase 1) `:Constraint`/`:Parameter` (Parametrics), `:InformationElement` (Info/Data
+  Architecture), `:Interaction`/`:InteractionFragment` (pending ADR-009 on the SysML v2 mapping),
+  `:Collection` (Dynamic/Static element collections), `:CandidateStructureSuggestion`
+  (proposal-scoped only, document-import), `:Function`/`:SelectionChoice`/`:ConnectionChoice`
+  (Mode B architecture design-space, FR-ARCH).
 - **Edges:** `contains` (acyclic only), `Satisfy`/`Verify`/`Refine`, `causes`/`mitigatedBy`,
-  `validatedBy`, `Suspect`. Edges carry metadata (stereotype, multiplicity, provenance).
+  `validatedBy`, `Suspect`; plus (v5, Phase 1) `Bound`, `Derive`, `Copy`, `Member`, `ArchDerives`
+  (cycles permitted — **renamed from the spec's own `derives`**, which collided with `Derive`
+  above; see `packages/sysml-core/src/lib.rs::EdgeKind::ArchDerives`'s doc comment),
+  `IncompatibleWith`, `ChoiceConstraint`. Edges carry metadata (stereotype, multiplicity,
+  provenance).
 
-**Confirmed spec, not yet implemented (v5, reqs §2.6–§2.11/§5.9–§5.17):** node labels
-`:Constraint`/`:Parameter` (Parametrics), `:InformationElement` (Info/Data Architecture),
-`:Interaction`/`:InteractionFragment` (pending ADR-009 on the SysML v2 mapping), `:Collection`
-(Dynamic/Static element collections), `:CandidateStructureSuggestion` (proposal-scoped only,
-document-import), `:Function`/`:SelectionChoice`/`:ConnectionChoice` (Mode B architecture
-design-space, FR-ARCH); edge types `Bound`, `Derive`, `Copy`, `member`, `derives` (cycles
-permitted), `incompatibleWith`, `choiceConstraint`. Full detail in
-`docs/Axioma_implementation_v5.md` §2.3.
+All of the above are real `NodeKind`/`EdgeKind` variants in `packages/sysml-core/src/lib.rs` today
+(with `sysml-textual`'s keyword mapping and `packages/shared-types` kept in sync) — not aspirational.
+Full detail, including which of the new edges got a real endpoint-legality rule vs. stayed
+deliberately kind-unconstrained, in `docs/Axioma_implementation_v5.md` §2.3. **Not yet done**:
+FR-CORE-12/13 (orphan-Action rejection) — blocked on an Action/Activity `NodeKind` decision no
+merged doc makes yet, flagged there rather than guessed.
 
 ## Non-negotiable architectural rules
 1. **Convergence ≠ validity.** The CRDT layer only guarantees clients converge to the same

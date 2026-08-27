@@ -23,6 +23,30 @@ pub enum NodeKind {
     Mission,
     Stakeholder,
     SimulationRun,
+    // docs/IMPLEMENTATION_KICKOFF.md Phase 1 — Parametrics (FR-PARAM, reqs v5 §5.9).
+    Constraint,
+    Parameter,
+    // Phase 1 — Information/Data Architecture (FR-INFO, reqs v5 §5.10).
+    InformationElement,
+    // Phase 1 — Interaction/Timing Modeling (FR-INTX, reqs v5 §5.11). Underlying SysML v2
+    // mapping is still pending ADR-009 — these two kinds exist so the rest of the schema/
+    // validation layer has something concrete to reference in the meantime.
+    Interaction,
+    InteractionFragment,
+    // Phase 1 — Dynamic Element Collections (FR-CORE-10/11, reqs v5 §5.13).
+    Collection,
+    // Phase 1 — document-import pipeline (FR-CORE-17, reqs v5 §5.14). Proposal-scoped only —
+    // never promoted automatically to `Structure`; enforcing that stays an application-layer
+    // concern (the document-import pipeline itself, not yet built), not this crate's job.
+    CandidateStructureSuggestion,
+    // Phase 1 — Mode B architecture design-space representation (FR-ARCH, reqs v5 §5.17).
+    // Confirmed against adsg-core's own real API during the Phase 2 spike (packages/cem-archspace):
+    // adsg-core itself has no FUN/COMP/MULTI/NOF/DE/CON type hierarchy either — these three kinds
+    // plus edge-level tags (see `EdgeKind`'s own Phase 1 doc comments) are this crate's own,
+    // deliberately topology-driven mirror of that same design, not a gap the spike exposed.
+    Function,
+    SelectionChoice,
+    ConnectionChoice,
 }
 
 /// Provenance origin (FR-CORE-08, impl §6.3) — who/what created an element. Scaffolding only:
@@ -74,6 +98,16 @@ impl NodeKind {
             NodeKind::Mission => "Mission",
             NodeKind::Stakeholder => "Stakeholder",
             NodeKind::SimulationRun => "SimulationRun",
+            NodeKind::Constraint => "Constraint",
+            NodeKind::Parameter => "Parameter",
+            NodeKind::InformationElement => "InformationElement",
+            NodeKind::Interaction => "Interaction",
+            NodeKind::InteractionFragment => "InteractionFragment",
+            NodeKind::Collection => "Collection",
+            NodeKind::CandidateStructureSuggestion => "CandidateStructureSuggestion",
+            NodeKind::Function => "Function",
+            NodeKind::SelectionChoice => "SelectionChoice",
+            NodeKind::ConnectionChoice => "ConnectionChoice",
         }
     }
 
@@ -89,6 +123,16 @@ impl NodeKind {
             "Mission" => Some(NodeKind::Mission),
             "Stakeholder" => Some(NodeKind::Stakeholder),
             "SimulationRun" => Some(NodeKind::SimulationRun),
+            "Constraint" => Some(NodeKind::Constraint),
+            "Parameter" => Some(NodeKind::Parameter),
+            "InformationElement" => Some(NodeKind::InformationElement),
+            "Interaction" => Some(NodeKind::Interaction),
+            "InteractionFragment" => Some(NodeKind::InteractionFragment),
+            "Collection" => Some(NodeKind::Collection),
+            "CandidateStructureSuggestion" => Some(NodeKind::CandidateStructureSuggestion),
+            "Function" => Some(NodeKind::Function),
+            "SelectionChoice" => Some(NodeKind::SelectionChoice),
+            "ConnectionChoice" => Some(NodeKind::ConnectionChoice),
             _ => None,
         }
     }
@@ -109,6 +153,45 @@ pub enum EdgeKind {
     Suspect,
     /// A `Stakeholder`'s link to a `Mission` or `Requirement` it owns (FR-MSN-02).
     Concerns,
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 1 — a Constraint's `Parameter` bound to a Value
+    /// Property of some structural element (FR-PARAM-02, reqs v5 §5.9). Source is always a
+    /// `Parameter`; target is unconstrained (any element can carry the bound property).
+    Bound,
+    /// Phase 1 — a lower-level `Requirement` derived by analysis from a higher-level one
+    /// (FR-CORE-03 amended, reqs v5 §5.3). **Naming note**: reqs v5 §5.3 names this edge
+    /// `Derive`; a *different*, unrelated concept (architecture-choice derivation, cycles
+    /// permitted) is separately named `derives` in impl v5 §2.3's FR-ARCH section — same word,
+    /// two different edges in two different subsystems. Resolved here as two distinct variants:
+    /// this one keeps the `Derive` name (Requirements-only); the FR-ARCH one is `ArchDerives`
+    /// below. Both `Requirement`.
+    Derive,
+    /// Phase 1 — marks a `Requirement` as a duplicate of another, kept discoverable as the same
+    /// underlying requirement content (FR-CORE-03 amended, reqs v5 §5.3). Both `Requirement`.
+    Copy,
+    /// Phase 1 — a `Collection`'s membership edge (FR-CORE-10/11, reqs v5 §5.13), deliberately
+    /// distinct from `Contains` so a Collection can legitimately reference elements from anywhere
+    /// in the graph without threatening `Contains`'s acyclicity guarantee (NFR-REL-02). Source is
+    /// always the `Collection`.
+    Member,
+    /// Phase 1 — Mode B's DSG-style derivation edge (FR-ARCH-01/02, reqs v5 §5.17): "if selected,
+    /// these elements exist." **Renamed from the spec's own `derives`** to avoid colliding with
+    /// `Derive` above (see that variant's doc comment) — same collision-at-implementation-time
+    /// shape this session already resolved for ADR-011/reqs v5 §5.14, documented at the point of
+    /// collision rather than silently. Cycles are explicitly permitted (NFR-REL-02 already allows
+    /// this generally; mutually-dependent architecture-choice derivation is a legitimate, expected
+    /// shape here specifically, confirmed directly against adsg-core's own `derives` edges during
+    /// the Phase 2 spike). Deliberately kind-unconstrained — any DSG-participating node can be
+    /// either endpoint, matching adsg-core's own genericity here.
+    ArchDerives,
+    /// Phase 1 — mutual exclusion between two architecture-choice options (FR-ARCH-04, reqs v5
+    /// §5.17). Undirected in semantics though modeled as a directed edge like everything else in
+    /// this graph (NFR-REL-02's own convention). Kind-unconstrained, same reasoning as
+    /// `ArchDerives`.
+    IncompatibleWith,
+    /// Phase 1 — a Linked/Permutations/Unordered [non-]replacing combination rule across ≥2
+    /// architecture choices (FR-ARCH-04, reqs v5 §5.17; mirrors `adsg_core.ChoiceConstraintType`,
+    /// confirmed during the Phase 2 spike). Kind-unconstrained, same reasoning as `ArchDerives`.
+    ChoiceConstraint,
 }
 
 impl EdgeKind {
@@ -130,6 +213,13 @@ impl EdgeKind {
             EdgeKind::ValidatedBy => "VALIDATED_BY",
             EdgeKind::Suspect => "SUSPECT",
             EdgeKind::Concerns => "CONCERNS",
+            EdgeKind::Bound => "BOUND",
+            EdgeKind::Derive => "DERIVE",
+            EdgeKind::Copy => "COPY",
+            EdgeKind::Member => "MEMBER",
+            EdgeKind::ArchDerives => "ARCH_DERIVES",
+            EdgeKind::IncompatibleWith => "INCOMPATIBLE_WITH",
+            EdgeKind::ChoiceConstraint => "CHOICE_CONSTRAINT",
         }
     }
 
@@ -146,6 +236,13 @@ impl EdgeKind {
             "VALIDATED_BY" => Some(EdgeKind::ValidatedBy),
             "SUSPECT" => Some(EdgeKind::Suspect),
             "CONCERNS" => Some(EdgeKind::Concerns),
+            "BOUND" => Some(EdgeKind::Bound),
+            "DERIVE" => Some(EdgeKind::Derive),
+            "COPY" => Some(EdgeKind::Copy),
+            "MEMBER" => Some(EdgeKind::Member),
+            "ARCH_DERIVES" => Some(EdgeKind::ArchDerives),
+            "INCOMPATIBLE_WITH" => Some(EdgeKind::IncompatibleWith),
+            "CHOICE_CONSTRAINT" => Some(EdgeKind::ChoiceConstraint),
             _ => None,
         }
     }
@@ -258,6 +355,22 @@ impl std::error::Error for ValidationError {}
 /// The Postgres/JSONB side of the polyglot split (NFR-DATA-02): element bodies, long text, and
 /// large metadata. Never held in the graph (topology store) — see `GeometryPointer` for the
 /// object-store equivalent.
+///
+/// `properties` is a deliberately untyped bag (no per-`NodeKind` Rust struct exists, and none is
+/// planned — every existing body property in this codebase, e.g. Hazard's `severity`/
+/// `likelihood`, already works this way). docs/IMPLEMENTATION_KICKOFF.md Phase 1 adds these
+/// conventions on top, documented here rather than as a schema change since none is needed:
+/// - `citation` on a `Requirement`'s body (FR-CORE-15, reqs v5 §5.14): `{ documentId, page,
+///   offset? }`, required when that Requirement's `origin` is `AiSuggested` and it came from the
+///   document-import pipeline (not yet built).
+/// - `confidence` on a `Requirement`'s body (FR-CORE-18): proposal-scoped/transient — describes a
+///   draft, discarded on accept, never persisted to a `Requirement` once it's on `main`.
+/// - An optimization-role tag (`objective`/`constraint`/`generic`, plus a permanence flag) on a
+///   `Constraint`'s body, and a fulfillment-mechanism tag (`DE`/`MULTI`/`NOF`/`CON`/direct `COMP`)
+///   on a `Function`'s body (FR-ARCH, reqs v5 §5.17) — metric/fulfillment roles adsg-core itself
+///   models as edge/node *properties*, not distinct types either (confirmed during the Phase 2
+///   spike), so mirroring that as a body-property convention here rather than new `NodeKind`
+///   variants is deliberate, not a shortcut.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ElementBody {
     pub element_id: ElementId,
@@ -341,6 +454,19 @@ pub fn check_relationship_endpoints(
             source_kind == NodeKind::Stakeholder
                 && matches!(target_kind, NodeKind::Mission | NodeKind::Requirement)
         }
+        // docs/IMPLEMENTATION_KICKOFF.md Phase 1 — same "only encode what the docs concretely
+        // pin down" discipline as Satisfy/Concerns above. `ArchDerives`/`IncompatibleWith`/
+        // `ChoiceConstraint` are deliberately left in the `_ => true` catch-all below: the FR-ARCH
+        // spec (reqs v5 §5.17) keeps them kind-unconstrained on purpose (any DSG-participating
+        // node can be either endpoint), so adding a constraint here would be guessing ahead of it.
+        EdgeKind::Bound => source_kind == NodeKind::Parameter,
+        EdgeKind::Derive => {
+            source_kind == NodeKind::Requirement && target_kind == NodeKind::Requirement
+        }
+        EdgeKind::Copy => {
+            source_kind == NodeKind::Requirement && target_kind == NodeKind::Requirement
+        }
+        EdgeKind::Member => source_kind == NodeKind::Collection,
         _ => true,
     };
     if legal {
@@ -709,6 +835,16 @@ mod tests {
             NodeKind::Mission,
             NodeKind::Stakeholder,
             NodeKind::SimulationRun,
+            NodeKind::Constraint,
+            NodeKind::Parameter,
+            NodeKind::InformationElement,
+            NodeKind::Interaction,
+            NodeKind::InteractionFragment,
+            NodeKind::Collection,
+            NodeKind::CandidateStructureSuggestion,
+            NodeKind::Function,
+            NodeKind::SelectionChoice,
+            NodeKind::ConnectionChoice,
         ] {
             assert_eq!(NodeKind::from_label(kind.as_label()), Some(kind));
         }
@@ -727,10 +863,128 @@ mod tests {
             EdgeKind::ValidatedBy,
             EdgeKind::Suspect,
             EdgeKind::Concerns,
+            EdgeKind::Bound,
+            EdgeKind::Derive,
+            EdgeKind::Copy,
+            EdgeKind::Member,
+            EdgeKind::ArchDerives,
+            EdgeKind::IncompatibleWith,
+            EdgeKind::ChoiceConstraint,
         ] {
             assert_eq!(EdgeKind::from_rel_type(kind.as_rel_type()), Some(kind));
         }
         assert_eq!(EdgeKind::from_rel_type("NOT_A_KIND"), None);
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 1 (FR-PARAM-02): a Constraint's Parameter binds to a
+    /// Value Property of any structural element — source must be a `Parameter`, target is
+    /// unconstrained.
+    #[test]
+    fn accepts_legal_bound_endpoint() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Bound,
+            "BypassRatioParam",
+            NodeKind::Parameter,
+            "FanLpCompression",
+            NodeKind::Structure,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_illegal_bound_endpoint() {
+        assert_eq!(
+            check_relationship_endpoints(
+                EdgeKind::Bound,
+                "FanLpCompression",
+                NodeKind::Structure,
+                "BypassRatioParam",
+                NodeKind::Parameter,
+            ),
+            Err(ValidationError::IllegalEndpoint {
+                kind: EdgeKind::Bound,
+                source: "FanLpCompression".to_string(),
+                source_kind: NodeKind::Structure,
+                target: "BypassRatioParam".to_string(),
+                target_kind: NodeKind::Parameter,
+            })
+        );
+    }
+
+    /// Phase 1 (FR-CORE-03 amended): `Derive`/`Copy` connect two Requirements — a Requirement
+    /// deriving from/copying a Structure is rejected either way.
+    #[test]
+    fn accepts_legal_derive_and_copy_endpoints() {
+        for kind in [EdgeKind::Derive, EdgeKind::Copy] {
+            assert!(check_relationship_endpoints(
+                kind,
+                "REQ-LOW",
+                NodeKind::Requirement,
+                "REQ-THRUST",
+                NodeKind::Requirement,
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_illegal_derive_and_copy_endpoints() {
+        for kind in [EdgeKind::Derive, EdgeKind::Copy] {
+            assert!(check_relationship_endpoints(
+                kind,
+                "REQ-LOW",
+                NodeKind::Requirement,
+                "Turbine",
+                NodeKind::Structure,
+            )
+            .is_err());
+        }
+    }
+
+    /// Phase 1 (FR-CORE-10/11): a `Member` edge's source must be the `Collection` — a plain
+    /// element "member-ing" another plain element (not a Collection) is rejected.
+    #[test]
+    fn accepts_legal_member_endpoint() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Member,
+            "SubsystemBlocks",
+            NodeKind::Collection,
+            "Turbine",
+            NodeKind::Structure,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_illegal_member_endpoint() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Member,
+            "Turbine",
+            NodeKind::Structure,
+            "SubsystemBlocks",
+            NodeKind::Collection,
+        )
+        .is_err());
+    }
+
+    /// Phase 1 (FR-ARCH): `ArchDerives`/`IncompatibleWith`/`ChoiceConstraint` are deliberately
+    /// kind-unconstrained — the spec keeps them generic across any DSG-participating node.
+    #[test]
+    fn accepts_arch_edges_between_any_kinds() {
+        for kind in [
+            EdgeKind::ArchDerives,
+            EdgeKind::IncompatibleWith,
+            EdgeKind::ChoiceConstraint,
+        ] {
+            assert!(check_relationship_endpoints(
+                kind,
+                "GenerateThrust",
+                NodeKind::Function,
+                "IncludeGearbox",
+                NodeKind::SelectionChoice,
+            )
+            .is_ok());
+        }
     }
 
     #[test]

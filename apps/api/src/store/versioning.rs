@@ -285,12 +285,23 @@ async fn create_versioning_tables(conn: &mut sqlx::PgConnection) -> Result<()> {
             candidate JSONB NOT NULL, \
             top_level_requirement_ids JSONB NOT NULL, \
             reason TEXT NOT NULL, \
+            origin TEXT NOT NULL DEFAULT 'cem-generated', \
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
         )",
     )
     .execute(&mut *conn)
     .await
     .context("creating proposals table")?;
+
+    // docs/IMPLEMENTATION_KICKOFF.md Phase 1 — `origin` distinguishes `cem-generated` (P2.2's
+    // only real caller today, `mode_b.rs::propose`) from the still-unbuilt `human-authored`
+    // (FR-PM-05) and `document-import` (FR-CORE-16) origins the merged spec already names.
+    // Migration for pre-existing dev databases (see `region`'s identical pattern above) — the
+    // `proposals` table already existed on this machine from P2.2 work earlier this session.
+    sqlx::query("ALTER TABLE proposals ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'cem-generated'")
+        .execute(&mut *conn)
+        .await
+        .context("adding proposals.origin column")?;
 
     Ok(())
 }
@@ -710,7 +721,10 @@ impl VersioningStore {
     }
 
     /// P2.2 (T-P2.2-01) — one row per subsystem; `reason` is the honest "why does this need
-    /// review" string a UI would surface (see `apps/api/src/autonomy.rs::Decision`).
+    /// review" string a UI would surface (see `apps/api/src/autonomy.rs::Decision`). `origin`
+    /// (docs/IMPLEMENTATION_KICKOFF.md Phase 1) distinguishes `cem-generated` (the only real
+    /// caller today, `mode_b.rs::propose`) from the still-unbuilt `human-authored`/
+    /// `document-import` origins the merged spec already names (FR-PM-05/FR-CORE-16).
     #[allow(clippy::too_many_arguments)]
     pub async fn create_proposal(
         &self,
@@ -720,6 +734,7 @@ impl VersioningStore {
         candidate: &serde_json::Value,
         top_level_requirement_ids: &[String],
         reason: &str,
+        origin: &str,
     ) -> Result<Proposal> {
         let id = uuid::Uuid::new_v4().to_string();
         let requirement_ids_json = serde_json::to_value(top_level_requirement_ids)
@@ -727,8 +742,8 @@ impl VersioningStore {
         sqlx::query(
             "INSERT INTO proposals \
                 (id, project_id, branch_id, subsystem_id, status, candidate, \
-                 top_level_requirement_ids, reason) \
-             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)",
+                 top_level_requirement_ids, reason, origin) \
+             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8)",
         )
         .bind(&id)
         .bind(project_id)
@@ -737,6 +752,7 @@ impl VersioningStore {
         .bind(candidate)
         .bind(&requirement_ids_json)
         .bind(reason)
+        .bind(origin)
         .execute(&self.pool)
         .await
         .context("inserting proposal")?;
@@ -749,6 +765,7 @@ impl VersioningStore {
             candidate: candidate.clone(),
             top_level_requirement_ids: top_level_requirement_ids.to_vec(),
             reason: reason.to_string(),
+            origin: origin.to_string(),
         })
     }
 
@@ -760,9 +777,10 @@ impl VersioningStore {
             serde_json::Value,
             serde_json::Value,
             String,
+            String,
         );
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT id, subsystem_id, status, candidate, top_level_requirement_ids, reason \
+            "SELECT id, subsystem_id, status, candidate, top_level_requirement_ids, reason, origin \
              FROM proposals WHERE project_id = $1 AND branch_id = $2 ORDER BY created_at",
         )
         .bind(project_id)
@@ -772,7 +790,7 @@ impl VersioningStore {
         .context("listing proposals")?;
         rows.into_iter()
             .map(
-                |(id, subsystem_id, status, candidate, requirement_ids_json, reason)| {
+                |(id, subsystem_id, status, candidate, requirement_ids_json, reason, origin)| {
                     let top_level_requirement_ids: Vec<String> =
                         serde_json::from_value(requirement_ids_json)
                             .context("parsing proposal requirement ids")?;
@@ -785,6 +803,7 @@ impl VersioningStore {
                         candidate,
                         top_level_requirement_ids,
                         reason,
+                        origin,
                     })
                 },
             )
@@ -803,9 +822,10 @@ impl VersioningStore {
             serde_json::Value,
             serde_json::Value,
             String,
+            String,
         );
         let row: Option<Row> = sqlx::query_as(
-            "SELECT branch_id, subsystem_id, status, candidate, top_level_requirement_ids, reason \
+            "SELECT branch_id, subsystem_id, status, candidate, top_level_requirement_ids, reason, origin \
              FROM proposals WHERE project_id = $1 AND id = $2",
         )
         .bind(project_id)
@@ -814,7 +834,7 @@ impl VersioningStore {
         .await
         .context("fetching proposal")?;
         row.map(
-            |(branch_id, subsystem_id, status, candidate, requirement_ids_json, reason)| {
+            |(branch_id, subsystem_id, status, candidate, requirement_ids_json, reason, origin)| {
                 let top_level_requirement_ids: Vec<String> =
                     serde_json::from_value(requirement_ids_json)
                         .context("parsing proposal requirement ids")?;
@@ -827,6 +847,7 @@ impl VersioningStore {
                     candidate,
                     top_level_requirement_ids,
                     reason,
+                    origin,
                 })
             },
         )
@@ -869,6 +890,10 @@ pub struct Proposal {
     pub candidate: serde_json::Value,
     pub top_level_requirement_ids: Vec<String>,
     pub reason: String,
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 1 — `cem-generated` today (the only real caller);
+    /// `human-authored`/`document-import` are real spec'd values (FR-PM-05/FR-CORE-16) neither of
+    /// which has a caller yet.
+    pub origin: String,
 }
 
 /// See `list_audit_log`'s own doc comment for why `#[allow(dead_code)]` is warranted here too.
