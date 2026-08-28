@@ -1422,6 +1422,7 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
     });
 
     seed_fr_comp_content(state, project_id, &mut diff_entries).await?;
+    seed_fr_arch_system_model(state, project_id, &mut diff_entries).await?;
 
     Ok(diff_entries)
 }
@@ -1863,6 +1864,745 @@ async fn seed_fr_comp_content(
             )
             .await?;
     }
+
+    Ok(())
+}
+
+/// docs/IMPLEMENTATION_KICKOFF.md Phase 4 — seeds the reconciled 5-subsystem turbofan system
+/// model (reqs v5 §5.16/§5.17) as a real instance: the station 0-8 gas-path Ports the compressor
+/// pair (Phase 3) didn't yet cover, the top-level boundary Functions and their fulfillment
+/// (`:Function`, first real instantiation), the architecture-choice primitives FR-ARCH-01..04
+/// need (`:SelectionChoice`/`:ConnectionChoice`, also first real instantiation, plus one
+/// `IncompatibleWith` and two `ChoiceConstraint` edges), the remaining named per-subsystem design
+/// variables as `:Parameter`s, and finally `Satisfy` edges wiring `REQ-THRUST` (previously
+/// disconnected in this fixture) to the four gas-path subsystems that jointly generate thrust.
+///
+/// **Everything here is a static, versioned description of the design space's fixed structure —
+/// not a live search state.** Per Phase 2's own ratified recommendation (impl v5 §10.3), the
+/// *unresolved* search space stays sidecar-side (`cem-archspace`); only a *resolved* architecture
+/// instance would ever materialize into this graph as a `:Structure` subgraph. This function seeds
+/// neither — it seeds the fixed choice/constraint *definitions* §5.16 documents, the same durable
+/// role this graph already plays for Requirement text or Contains topology.
+///
+/// **A real, minor doc inconsistency, flagged rather than silently resolved**: reqs v5 §5.16's own
+/// prose calls `GenerateThrust`'s decomposition a "five-subsystem gas-path chain," but its own
+/// mermaid diagram's `GT` subgraph includes only four (Fan & LP Compression, Core (HP) Compressor,
+/// Combustor, Turbine (HP & LP) — Control (FADEC/EEC) is not gas-path). The diagram is treated as
+/// authoritative here.
+///
+/// **A real, confirmed schema gap, flagged not invented around**: `EdgeKind::ChoiceConstraint`'s
+/// own doc comment says it "carries a Linked/Permutations/Unordered [non-]replacing type," but
+/// `Edge` (`packages/sysml-core/src/lib.rs`) is `{source, target, kind}` only — no properties
+/// field exists to persist that type anywhere. The two `ChoiceConstraint` edges below are real
+/// (FR-COMP-04, unblocked now that Turbine-side stage-count Parameters exist), but their "Linked"
+/// type lives only in this comment and the docs write-up, not in the graph.
+async fn seed_fr_arch_system_model(
+    state: &AppState,
+    project_id: &str,
+    diff_entries: &mut Vec<DiffEntry>,
+) -> anyhow::Result<()> {
+    struct PortSeed {
+        id: &'static str,
+        name: &'static str,
+        subsystem_id: &'static str,
+        station: Option<u32>,
+        properties: serde_json::Value,
+    }
+
+    let ports = [
+        PortSeed {
+            id: "FanBypassDuctExitPort",
+            name: "Fan & LP Compression bypass duct exit",
+            subsystem_id: "FanLpCompression",
+            station: None,
+            properties: serde_json::json!({
+                "description": "Feeds the nozzle/mixer; carries the MixedNozzle incompatibility constraint (reqs v5 §5.16).",
+            }),
+        },
+        PortSeed {
+            id: "CoreBleedOfftakePort",
+            name: "Core (HP) Compressor bleed-air offtake",
+            subsystem_id: "CoreHpCompressor",
+            station: None,
+            properties: serde_json::json!({
+                "description": "Location per the BleedOfftakeStage selection choice; routed via the BleedAirRouting connection choice.",
+            }),
+        },
+        PortSeed {
+            id: "CombustorInletPort",
+            name: "Combustor inlet (station 3)",
+            subsystem_id: "Combustor",
+            station: Some(3),
+            properties: serde_json::json!({}),
+        },
+        PortSeed {
+            id: "CombustorFuelInjectorPort",
+            name: "Combustor fuel-injector port",
+            subsystem_id: "Combustor",
+            station: None,
+            properties: serde_json::json!({
+                "description": "Fixed connection from Control (FADEC/EEC)'s Fuel Metering Unit -- not a choice. No fixed non-choice port-to-port edge type exists in this schema yet, so this is a documented property only, not a graph edge.",
+            }),
+        },
+        PortSeed {
+            id: "CombustorExitPort",
+            name: "Combustor exit (station 4)",
+            subsystem_id: "Combustor",
+            station: Some(4),
+            properties: serde_json::json!({}),
+        },
+        PortSeed {
+            id: "TurbineHpInletPort",
+            name: "Turbine HP inlet (station 4)",
+            subsystem_id: "TurbineHpLp",
+            station: Some(4),
+            properties: serde_json::json!({}),
+        },
+        PortSeed {
+            id: "TurbineLpInterstagePort",
+            name: "Turbine HP exit / LP inlet (station 5)",
+            subsystem_id: "TurbineHpLp",
+            station: Some(5),
+            properties: serde_json::json!({}),
+        },
+        PortSeed {
+            id: "TurbineExitPort",
+            name: "Turbine LP exit (station 6)",
+            subsystem_id: "TurbineHpLp",
+            station: Some(6),
+            properties: serde_json::json!({}),
+        },
+        PortSeed {
+            id: "NozzleInletPort",
+            name: "Nozzle inlet (station 7)",
+            subsystem_id: "TurbineHpLp",
+            station: Some(7),
+            properties: serde_json::json!({
+                "description": "Nozzle folded into Turbine's exit boundary per the ratified reconciliation decision (reqs v5 §5.16) -- not a 6th subsystem.",
+            }),
+        },
+        PortSeed {
+            id: "NozzleExitPort",
+            name: "Nozzle exit (station 8)",
+            subsystem_id: "TurbineHpLp",
+            station: Some(8),
+            properties: serde_json::json!({}),
+        },
+        PortSeed {
+            id: "ControlAccessoryPort",
+            name: "Control (FADEC/EEC) accessory/generator connection port",
+            subsystem_id: "ControlFadecEec",
+            station: None,
+            properties: serde_json::json!({
+                "description": "Receives Turbine's PowerOfftake via the PowerOfftakeRouting connection choice.",
+            }),
+        },
+    ];
+
+    for p in ports {
+        let mut properties = p.properties.as_object().cloned().unwrap_or_default();
+        if let Some(station) = p.station {
+            properties.insert("station".to_string(), serde_json::json!(station));
+        }
+        let port = Element {
+            id: p.id.to_string(),
+            kind: NodeKind::Port,
+            name: p.name.to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(project_id, &port).await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: port.id.clone(),
+            kind: port.kind,
+            name: port.name.clone(),
+        });
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: p.id.to_string(),
+                    rationale: None,
+                    properties: serde_json::Value::Object(properties),
+                },
+            )
+            .await?;
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: p.subsystem_id.to_string(),
+                    target: p.id.to_string(),
+                    kind: EdgeKind::Contains,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: p.subsystem_id.to_string(),
+            target: p.id.to_string(),
+            kind: EdgeKind::Contains,
+        });
+    }
+
+    // FR-ARCH-02/03: selection/connection choices (`:SelectionChoice`/`:ConnectionChoice`, first
+    // real instantiation of either kind). `options` is a plain JSON array -- there's no dedicated
+    // "option node" mechanism in this schema yet (same "plain JSON, gap flagged" precedent as
+    // Phase 3's Constraint-uses-Parameter list). `resolutionState` matches §5.17's own literal
+    // "unresolved -> partial -> resolved... node-property state machine" spec.
+    struct SelectionChoiceSeed {
+        id: &'static str,
+        name: &'static str,
+        subsystem_id: &'static str,
+        options: &'static [&'static str],
+        incompatibility_note: Option<&'static str>,
+    }
+
+    let selection_choices = [
+        SelectionChoiceSeed {
+            id: "IncludeGearbox",
+            name: "Include Gearbox (Fan & LP Compression)",
+            subsystem_id: "FanLpCompression",
+            options: &["true", "false"],
+            incompatibility_note: None,
+        },
+        SelectionChoiceSeed {
+            id: "BleedOfftakeStage",
+            name: "Bleed Offtake Stage (Core (HP) Compressor)",
+            subsystem_id: "CoreHpCompressor",
+            options: &["stage 1..n_HP_stages (illustrative set: stage 1, stage 2, stage 3)"],
+            incompatibility_note: None,
+        },
+        SelectionChoiceSeed {
+            id: "PowerOfftake",
+            name: "Power-Offtake Shaft (Turbine (HP & LP))",
+            subsystem_id: "TurbineHpLp",
+            options: &["HP shaft", "LP shaft"],
+            incompatibility_note: None,
+        },
+        SelectionChoiceSeed {
+            id: "MixedNozzle",
+            name: "Mixed vs. Separate-Flow Nozzle (Turbine (HP & LP))",
+            subsystem_id: "TurbineHpLp",
+            options: &["mixed", "separate"],
+            incompatibility_note: Some(
+                "MixedNozzle=true (mixed exhaust) excludes independently-configured separate \
+                 core/bypass nozzle fulfillment via Fan & LP Compression's \
+                 FanBypassDuctExitPort, and vice versa (reqs v5 §5.16) -- see this element's \
+                 IncompatibleWith edge to that port.",
+            ),
+        },
+    ];
+
+    for sc in selection_choices {
+        let element = Element {
+            id: sc.id.to_string(),
+            kind: NodeKind::SelectionChoice,
+            name: sc.name.to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(project_id, &element).await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: element.id.clone(),
+            kind: element.kind,
+            name: element.name.clone(),
+        });
+        let mut properties = serde_json::Map::new();
+        properties.insert("options".to_string(), serde_json::json!(sc.options));
+        properties.insert(
+            "resolutionState".to_string(),
+            serde_json::json!("unresolved"),
+        );
+        if let Some(note) = sc.incompatibility_note {
+            properties.insert("incompatibilityNote".to_string(), serde_json::json!(note));
+        }
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: sc.id.to_string(),
+                    rationale: None,
+                    properties: serde_json::Value::Object(properties),
+                },
+            )
+            .await?;
+        // Scopes the choice to the subsystem it's part of. `ArchDerives` is deliberately
+        // kind-unconstrained (packages/sysml-core/src/lib.rs) -- a real DSG's own option-derivation
+        // edges (adsg-core's `derives`) are out of scope for this static seed; see this function's
+        // own doc comment.
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: sc.id.to_string(),
+                    target: sc.subsystem_id.to_string(),
+                    kind: EdgeKind::ArchDerives,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: sc.id.to_string(),
+            target: sc.subsystem_id.to_string(),
+            kind: EdgeKind::ArchDerives,
+        });
+    }
+
+    struct ConnectionChoiceSeed {
+        id: &'static str,
+        name: &'static str,
+        properties: serde_json::Value,
+    }
+
+    let connection_choices = [
+        ConnectionChoiceSeed {
+            id: "BleedAirRouting",
+            name: "Bleed-Air Routing",
+            properties: serde_json::json!({
+                "sourcePortId": "CoreBleedOfftakePort",
+                "targetBoundary": "external ECS/airframe port -- outside the engine System-of-Interest (reqs v5 §5.16's reconciliation table), so no target Port element exists for it",
+                "cardinality": "single connection",
+            }),
+        },
+        ConnectionChoiceSeed {
+            id: "PowerOfftakeRouting",
+            name: "Power-Offtake Routing",
+            properties: serde_json::json!({
+                "sourceSelectionChoiceId": "PowerOfftake",
+                "targetPortId": "ControlAccessoryPort",
+                "cardinality": "single connection, resolved after the PowerOfftake selection choice",
+            }),
+        },
+    ];
+
+    for cc in connection_choices {
+        let element = Element {
+            id: cc.id.to_string(),
+            kind: NodeKind::ConnectionChoice,
+            name: cc.name.to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(project_id, &element).await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: element.id.clone(),
+            kind: element.kind,
+            name: element.name.clone(),
+        });
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: cc.id.to_string(),
+                    rationale: None,
+                    properties: cc.properties,
+                },
+            )
+            .await?;
+    }
+
+    // FR-ARCH-01: top-level boundary Functions (`:Function`, first real instantiation), each
+    // `ArchDerives`-linked to whatever fulfills it -- a fixed Structure for `COMP`, or the
+    // ConnectionChoice that resolves its `NOF`-eligible fulfillment. `fulfillmentMechanism` matches
+    // impl v5 §2.3's own "tag... on a Function's body" convention exactly.
+    struct FunctionSeed {
+        id: &'static str,
+        name: &'static str,
+        permanence: &'static str,
+        fulfillment_mechanism: &'static str,
+        notes: &'static str,
+        fulfills: &'static [&'static str],
+    }
+
+    let functions = [
+        FunctionSeed {
+            id: "GenerateThrust",
+            name: "Generate Thrust",
+            permanence: "permanent",
+            fulfillment_mechanism: "DE",
+            notes: "Decomposed into the gas-path chain per reqs v5 §5.16's mermaid diagram: Fan & \
+                LP Compression -> Core (HP) Compressor -> Combustor -> Turbine (HP & LP). The \
+                section's own prose table calls this a 'five-subsystem gas-path chain', but the \
+                diagram itself includes only these four (Control (FADEC/EEC) is not gas-path) -- \
+                the diagram is treated as authoritative; this mismatch is flagged, not silently \
+                resolved by guessing which is right.",
+            fulfills: &[
+                "FanLpCompression",
+                "CoreHpCompressor",
+                "Combustor",
+                "TurbineHpLp",
+            ],
+        },
+        FunctionSeed {
+            id: "ProvideBleedAir",
+            name: "Provide Bleed Air",
+            permanence: "conditional",
+            fulfillment_mechanism: "NOF",
+            notes: "Non-fulfillment-eligible; when fulfilled, it is via the BleedAirRouting \
+                connection choice from Core (HP) Compressor's offtake port, not a fixed component.",
+            fulfills: &["BleedAirRouting"],
+        },
+        FunctionSeed {
+            id: "ProvideAccessoryShaftPower",
+            name: "Provide Accessory/Shaft Power",
+            permanence: "conditional",
+            fulfillment_mechanism: "NOF",
+            notes: "Non-fulfillment-eligible; when fulfilled, it is via the PowerOfftakeRouting \
+                connection choice from a shaft-mounted offtake (HP or LP shaft, per the Turbine \
+                PowerOfftake selection choice).",
+            fulfills: &["PowerOfftakeRouting"],
+        },
+        FunctionSeed {
+            id: "RegulateEngineOperation",
+            name: "Regulate Engine Operation",
+            permanence: "permanent",
+            fulfillment_mechanism: "COMP",
+            notes: "Fulfilled directly by one fixed component -- Control (FADEC/EEC) -- no \
+                architecture choice searched over. Induces the Meter Fuel Flow sub-function.",
+            fulfills: &["ControlFadecEec"],
+        },
+        FunctionSeed {
+            id: "MeterFuelFlow",
+            name: "Meter Fuel Flow",
+            permanence: "permanent",
+            fulfillment_mechanism: "COMP",
+            notes: "Sub-function induced by Regulate Engine Operation; fulfilled by Control \
+                (FADEC/EEC)'s Fuel Metering Unit, which feeds Combustor's fixed \
+                CombustorFuelInjectorPort.",
+            fulfills: &["ControlFadecEec"],
+        },
+    ];
+
+    for f in functions {
+        let element = Element {
+            id: f.id.to_string(),
+            kind: NodeKind::Function,
+            name: f.name.to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(project_id, &element).await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: element.id.clone(),
+            kind: element.kind,
+            name: element.name.clone(),
+        });
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: f.id.to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({
+                        "permanence": f.permanence,
+                        "fulfillmentMechanism": f.fulfillment_mechanism,
+                        "notes": f.notes,
+                    }),
+                },
+            )
+            .await?;
+        for target in f.fulfills {
+            state
+                .neo4j
+                .create_edge(
+                    project_id,
+                    &Edge {
+                        source: f.id.to_string(),
+                        target: target.to_string(),
+                        kind: EdgeKind::ArchDerives,
+                    },
+                )
+                .await?;
+            diff_entries.push(DiffEntry::EdgeCreated {
+                source: f.id.to_string(),
+                target: target.to_string(),
+                kind: EdgeKind::ArchDerives,
+            });
+        }
+    }
+
+    // FR-ARCH-04: the nozzle-flow-exclusivity incompatibility constraint (reqs v5 §5.16's
+    // cross-cutting table), between the two elements the doc's own prose says it "spans."
+    state
+        .neo4j
+        .create_edge(
+            project_id,
+            &Edge {
+                source: "MixedNozzle".to_string(),
+                target: "FanBypassDuctExitPort".to_string(),
+                kind: EdgeKind::IncompatibleWith,
+            },
+        )
+        .await?;
+    diff_entries.push(DiffEntry::EdgeCreated {
+        source: "MixedNozzle".to_string(),
+        target: "FanBypassDuctExitPort".to_string(),
+        kind: EdgeKind::IncompatibleWith,
+    });
+
+    // Remaining named per-subsystem design variables (reqs v5 §5.16's per-subsystem breakdown),
+    // as `:Parameter`s -- includes the two stage-count pairs FR-COMP-04 needs (deferred from Phase
+    // 3 pending this Turbine-side content). Bounds are the doc's own "illustrative starting
+    // points, subject to real numeric sourcing" (§5.16); Combustor's four carry no stated bound at
+    // all (the doc gives it design-variables/metrics with no numeric target), so those are marked
+    // `illustrative: true` rather than given a fabricated range.
+    struct ParamSeed {
+        id: &'static str,
+        subsystem_id: &'static str,
+        symbol: &'static str,
+        properties: serde_json::Value,
+    }
+
+    let params = [
+        ParamSeed {
+            id: "FanLpStagesParam",
+            subsystem_id: "FanLpCompression",
+            symbol: "n_LP_stages",
+            properties: serde_json::json!({
+                "description": "LP-compressor stage count; ChoiceConstraint-linked to TurbineLpStagesParam (FR-COMP-04).",
+                "type": "integer",
+            }),
+        },
+        ParamSeed {
+            id: "CoreHpStagesParam",
+            subsystem_id: "CoreHpCompressor",
+            symbol: "n_HP_stages",
+            properties: serde_json::json!({
+                "description": "HP-compressor stage count; ChoiceConstraint-linked to TurbineHpStagesParam (FR-COMP-04).",
+                "type": "integer",
+            }),
+        },
+        ParamSeed {
+            id: "TurbineHpStagesParam",
+            subsystem_id: "TurbineHpLp",
+            symbol: "n_HP_turbine_stages",
+            properties: serde_json::json!({
+                "description": "HP-turbine stage count; ChoiceConstraint-linked to CoreHpStagesParam (FR-COMP-04).",
+                "type": "integer",
+            }),
+        },
+        ParamSeed {
+            id: "TurbineLpStagesParam",
+            subsystem_id: "TurbineHpLp",
+            symbol: "n_LP_turbine_stages",
+            properties: serde_json::json!({
+                "description": "LP-turbine stage count; ChoiceConstraint-linked to FanLpStagesParam (FR-COMP-04).",
+                "type": "integer",
+            }),
+        },
+        ParamSeed {
+            id: "GearRatioParam",
+            subsystem_id: "FanLpCompression",
+            symbol: "GearRatio",
+            properties: serde_json::json!({
+                "description": "Conditional on the IncludeGearbox selection choice.",
+                "bound": [1.0, 5.0],
+                "illustrative": true,
+            }),
+        },
+        ParamSeed {
+            id: "BprParam",
+            subsystem_id: "FanLpCompression",
+            symbol: "BPR",
+            properties: serde_json::json!({ "bound": [2.0, 12.5], "illustrative": true }),
+        },
+        ParamSeed {
+            id: "FprParam",
+            subsystem_id: "FanLpCompression",
+            symbol: "FPR",
+            properties: serde_json::json!({ "bound": [1.1, 1.8], "illustrative": true }),
+        },
+        ParamSeed {
+            id: "OprCoreParam",
+            subsystem_id: "CoreHpCompressor",
+            symbol: "OPR_core",
+            properties: serde_json::json!({
+                "description": "Combines toward overall OPR [1.1-60.0].",
+                "illustrative": true,
+            }),
+        },
+        ParamSeed {
+            id: "ChamberSizeParam",
+            subsystem_id: "Combustor",
+            symbol: "ChamberSize",
+            properties: serde_json::json!({
+                "description": "No architecture choice modeled for Combustor this pass (reqs v5 §5.16); no numeric target sourced anywhere yet.",
+                "illustrative": true,
+            }),
+        },
+        ParamSeed {
+            id: "FlameTemperatureParam",
+            subsystem_id: "Combustor",
+            symbol: "FlameTemperature",
+            properties: serde_json::json!({ "illustrative": true }),
+        },
+        ParamSeed {
+            id: "PressureLossParam",
+            subsystem_id: "Combustor",
+            symbol: "PressureLoss",
+            properties: serde_json::json!({ "illustrative": true }),
+        },
+        ParamSeed {
+            id: "NOxParam",
+            subsystem_id: "Combustor",
+            symbol: "NOx",
+            properties: serde_json::json!({
+                "description": "Generic metric, verification-only unless made an objective (reqs v5 §5.16 Metrics table).",
+                "illustrative": true,
+            }),
+        },
+    ];
+
+    for p in params {
+        let element = Element {
+            id: p.id.to_string(),
+            kind: NodeKind::Parameter,
+            name: format!("{} {}", p.subsystem_id, p.symbol),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(project_id, &element).await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: element.id.clone(),
+            kind: element.kind,
+            name: element.name.clone(),
+        });
+        let mut properties = p.properties.as_object().cloned().unwrap_or_default();
+        properties.insert("symbol".to_string(), serde_json::json!(p.symbol));
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: p.id.to_string(),
+                    rationale: None,
+                    properties: serde_json::Value::Object(properties),
+                },
+            )
+            .await?;
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: p.id.to_string(),
+                    target: p.subsystem_id.to_string(),
+                    kind: EdgeKind::Bound,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: p.id.to_string(),
+            target: p.subsystem_id.to_string(),
+            kind: EdgeKind::Bound,
+        });
+    }
+
+    for (a, b) in [
+        ("FanLpStagesParam", "TurbineLpStagesParam"),
+        ("CoreHpStagesParam", "TurbineHpStagesParam"),
+    ] {
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: a.to_string(),
+                    target: b.to_string(),
+                    kind: EdgeKind::ChoiceConstraint,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: a.to_string(),
+            target: b.to_string(),
+            kind: EdgeKind::ChoiceConstraint,
+        });
+    }
+
+    // Closes the real gap this function's own doc comment flags: `REQ-THRUST` previously had zero
+    // edges in this fixture. `Satisfy` from the four gas-path subsystems `GenerateThrust`
+    // decomposes into -- Phase 4's own "Satisfy/Verify edges from... existing higher-level
+    // requirements into the seeded structure" instruction, exercising traceability end-to-end.
+    for subsystem_id in [
+        "FanLpCompression",
+        "CoreHpCompressor",
+        "Combustor",
+        "TurbineHpLp",
+    ] {
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: subsystem_id.to_string(),
+                    target: "REQ-THRUST".to_string(),
+                    kind: EdgeKind::Satisfy,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: subsystem_id.to_string(),
+            target: "REQ-THRUST".to_string(),
+            kind: EdgeKind::Satisfy,
+        });
+    }
+
+    // `CoreBleedOfftakePort` is a real port on Core, so it belongs in the Interface Contract's
+    // `interfacePortDefinitions.ports` array Phase 3 already populated -- read-merge, same pattern
+    // as `seed_fr_comp_content`'s own Interface Contract merge.
+    let existing = state
+        .postgres
+        .get_body(project_id, "CoreHpCompressor")
+        .await?;
+    let mut properties = existing
+        .as_ref()
+        .and_then(|b| b.get("properties"))
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let rationale = existing
+        .as_ref()
+        .and_then(|b| b.get("rationale"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let old_interface_port_definitions = properties
+        .get("interfacePortDefinitions")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let mut new_interface_port_definitions = old_interface_port_definitions.clone();
+    if let Some(ports_arr) = new_interface_port_definitions
+        .get_mut("ports")
+        .and_then(|v| v.as_array_mut())
+    {
+        ports_arr.push(serde_json::json!("CoreBleedOfftakePort"));
+    }
+    diff_entries.push(DiffEntry::PropertyChanged {
+        element_id: "CoreHpCompressor".to_string(),
+        property: "interfacePortDefinitions".to_string(),
+        old: old_interface_port_definitions,
+        new: new_interface_port_definitions.clone(),
+    });
+    properties.insert(
+        "interfacePortDefinitions".to_string(),
+        new_interface_port_definitions,
+    );
+    state
+        .postgres
+        .upsert_body(
+            project_id,
+            &ElementBody {
+                element_id: "CoreHpCompressor".to_string(),
+                rationale,
+                properties: serde_json::Value::Object(properties),
+            },
+        )
+        .await?;
 
     Ok(())
 }
@@ -4512,9 +5252,19 @@ mod tests {
 
         seed_turbofan_ref(&state, &project.id).await.unwrap();
 
-        for (subsystem_id, spec_req_id) in [
-            ("FanLpCompression", "REQ-FAN-SPEC"),
-            ("CoreHpCompressor", "REQ-CORE-SPEC"),
+        for (subsystem_id, spec_req_id, inlet_port_id, exit_port_id) in [
+            (
+                "FanLpCompression",
+                "REQ-FAN-SPEC",
+                "FanInletPort",
+                "FanExitPort",
+            ),
+            (
+                "CoreHpCompressor",
+                "REQ-CORE-SPEC",
+                "CoreInletPort",
+                "CoreExitPort",
+            ),
         ] {
             // FR-COMP-01/06: a real Requirement element, Satisfy-linked from its subsystem, with
             // the 9-field spec plus the negotiable/flagged convention as body properties.
@@ -4565,25 +5315,25 @@ mod tests {
                 );
             }
 
-            // FR-COMP-05: two real Ports, Contains-linked from the subsystem.
+            // FR-COMP-05: the compressor's two named Ports, Contains-linked from the subsystem.
+            // Asserts these two specifically exist among the subsystem's Contains-linked
+            // children rather than an exact total count -- Phase 4 (docs/IMPLEMENTATION_KICKOFF.md)
+            // legitimately adds further ports to these same subsystems (e.g.
+            // `FanBypassDuctExitPort`, `CoreBleedOfftakePort`), so an exact-count assertion here
+            // would be re-broken by every future phase that adds one more.
             let contains_edges = state.neo4j.contains_edges(&project.id).await.unwrap();
-            let port_ids: Vec<&str> = contains_edges
-                .iter()
-                .filter(|e| e.source == subsystem_id && e.target != subsystem_id)
-                .map(|e| e.target.as_str())
-                .filter(|id| *id != "Engine")
-                .collect();
             let ports_for_subsystem: Vec<&str> = contains_edges
                 .iter()
                 .filter(|e| e.source == subsystem_id)
                 .map(|e| e.target.as_str())
                 .collect();
-            assert_eq!(
-                ports_for_subsystem.len(),
-                2,
-                "expected 2 ports Contains-linked from {subsystem_id}, got {port_ids:?}"
-            );
-            for port_id in ports_for_subsystem {
+            for expected_port_id in [inlet_port_id, exit_port_id] {
+                assert!(
+                    ports_for_subsystem.contains(&expected_port_id),
+                    "expected {expected_port_id} Contains-linked from {subsystem_id}, got {ports_for_subsystem:?}"
+                );
+            }
+            for port_id in [inlet_port_id, exit_port_id] {
                 let port = state
                     .neo4j
                     .get_element(&project.id, port_id)
@@ -4660,6 +5410,240 @@ mod tests {
             fan_properties["specProvenance"],
             serde_json::json!("docs-worked-example")
         );
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 4 (turbofan system-model instance) — calls
+    /// `seed_turbofan_ref` directly against a fresh project and asserts the real FR-ARCH content
+    /// `seed_fr_arch_system_model` now creates: the new gas-path Ports, the first-ever
+    /// `:Function`/`:SelectionChoice`/`:ConnectionChoice` elements and their edges, the
+    /// stage-count `ChoiceConstraint`s, and `REQ-THRUST`'s traceability wiring.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn seed_turbofan_ref_lands_fr_arch_system_model_across_all_five_subsystems() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "fr-arch-seed").await;
+
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        // New station-numbered Ports, Contains-linked from their subsystem.
+        let contains_edges = state.neo4j.contains_edges(&project.id).await.unwrap();
+        for (port_id, subsystem_id, expected_station) in [
+            ("FanBypassDuctExitPort", "FanLpCompression", None),
+            ("CoreBleedOfftakePort", "CoreHpCompressor", None),
+            ("CombustorInletPort", "Combustor", Some(3)),
+            ("CombustorFuelInjectorPort", "Combustor", None),
+            ("CombustorExitPort", "Combustor", Some(4)),
+            ("TurbineHpInletPort", "TurbineHpLp", Some(4)),
+            ("TurbineLpInterstagePort", "TurbineHpLp", Some(5)),
+            ("TurbineExitPort", "TurbineHpLp", Some(6)),
+            ("NozzleInletPort", "TurbineHpLp", Some(7)),
+            ("NozzleExitPort", "TurbineHpLp", Some(8)),
+            ("ControlAccessoryPort", "ControlFadecEec", None),
+        ] {
+            let port = state
+                .neo4j
+                .get_element(&project.id, port_id)
+                .await
+                .unwrap()
+                .expect("port should exist");
+            assert_eq!(port.kind, NodeKind::Port);
+            assert!(
+                contains_edges
+                    .iter()
+                    .any(|e| e.source == subsystem_id && e.target == port_id),
+                "expected {subsystem_id} -Contains-> {port_id}, got {contains_edges:?}"
+            );
+            if let Some(station) = expected_station {
+                let body = state
+                    .postgres
+                    .get_body(&project.id, port_id)
+                    .await
+                    .unwrap()
+                    .expect("port should have a body");
+                assert_eq!(body["properties"]["station"], serde_json::json!(station));
+            }
+        }
+
+        // First-ever `:Function` instantiation, ArchDerives-linked to what fulfills it.
+        let arch_derives_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::ArchDerives)
+            .await
+            .unwrap();
+        for (function_id, fulfills) in [
+            (
+                "GenerateThrust",
+                vec![
+                    "FanLpCompression",
+                    "CoreHpCompressor",
+                    "Combustor",
+                    "TurbineHpLp",
+                ],
+            ),
+            ("ProvideBleedAir", vec!["BleedAirRouting"]),
+            ("ProvideAccessoryShaftPower", vec!["PowerOfftakeRouting"]),
+            ("RegulateEngineOperation", vec!["ControlFadecEec"]),
+            ("MeterFuelFlow", vec!["ControlFadecEec"]),
+        ] {
+            let function = state
+                .neo4j
+                .get_element(&project.id, function_id)
+                .await
+                .unwrap()
+                .expect("Function should exist");
+            assert_eq!(function.kind, NodeKind::Function);
+            for target in fulfills {
+                assert!(
+                    arch_derives_edges
+                        .iter()
+                        .any(|e| e.source == function_id && e.target == target),
+                    "expected {function_id} -ArchDerives-> {target}, got {arch_derives_edges:?}"
+                );
+            }
+        }
+
+        // First-ever `:SelectionChoice`/`:ConnectionChoice` instantiation.
+        for (id, subsystem_id) in [
+            ("IncludeGearbox", "FanLpCompression"),
+            ("BleedOfftakeStage", "CoreHpCompressor"),
+            ("PowerOfftake", "TurbineHpLp"),
+            ("MixedNozzle", "TurbineHpLp"),
+        ] {
+            let choice = state
+                .neo4j
+                .get_element(&project.id, id)
+                .await
+                .unwrap()
+                .expect("SelectionChoice should exist");
+            assert_eq!(choice.kind, NodeKind::SelectionChoice);
+            assert!(
+                arch_derives_edges
+                    .iter()
+                    .any(|e| e.source == id && e.target == subsystem_id),
+                "expected {id} -ArchDerives-> {subsystem_id}, got {arch_derives_edges:?}"
+            );
+        }
+        for id in ["BleedAirRouting", "PowerOfftakeRouting"] {
+            let choice = state
+                .neo4j
+                .get_element(&project.id, id)
+                .await
+                .unwrap()
+                .expect("ConnectionChoice should exist");
+            assert_eq!(choice.kind, NodeKind::ConnectionChoice);
+        }
+
+        // FR-ARCH-04: the nozzle-flow incompatibility constraint.
+        let incompatible_with_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::IncompatibleWith)
+            .await
+            .unwrap();
+        assert!(incompatible_with_edges
+            .iter()
+            .any(|e| e.source == "MixedNozzle" && e.target == "FanBypassDuctExitPort"));
+
+        // FR-COMP-04 (unblocked this phase): stage-count Parameters, Bound-linked, and their two
+        // ChoiceConstraint edges.
+        let bound_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::Bound)
+            .await
+            .unwrap();
+        for (param_id, subsystem_id) in [
+            ("FanLpStagesParam", "FanLpCompression"),
+            ("CoreHpStagesParam", "CoreHpCompressor"),
+            ("TurbineHpStagesParam", "TurbineHpLp"),
+            ("TurbineLpStagesParam", "TurbineHpLp"),
+            ("GearRatioParam", "FanLpCompression"),
+            ("BprParam", "FanLpCompression"),
+            ("FprParam", "FanLpCompression"),
+            ("OprCoreParam", "CoreHpCompressor"),
+            ("ChamberSizeParam", "Combustor"),
+            ("FlameTemperatureParam", "Combustor"),
+            ("PressureLossParam", "Combustor"),
+            ("NOxParam", "Combustor"),
+        ] {
+            let param = state
+                .neo4j
+                .get_element(&project.id, param_id)
+                .await
+                .unwrap()
+                .expect("Parameter should exist");
+            assert_eq!(param.kind, NodeKind::Parameter);
+            assert!(
+                bound_edges
+                    .iter()
+                    .any(|e| e.source == param_id && e.target == subsystem_id),
+                "expected {param_id} -Bound-> {subsystem_id}, got {bound_edges:?}"
+            );
+        }
+        let choice_constraint_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::ChoiceConstraint)
+            .await
+            .unwrap();
+        assert!(choice_constraint_edges
+            .iter()
+            .any(|e| e.source == "FanLpStagesParam" && e.target == "TurbineLpStagesParam"));
+        assert!(choice_constraint_edges
+            .iter()
+            .any(|e| e.source == "CoreHpStagesParam" && e.target == "TurbineHpStagesParam"));
+
+        // Core's Interface Contract `ports` array now includes the new bleed-offtake port.
+        let core_body = state
+            .postgres
+            .get_body(&project.id, "CoreHpCompressor")
+            .await
+            .unwrap()
+            .expect("CoreHpCompressor should have a body");
+        let core_ports = core_body["properties"]["interfacePortDefinitions"]["ports"]
+            .as_array()
+            .expect("ports array should exist");
+        assert!(core_ports.contains(&serde_json::json!("CoreBleedOfftakePort")));
+
+        // REQ-THRUST was previously disconnected in this fixture -- now Satisfy-linked from the
+        // four gas-path subsystems, and reachable via the real traceability machinery.
+        let satisfy_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::Satisfy)
+            .await
+            .unwrap();
+        for subsystem_id in [
+            "FanLpCompression",
+            "CoreHpCompressor",
+            "Combustor",
+            "TurbineHpLp",
+        ] {
+            assert!(
+                satisfy_edges
+                    .iter()
+                    .any(|e| e.source == subsystem_id && e.target == "REQ-THRUST"),
+                "expected {subsystem_id} -Satisfy-> REQ-THRUST, got {satisfy_edges:?}"
+            );
+        }
+        let traversal = traceability::run_traversal(
+            &state,
+            &project.id,
+            "REQ-THRUST",
+            1,
+            500,
+            traceability::Direction::Incoming,
+        )
+        .await
+        .unwrap();
+        for subsystem_id in [
+            "FanLpCompression",
+            "CoreHpCompressor",
+            "Combustor",
+            "TurbineHpLp",
+        ] {
+            assert!(
+                traversal.visited.contains_key(subsystem_id),
+                "expected {subsystem_id} reachable from REQ-THRUST via traceability, got {:?}",
+                traversal.visited
+            );
+        }
     }
 
     /// Compiles `control_sim::golden_alf_transitions` (the pilot's Idle->Armed->Running->Shutdown

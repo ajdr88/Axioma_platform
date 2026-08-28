@@ -742,3 +742,96 @@ label happened to have an internal token id lower than `:Element`'s.
   `mode_b_accept_wires_traceability_and_interface_contract_is_fully_populated` — confirming the
   Interface Contract merge composes correctly with Mode B's own `accept`-path writes to the same
   subsystem bodies rather than clobbering them.
+
+---
+
+## 12. Phase 4: Turbofan System-Model Instance Seeded **[REV-D]**
+
+`docs/IMPLEMENTATION_KICKOFF.md` Phase 4 called for seeding an actual instance of the reconciled
+5-subsystem engine model (reqs v5 §5.16/§5.17) — boundary functions, per-subsystem breakdown,
+cross-cutting connection choices/constraints, station 0–8 numbering, and `Satisfy`/`Verify` edges
+from existing Requirements into the seeded structure. Recorded here is what was actually seeded and
+verified, `apps/api/src/main.rs::seed_fr_arch_system_model`, called from `seed_turbofan_ref` right
+after Phase 3's `seed_fr_comp_content`.
+
+### 12.1 What was seeded
+
+- **Station 0–8 gas-path Ports**, extending Phase 3's Fan/Core ports (stations 1/2, 2/3) across the
+  rest of the chain: `CombustorInletPort`/`CombustorExitPort` (stations 3/4 — station 3 shared with
+  `CoreExitPort`, station 4 shared with `TurbineHpInletPort`, the same documented shared-station
+  pattern §5.16 already establishes for stations 2/3), `TurbineLpInterstagePort` (station 5),
+  `TurbineExitPort` (station 6), `NozzleInletPort`/`NozzleExitPort` (stations 7/8, on `TurbineHpLp`
+  per the ratified "Nozzle folded into Turbine's exit port" reconciliation decision — not a 6th
+  subsystem), plus three non-station-numbered ports the per-subsystem breakdown names explicitly:
+  `FanBypassDuctExitPort`, `CoreBleedOfftakePort` (appended into Core's existing Interface Contract
+  `ports` array via the same read-merge pattern Phase 3 established), and `ControlAccessoryPort`.
+  `CombustorFuelInjectorPort` is a documented property only, no edge — it's "fixed, not a choice"
+  per the doc's own words, and no fixed non-choice port-to-port edge type exists in this schema.
+- **5 `:Function` elements — first-ever instantiation of this `NodeKind`**: `GenerateThrust`
+  (permanent, `DE`, `ArchDerives`-linked to the four gas-path subsystems), `ProvideBleedAir`/
+  `ProvideAccessoryShaftPower` (conditional, `NOF`, `ArchDerives`-linked to the `ConnectionChoice`
+  that resolves their fulfillment rather than a fixed Structure), `RegulateEngineOperation`/
+  `MeterFuelFlow` (permanent, `COMP`, `ArchDerives`-linked to `ControlFadecEec`). The
+  `permanence`/`fulfillmentMechanism` body tags match this doc's own §2.3 convention exactly.
+- **4 `:SelectionChoice` + 2 `:ConnectionChoice` elements — first-ever instantiation of either
+  `NodeKind`**: `IncludeGearbox`, `BleedOfftakeStage`, `PowerOfftake`, `MixedNozzle` (each
+  `ArchDerives`-linked to its owning subsystem, `options` as a plain JSON array, `resolutionState:
+  "unresolved"` per §5.17's own node-property-state-machine spec); `BleedAirRouting`/
+  `PowerOfftakeRouting` (source/target port ids and cardinality as body properties — no dedicated
+  port-to-port connection edge exists in this schema, same "plain JSON, gap flagged" precedent
+  Phase 3 already established for Constraint→Parameter usage).
+- **1 `IncompatibleWith` edge** (FR-ARCH-04): `MixedNozzle` → `FanBypassDuctExitPort`, the two
+  elements §5.16's own prose says the nozzle-flow-exclusivity constraint "spans."
+- **FR-COMP-04 (stage-count consistency), unblocked and landed** — explicitly deferred from Phase 3
+  pending Turbine-side content, which this phase now provides: 4 new `:Parameter`s
+  (`FanLpStagesParam`/`CoreHpStagesParam`/`TurbineHpStagesParam`/`TurbineLpStagesParam`,
+  `Bound`-linked to their subsystem) plus 2 `ChoiceConstraint` edges linking each compressor's stage
+  count to its driving turbine section's.
+- **The remaining named per-subsystem design variables** (`GearRatioParam`, `BprParam`, `FprParam`,
+  `OprCoreParam`, and Combustor's `ChamberSizeParam`/`FlameTemperatureParam`/`PressureLossParam`/
+  `NOxParam`) as `:Parameter`s, `Bound`-linked, carrying §5.16's own stated bounds where given
+  (BPR/FPR/GearRatio) or `illustrative: true` where the doc names a design variable with no numeric
+  target at all (Combustor's four — it deliberately has no architecture choice modeled this pass).
+- **`REQ-THRUST` wired into the seeded structure** — previously a fully disconnected element in
+  this fixture (confirmed by reading `seed_turbofan_ref` before this pass: it was created with zero
+  edges anywhere). Now `Satisfy`-linked from the four gas-path subsystems `GenerateThrust`
+  decomposes into, and confirmed reachable from `REQ-THRUST` via `traceability::run_traversal`
+  (direction `Incoming`) in the new integration test — the literal "exercising the traceability
+  machinery end-to-end" check this phase's own kickoff text asks for.
+
+### 12.2 Two real findings, flagged rather than resolved silently
+
+- **A minor doc inconsistency**: §5.16's own prose calls `GenerateThrust`'s decomposition a
+  "five-subsystem gas-path chain," but its own mermaid diagram's `GT` subgraph includes only four
+  (Fan & LP Compression, Core (HP) Compressor, Combustor, Turbine (HP & LP) — Control (FADEC/EEC)
+  is not gas-path). The diagram was treated as authoritative for this seed; the prose mismatch is
+  flagged here rather than silently resolved by guessing which is right.
+- **A real, confirmed schema gap**: `EdgeKind::ChoiceConstraint`'s own doc comment says it "carries
+  a Linked/Permutations/Unordered [non-]replacing type" (mirroring `adsg_core.ChoiceConstraintType`,
+  confirmed during the Phase 2 spike), but `Edge` (`packages/sysml-core/src/lib.rs`) is
+  `{source, target, kind}` only — no properties field exists to persist that type anywhere. The two
+  `ChoiceConstraint` edges this phase creates are real, but their "Linked" type lives only in code
+  comments and this write-up, not in the graph. Not invented around (e.g. encoding it into an id) —
+  flagged as a real gap for whenever a design-space-definition property mechanism gets built.
+
+### 12.3 Explicitly not attempted this pass
+
+Per Phase 2's own ratified recommendation (§10.3) that the *unresolved* search space stays
+sidecar-side and only a *resolved* architecture instance materializes into Axioma's graph: no
+wiring into `cem-archspace`/`archspace_client.rs`, no live Mode B search over this design space —
+everything seeded here is a static, versioned *description* of the design space's fixed structure,
+not a live search state. No `diagram-engine`/UI (Phase 5). No full Metrics-table objective/
+constraint modeling beyond what diffusion-factor/Mach (Phase 3's `check_compressor_blade_loading`)
+and the two stage-count `ChoiceConstraint`s cover — a real Parametrics evaluation engine that could
+meaningfully consume TSFC/Thrust/Weight/Jet-Mach/etc. tags doesn't exist yet (Phase 5).
+
+### 12.4 Verification
+
+- `cargo build/clippy/fmt --workspace`: clean.
+- Full `apps/api` `--ignored` suite against the live Docker stack: 46/46 passing, including the new
+  `seed_turbofan_ref_lands_fr_arch_system_model_across_all_five_subsystems` test. Phase 3's own
+  `seed_turbofan_ref_lands_fr_comp_content_for_both_compressor_subsystems` needed one real update
+  (not a regression): it had asserted *exactly* 2 Contains-linked ports per compressor subsystem,
+  which this phase's new `FanBypassDuctExitPort`/`CoreBleedOfftakePort` correctly breaks — fixed to
+  assert the two named compressor ports are present among the subsystem's children, not an exact
+  count, so a future phase adding one more port doesn't re-break the same assertion again.
