@@ -6,15 +6,17 @@ any earlier v1–v4 docs or prior drafts of this file — if something here conf
 the docs win; flag it and ask. (v3/v4 requirements/implementation docs are kept in `docs/` for
 history, not deleted — do not treat their presence as ambiguity about which is current.)
 
-**v5/v4 status (2026-08-27):** these are the result of `docs/IMPLEMENTATION_KICKOFF.md`'s Phase 0
+**v5/v4 status (2026-08-28):** these are the result of `docs/IMPLEMENTATION_KICKOFF.md`'s Phase 0
 doc-consolidation pass — a large body of new capability (Parametrics, Information/Data Architecture,
 Interaction/Timing modeling, Export/Reporting, a documents→draft-model pipeline, compressor
 subsystem requirements, and a full turbofan ADSG system model + Mode B design-space representation)
 became **accepted spec** there. Since then: **Phase 1** (schema — new node/edge types, see Data
-model below) and **Phase 2** (the `adsg-core`/`SBArchOpt` sidecar spike, `packages/cem-archspace/`,
-ADR-011 ratified) are both built and verified. Phases 3–6 (content authoring, turbofan instance
-seeding, UI/API surface, test-scenario authoring) are still open. `docs/claude/*.md` holds the
-original amendment/analysis docs Phase 0 merged, kept for history.
+model below), **Phase 2** (the `adsg-core`/`SBArchOpt` sidecar spike, `packages/cem-archspace/`,
+ADR-011 ratified), and **Phase 3** (FR-COMP-01/02/05/06 seeded as real content on `Turbofan-Ref`,
+FR-COMP-03 validated-but-unwired, FR-COMP-04 deferred to Phase 4 — see impl v5 §11) are all built
+and verified. Phases 4–6 (full turbofan instance seeding, UI/API surface, test-scenario authoring)
+are still open. `docs/claude/*.md` holds the original amendment/analysis docs Phase 0 merged, kept
+for history.
 
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2

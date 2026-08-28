@@ -1421,7 +1421,450 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
         new: serde_json::json!(pointer),
     });
 
+    seed_fr_comp_content(state, project_id, &mut diff_entries).await?;
+
     Ok(diff_entries)
+}
+
+/// docs/IMPLEMENTATION_KICKOFF.md Phase 3 (FR-COMP-01…06) — the Fan & LP Compression / Core (HP)
+/// Compressor content the kickoff doc's own Phase 3 asks for, landed directly into the growing
+/// Turbofan-Ref fixture per that phase's stated purpose ("gives Phase 4 concrete, already-modeled
+/// Requirements... rather than inventing them ad hoc during instance seeding"). Split out of
+/// `seed_turbofan_ref` itself only for readability — same genesis-commit diff-accuracy contract
+/// applies (see that function's own doc comment), which is why every property write below still
+/// pushes its own `DiffEntry`, unlike `mode_b.rs::apply_candidate_to_main`'s lighter (undiffed)
+/// property merge — this function's caller explicitly cares more about diff completeness.
+///
+/// **Numeric values are this function's own illustrative defaults**, not sourced from a real
+/// design — same "invent a reasonable, documented default" precedent as Trade Study's thrust
+/// formula and `cem-core`'s own 0D model. Where `cem_core`'s own reference constants already pin
+/// a value (bypass ratio), this reuses that exact number rather than inventing a divergent one.
+async fn seed_fr_comp_content(
+    state: &AppState,
+    project_id: &str,
+    diff_entries: &mut Vec<DiffEntry>,
+) -> anyhow::Result<()> {
+    /// One compressor subsystem's FR-COMP content, gathered so the loop below stays readable.
+    struct CompressorSeed {
+        subsystem_id: &'static str,
+        spec_req_id: &'static str,
+        spec_req_name: &'static str,
+        overall_specification: serde_json::Value,
+        constraint_id: &'static str,
+        weight_flow_param_id: &'static str,
+        speed_param_id: &'static str,
+        inlet_port: (&'static str, u32, serde_json::Value),
+        exit_port: (&'static str, u32, serde_json::Value),
+        interface_contract: [(&'static str, serde_json::Value); 6],
+    }
+
+    let seeds = [
+        CompressorSeed {
+            subsystem_id: "FanLpCompression",
+            spec_req_id: "REQ-FAN-SPEC",
+            spec_req_name: "Fan & LP Compression over-all design-point specification",
+            overall_specification: serde_json::json!({
+                "designWeightFlowLbPerSec": 550.0,
+                // 5.0 matches cem_core::REFERENCE_BYPASS_RATIO exactly -- duplicated as a
+                // literal rather than referenced since that const isn't `pub` (cem-core is a
+                // deliberately zero-I/O, self-contained crate; changing its public surface just
+                // for a seed script's cross-reference wasn't worth it here).
+                "designBypassRatio": 5.0,
+                "designFanPressureRatio": 1.4,
+                "designEquivalentSpeedRpm": 3800.0,
+                "targetPolytropicEfficiency": 0.92,
+                "highEfficiencyOperatingRangePercentNCorrected": [70.0, 105.0],
+                "inletDiameterIn": 78.0,
+                "outletDiameterIn": 74.0,
+                "maxOutletVelocityFtPerSec": 750.0,
+                "targetLengthIn": 40.0,
+                "targetWeightLb": 620.0,
+                "inletDistortionTolerance": "IDC <= 0.10 at max operating AoA",
+                "negotiable": true,
+                "flagged": false,
+            }),
+            constraint_id: "FanPerformanceMapConstraint",
+            weight_flow_param_id: "FanEquivalentWeightFlowParam",
+            speed_param_id: "FanEquivalentSpeedParam",
+            inlet_port: (
+                "FanInletPort",
+                1,
+                serde_json::json!({ "equivalentWeightFlowLbPerSec": 550.0, "equivalentSpeedRpm": 3800.0 }),
+            ),
+            exit_port: (
+                "FanExitPort",
+                2,
+                serde_json::json!({ "equivalentWeightFlowLbPerSec": 550.0, "equivalentSpeedRpm": 3800.0 }),
+            ),
+            interface_contract: [
+                (
+                    "performanceTargets",
+                    serde_json::json!({
+                        "description": "Design weight flow, BPR, FPR [1.1-1.8], design equivalent speed, target eta_poly, high-eta range = 70-105% N/sqrt(theta)",
+                        "bpr": 5.0,
+                        "fprRange": [1.1, 1.8],
+                        "highEfficiencyRangePercent": [70.0, 105.0],
+                    }),
+                ),
+                (
+                    "boundaryConditions",
+                    serde_json::json!({
+                        "description": "Inlet distortion tolerance, altitude/Mach envelope, Reynolds-number floor at altitude",
+                    }),
+                ),
+                (
+                    "geometricEnvelope",
+                    serde_json::json!({
+                        "description": "Fan diameter, LP-spool axial length budget, hub/tip ratio floor (~0.35)",
+                        "hubToTipRatioFloor": 0.35,
+                    }),
+                ),
+                (
+                    "interfacePortDefinitions",
+                    serde_json::json!({
+                        "description": "Bypass duct port (to nozzle/mixer), LP-shaft coupling (to LP Turbine), gearbox port (if IncludeGearbox)",
+                        "ports": ["FanInletPort", "FanExitPort"],
+                    }),
+                ),
+                (
+                    "massCostTargets",
+                    serde_json::json!({
+                        "description": "Stage/blade mass <= budget, unit cost envelope",
+                    }),
+                ),
+                (
+                    "materialProcessConstraints",
+                    serde_json::json!({
+                        "description": "Blade material vs. relative-Mach/thermal duty (FR-COMP-03 bound)",
+                    }),
+                ),
+            ],
+        },
+        CompressorSeed {
+            subsystem_id: "CoreHpCompressor",
+            spec_req_id: "REQ-CORE-SPEC",
+            spec_req_name: "Core (HP) Compressor over-all design-point specification",
+            overall_specification: serde_json::json!({
+                "designWeightFlowLbPerSec": 110.0,
+                "designOverallPressureRatioContribution": 8.0,
+                "designEquivalentSpeedRpm": 14500.0,
+                "targetPolytropicEfficiency": 0.88,
+                "highEfficiencyOperatingRangePercentNCorrected": [75.0, 100.0],
+                "inletDiameterIn": 28.0,
+                "outletDiameterIn": 18.0,
+                "maxOutletVelocityFtPerSec": 900.0,
+                "targetLengthIn": 22.0,
+                "targetWeightLb": 340.0,
+                "inletDistortionTolerance": "IDC <= 0.05 (post-fan-conditioned flow)",
+                "negotiable": true,
+                "flagged": false,
+            }),
+            constraint_id: "CorePerformanceMapConstraint",
+            weight_flow_param_id: "CoreEquivalentWeightFlowParam",
+            speed_param_id: "CoreEquivalentSpeedParam",
+            inlet_port: (
+                "CoreInletPort",
+                2,
+                serde_json::json!({ "equivalentWeightFlowLbPerSec": 110.0, "equivalentSpeedRpm": 14500.0 }),
+            ),
+            exit_port: (
+                "CoreExitPort",
+                3,
+                serde_json::json!({
+                    "equivalentWeightFlowLbPerSec": 110.0,
+                    "equivalentSpeedRpm": 14500.0,
+                    // Bleed originates at the core exit per the reconciliation table (reqs v5
+                    // §5.16) -- not on the fan side.
+                    "bleedFractionB": 0.03,
+                }),
+            ),
+            interface_contract: [
+                (
+                    "performanceTargets",
+                    serde_json::json!({
+                        "description": "Design weight flow, OPR contribution, design equivalent speed, target eta_poly, high-eta range",
+                        "overallPressureRatioContribution": 8.0,
+                        "highEfficiencyRangePercent": [75.0, 100.0],
+                    }),
+                ),
+                (
+                    "boundaryConditions",
+                    serde_json::json!({
+                        "description": "Combustor-inlet temperature/pressure environment",
+                    }),
+                ),
+                (
+                    "geometricEnvelope",
+                    serde_json::json!({
+                        "description": "Core diameter, HP-spool axial length budget",
+                    }),
+                ),
+                (
+                    "interfacePortDefinitions",
+                    serde_json::json!({
+                        "description": "Bleed-air offtake port (location per BleedOfftakeStage), HP-shaft coupling (to HP Turbine), combustor-inlet port",
+                        "ports": ["CoreInletPort", "CoreExitPort"],
+                    }),
+                ),
+                (
+                    "massCostTargets",
+                    serde_json::json!({
+                        "description": "Stage/blade mass <= budget, core-spool scope",
+                    }),
+                ),
+                (
+                    "materialProcessConstraints",
+                    serde_json::json!({
+                        "description": "Blade material vs. relative-Mach/thermal duty, higher-temperature duty than the LP spool",
+                    }),
+                ),
+            ],
+        },
+    ];
+
+    for seed in seeds {
+        // FR-COMP-01/06: the over-all design-point specification lands as a real `:Requirement`
+        // the subsystem `Satisfy`-links to -- the same shape `REQ-THRUST` already established,
+        // not a bare property on the subsystem's own body.
+        let spec_req = Element {
+            id: seed.spec_req_id.to_string(),
+            kind: NodeKind::Requirement,
+            name: seed.spec_req_name.to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(project_id, &spec_req).await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: spec_req.id.clone(),
+            kind: spec_req.kind,
+            name: spec_req.name.clone(),
+        });
+        // Captured before `overall_specification` moves into the ElementBody below -- reused by
+        // the performance-map Constraint's illustrative sample points further down.
+        let design_weight_flow = seed
+            .overall_specification
+            .get("designWeightFlowLbPerSec")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: seed.spec_req_id.to_string(),
+                    rationale: None,
+                    properties: seed.overall_specification,
+                },
+            )
+            .await?;
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: seed.subsystem_id.to_string(),
+                    target: seed.spec_req_id.to_string(),
+                    kind: EdgeKind::Satisfy,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: seed.subsystem_id.to_string(),
+            target: seed.spec_req_id.to_string(),
+            kind: EdgeKind::Satisfy,
+        });
+
+        // FR-COMP-02: the off-design performance map, using Phase 1's `:Constraint`/`:Parameter`
+        // kinds for the first time anywhere in this codebase -- deliberately modest (an
+        // illustrative sampled shape, not a sourced equation; see this function's own doc
+        // comment and reqs v5 §5.15's honesty note that the real formulas aren't sourced yet).
+        let map_constraint = Element {
+            id: seed.constraint_id.to_string(),
+            kind: NodeKind::Constraint,
+            name: format!("{} performance map", seed.subsystem_id),
+            active: true,
+            origin: Origin::Human,
+        };
+        state
+            .neo4j
+            .upsert_element(project_id, &map_constraint)
+            .await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: map_constraint.id.clone(),
+            kind: map_constraint.kind,
+            name: map_constraint.name.clone(),
+        });
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: seed.constraint_id.to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({
+                        "description": "Pressure ratio vs. equivalent weight flow, parametrized by equivalent speed, with a stall/surge limit line",
+                        // Illustrative shape only, at one fixed equivalent speed -- not a real
+                        // constitutive relation. There's no dedicated "constraint uses parameter"
+                        // edge in the Phase 1 schema yet, so this plain id list is the honest
+                        // stand-in until Parametrics evaluation (Phase 5) needs a real one.
+                        "usesParameterIds": [seed.weight_flow_param_id, seed.speed_param_id],
+                        "sampledPointsAtDesignSpeed": [
+                            { "equivalentWeightFlowLbPerSec": seed.inlet_port.2["equivalentWeightFlowLbPerSec"].clone(), "pressureRatio": 1.30 },
+                            { "equivalentWeightFlowLbPerSec": design_weight_flow.clone(), "pressureRatio": 1.40 },
+                            { "equivalentWeightFlowLbPerSec": 0.0, "pressureRatio": 1.35, "note": "illustrative stall/surge knee, not a sourced value" },
+                        ],
+                        "sourceNote": "illustrative shape only -- real constitutive equations not yet sourced (reqs v5 §5.15)",
+                    }),
+                },
+            )
+            .await?;
+
+        for (param_id, symbol) in [
+            (seed.weight_flow_param_id, "w*sqrt(theta)/delta"),
+            (seed.speed_param_id, "N/sqrt(theta)"),
+        ] {
+            let param = Element {
+                id: param_id.to_string(),
+                kind: NodeKind::Parameter,
+                name: format!("{} {}", seed.subsystem_id, symbol),
+                active: true,
+                origin: Origin::Human,
+            };
+            state.neo4j.upsert_element(project_id, &param).await?;
+            diff_entries.push(DiffEntry::ElementCreated {
+                element_id: param.id.clone(),
+                kind: param.kind,
+                name: param.name.clone(),
+            });
+            state
+                .postgres
+                .upsert_body(
+                    project_id,
+                    &ElementBody {
+                        element_id: param_id.to_string(),
+                        rationale: None,
+                        properties: serde_json::json!({ "symbol": symbol, "units": "corrected (equivalent) units" }),
+                    },
+                )
+                .await?;
+            // EdgeKind::Bound's real endpoint rule (packages/sysml-core/src/lib.rs): source must
+            // be a Parameter, target is unconstrained -- here, the subsystem whose Value
+            // Property this Parameter represents (FR-PARAM-02).
+            state
+                .neo4j
+                .create_edge(
+                    project_id,
+                    &Edge {
+                        source: param_id.to_string(),
+                        target: seed.subsystem_id.to_string(),
+                        kind: EdgeKind::Bound,
+                    },
+                )
+                .await?;
+            diff_entries.push(DiffEntry::EdgeCreated {
+                source: param_id.to_string(),
+                target: seed.subsystem_id.to_string(),
+                kind: EdgeKind::Bound,
+            });
+        }
+
+        // FR-COMP-05: gas-generator matching interface, as real `:Port` elements following reqs
+        // v5 §5.16's station-numbering convention.
+        for (port_id, station, port_properties) in [seed.inlet_port, seed.exit_port] {
+            let mut properties = port_properties.as_object().cloned().unwrap_or_default();
+            properties.insert("station".to_string(), serde_json::json!(station));
+            let port = Element {
+                id: port_id.to_string(),
+                kind: NodeKind::Port,
+                name: format!("{} station {}", seed.subsystem_id, station),
+                active: true,
+                origin: Origin::Human,
+            };
+            state.neo4j.upsert_element(project_id, &port).await?;
+            diff_entries.push(DiffEntry::ElementCreated {
+                element_id: port.id.clone(),
+                kind: port.kind,
+                name: port.name.clone(),
+            });
+            state
+                .postgres
+                .upsert_body(
+                    project_id,
+                    &ElementBody {
+                        element_id: port_id.to_string(),
+                        rationale: None,
+                        properties: serde_json::Value::Object(properties),
+                    },
+                )
+                .await?;
+            state
+                .neo4j
+                .create_edge(
+                    project_id,
+                    &Edge {
+                        source: seed.subsystem_id.to_string(),
+                        target: port_id.to_string(),
+                        kind: EdgeKind::Contains,
+                    },
+                )
+                .await?;
+            diff_entries.push(DiffEntry::EdgeCreated {
+                source: seed.subsystem_id.to_string(),
+                target: port_id.to_string(),
+                kind: EdgeKind::Contains,
+            });
+        }
+
+        // Extended Interface Contract worked examples (impl v5 §2.6) -- merged onto the
+        // subsystem's existing body (read-then-write, `mode_b.rs::upsert_subsystem_contract`'s
+        // exact pattern) rather than replacing it, and tagged so this is never confused with a
+        // real Mode B run's `modeBProvenance`.
+        let existing = state
+            .postgres
+            .get_body(project_id, seed.subsystem_id)
+            .await?;
+        let mut properties = existing
+            .as_ref()
+            .and_then(|b| b.get("properties"))
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let rationale = existing
+            .as_ref()
+            .and_then(|b| b.get("rationale"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        for (key, value) in seed.interface_contract {
+            let old = properties
+                .get(key)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            diff_entries.push(DiffEntry::PropertyChanged {
+                element_id: seed.subsystem_id.to_string(),
+                property: key.to_string(),
+                old,
+                new: value.clone(),
+            });
+            properties.insert(key.to_string(), value);
+        }
+        properties.insert(
+            "specProvenance".to_string(),
+            serde_json::json!("docs-worked-example"),
+        );
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: seed.subsystem_id.to_string(),
+                    rationale,
+                    properties: serde_json::Value::Object(properties),
+                },
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 /// Integration tests against the real docker-compose stack (`docker compose up -d`) — `#[ignore]`d
@@ -4056,6 +4499,167 @@ mod tests {
         // A bogus handle must be rejected loudly (NOT_FOUND), never silently.
         let bogus = archspace_client::get_design_space_stats("does-not-exist").await;
         assert!(bogus.is_err(), "a bogus handle should be rejected");
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 3 (FR-COMP-01/02/05, extended Interface Contract
+    /// examples) — calls `seed_turbofan_ref` directly against a fresh project (not through the
+    /// once-only `ensure_seeded` gate) and asserts the real FR-COMP content it now creates.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn seed_turbofan_ref_lands_fr_comp_content_for_both_compressor_subsystems() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "fr-comp-seed").await;
+
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        for (subsystem_id, spec_req_id) in [
+            ("FanLpCompression", "REQ-FAN-SPEC"),
+            ("CoreHpCompressor", "REQ-CORE-SPEC"),
+        ] {
+            // FR-COMP-01/06: a real Requirement element, Satisfy-linked from its subsystem, with
+            // the 9-field spec plus the negotiable/flagged convention as body properties.
+            let spec_req = state
+                .neo4j
+                .get_element(&project.id, spec_req_id)
+                .await
+                .unwrap()
+                .expect("spec Requirement should exist");
+            assert_eq!(spec_req.kind, NodeKind::Requirement);
+
+            let satisfy_edges = state
+                .neo4j
+                .edges_of_kind(&project.id, EdgeKind::Satisfy)
+                .await
+                .unwrap();
+            assert!(
+                satisfy_edges
+                    .iter()
+                    .any(|e| e.source == subsystem_id && e.target == spec_req_id),
+                "expected {subsystem_id} -Satisfy-> {spec_req_id}, got {satisfy_edges:?}"
+            );
+
+            let spec_body = state
+                .postgres
+                .get_body(&project.id, spec_req_id)
+                .await
+                .unwrap()
+                .expect("spec Requirement should have a body");
+            let spec_properties = spec_body["properties"].as_object().unwrap();
+            for field in [
+                "designWeightFlowLbPerSec",
+                "designEquivalentSpeedRpm",
+                "targetPolytropicEfficiency",
+                "highEfficiencyOperatingRangePercentNCorrected",
+                "inletDiameterIn",
+                "outletDiameterIn",
+                "maxOutletVelocityFtPerSec",
+                "targetLengthIn",
+                "targetWeightLb",
+                "inletDistortionTolerance",
+                "negotiable",
+                "flagged",
+            ] {
+                assert!(
+                    !spec_properties[field].is_null(),
+                    "{spec_req_id}.{field} should be populated, got {spec_body}"
+                );
+            }
+
+            // FR-COMP-05: two real Ports, Contains-linked from the subsystem.
+            let contains_edges = state.neo4j.contains_edges(&project.id).await.unwrap();
+            let port_ids: Vec<&str> = contains_edges
+                .iter()
+                .filter(|e| e.source == subsystem_id && e.target != subsystem_id)
+                .map(|e| e.target.as_str())
+                .filter(|id| *id != "Engine")
+                .collect();
+            let ports_for_subsystem: Vec<&str> = contains_edges
+                .iter()
+                .filter(|e| e.source == subsystem_id)
+                .map(|e| e.target.as_str())
+                .collect();
+            assert_eq!(
+                ports_for_subsystem.len(),
+                2,
+                "expected 2 ports Contains-linked from {subsystem_id}, got {port_ids:?}"
+            );
+            for port_id in ports_for_subsystem {
+                let port = state
+                    .neo4j
+                    .get_element(&project.id, port_id)
+                    .await
+                    .unwrap()
+                    .expect("port should exist");
+                assert_eq!(port.kind, NodeKind::Port);
+                let port_body = state
+                    .postgres
+                    .get_body(&project.id, port_id)
+                    .await
+                    .unwrap()
+                    .expect("port should have a body");
+                assert!(!port_body["properties"]["station"].is_null());
+                assert!(!port_body["properties"]["equivalentWeightFlowLbPerSec"].is_null());
+            }
+        }
+
+        // FR-COMP-02: the first-ever real Constraint/Parameter content, Bound-wired.
+        let constraint = state
+            .neo4j
+            .get_element(&project.id, "FanPerformanceMapConstraint")
+            .await
+            .unwrap()
+            .expect("performance map Constraint should exist");
+        assert_eq!(constraint.kind, NodeKind::Constraint);
+
+        let param = state
+            .neo4j
+            .get_element(&project.id, "FanEquivalentWeightFlowParam")
+            .await
+            .unwrap()
+            .expect("Parameter should exist");
+        assert_eq!(param.kind, NodeKind::Parameter);
+
+        let bound_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::Bound)
+            .await
+            .unwrap();
+        assert!(
+            bound_edges
+                .iter()
+                .any(|e| e.source == "FanEquivalentWeightFlowParam"
+                    && e.target == "FanLpCompression"),
+            "expected FanEquivalentWeightFlowParam -Bound-> FanLpCompression, got {bound_edges:?}"
+        );
+
+        // Interface Contract worked examples merged onto the subsystem's body, alongside (not
+        // clobbering) the FR-COMP-01 content already written there via REQ-FAN-SPEC's own
+        // upsert_body call (a different element, so no clobber risk) plus whatever the rest of
+        // seed_turbofan_ref already wrote to FanLpCompression/CoreHpCompressor directly.
+        let fan_body = state
+            .postgres
+            .get_body(&project.id, "FanLpCompression")
+            .await
+            .unwrap()
+            .expect("FanLpCompression should have a body after the Interface Contract merge");
+        let fan_properties = &fan_body["properties"];
+        for field in [
+            "performanceTargets",
+            "boundaryConditions",
+            "geometricEnvelope",
+            "interfacePortDefinitions",
+            "massCostTargets",
+            "materialProcessConstraints",
+        ] {
+            assert!(
+                !fan_properties[field].is_null(),
+                "FanLpCompression.{field} should be populated, got {fan_body}"
+            );
+        }
+        assert_eq!(
+            fan_properties["specProvenance"],
+            serde_json::json!("docs-worked-example")
+        );
     }
 
     /// Compiles `control_sim::golden_alf_transitions` (the pilot's Idle->Armed->Running->Shutdown

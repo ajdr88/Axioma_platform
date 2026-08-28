@@ -283,7 +283,11 @@ pub struct Edge {
 /// A single semantic-validation failure. The real layer (impl §4.2) also checks parametric
 /// consistency — no parametric model exists yet, so that rule has nothing to validate against
 /// and isn't represented here yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` dropped from this derive in docs/IMPLEMENTATION_KICKOFF.md Phase 3: `f64` (needed for
+// `CompressorLoadingOutOfBounds`'s real-valued diffusion-factor/Mach fields) has no `Eq` impl
+// (NaN breaks reflexivity) — confirmed nothing in this codebase actually relied on `ValidationError:
+// Eq` specifically (only `PartialEq`, via `assert_eq!` in tests) before making this change.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ValidationError {
     ContainmentCycle {
         parent: ElementId,
@@ -311,6 +315,16 @@ pub enum ValidationError {
     DanglingEdge {
         edge_kind: EdgeKind,
         missing_id: ElementId,
+    },
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 3 (FR-COMP-03) — a compressor-subsystem
+    /// configuration's diffusion factor or relative Mach number falls outside the stated bound
+    /// without an explicit, human-acknowledged override. See
+    /// [`check_compressor_blade_loading`]. `metric` is `"diffusionFactor"`/`"relativeMach"`.
+    CompressorLoadingOutOfBounds {
+        element_id: ElementId,
+        metric: &'static str,
+        value: f64,
+        bound: f64,
     },
 }
 
@@ -345,6 +359,16 @@ impl std::fmt::Display for ValidationError {
             } => write!(
                 f,
                 "cannot create {edge_kind:?} edge: element {missing_id} does not exist"
+            ),
+            ValidationError::CompressorLoadingOutOfBounds {
+                element_id,
+                metric,
+                value,
+                bound,
+            } => write!(
+                f,
+                "{element_id}: {metric} {value} exceeds the {bound} bound without an \
+                 acknowledged override"
             ),
         }
     }
@@ -480,6 +504,69 @@ pub fn check_relationship_endpoints(
             target_kind,
         })
     }
+}
+
+/// FR-COMP-03 (docs/IMPLEMENTATION_KICKOFF.md Phase 3) — rejects a compressor-subsystem
+/// configuration whose diffusion factor or relative Mach number falls outside the stated bound.
+/// Thresholds are the exact numbers reqs v5 §5.15/FR-COMP-03 cite (sourced from NASA SP-36 via
+/// the literature-extraction working doc), not invented here:
+/// - Diffusion factor > 0.4 is rejected unless `override_acknowledged`.
+/// - Relative Mach > 1.35 ("demonstrated-extended," the doc's own outer ceiling) is rejected
+///   **unconditionally** — no override accepts beyond it.
+/// - Relative Mach in `(1.2, 1.35]` ("routine" vs. "demonstrated-extended") is rejected unless
+///   `override_acknowledged`.
+/// - Either metric can be `None` (not yet specified) — a `None` metric is never checked, matching
+///   how every other optional body property in this codebase is treated (absence isn't a
+///   violation of a bound that doesn't apply yet).
+///
+/// **Pure and tested, not yet wired into any HTTP endpoint** — this codebase's one generic
+/// body-property endpoint (`PATCH .../elements/:id/body`) validates nothing kind-specific today
+/// (Hazard severity, Stage Tracking status, etc. are all unvalidated JSONB-bag conventions), and
+/// bolting a check onto only this one property would make that endpoint inconsistently stricter
+/// for compressors than for everything else already flowing through it. Wiring this into a real
+/// calling convention (with `traceability.rs`'s existing `?acknowledge=true`/`409` pattern as the
+/// natural REST shape) is Phase 5's "API surface" work, not this phase's.
+pub fn check_compressor_blade_loading(
+    element_id: &str,
+    diffusion_factor: Option<f64>,
+    relative_mach: Option<f64>,
+    override_acknowledged: bool,
+) -> Result<(), ValidationError> {
+    const DIFFUSION_FACTOR_BOUND: f64 = 0.4;
+    const RELATIVE_MACH_ROUTINE_BOUND: f64 = 1.2;
+    const RELATIVE_MACH_DEMONSTRATED_BOUND: f64 = 1.35;
+
+    if let Some(value) = diffusion_factor {
+        if value > DIFFUSION_FACTOR_BOUND && !override_acknowledged {
+            return Err(ValidationError::CompressorLoadingOutOfBounds {
+                element_id: element_id.to_string(),
+                metric: "diffusionFactor",
+                value,
+                bound: DIFFUSION_FACTOR_BOUND,
+            });
+        }
+    }
+
+    if let Some(value) = relative_mach {
+        if value > RELATIVE_MACH_DEMONSTRATED_BOUND {
+            return Err(ValidationError::CompressorLoadingOutOfBounds {
+                element_id: element_id.to_string(),
+                metric: "relativeMach",
+                value,
+                bound: RELATIVE_MACH_DEMONSTRATED_BOUND,
+            });
+        }
+        if value > RELATIVE_MACH_ROUTINE_BOUND && !override_acknowledged {
+            return Err(ValidationError::CompressorLoadingOutOfBounds {
+                element_id: element_id.to_string(),
+                metric: "relativeMach",
+                value,
+                bound: RELATIVE_MACH_ROUTINE_BOUND,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// An in-memory model graph. Real persistence is polyglot (Neo4j for topology, Postgres/JSONB
@@ -985,6 +1072,57 @@ mod tests {
             )
             .is_ok());
         }
+    }
+
+    /// FR-COMP-03 (Phase 3): within the routine bound on both metrics — always accepted.
+    #[test]
+    fn compressor_loading_within_routine_bounds_is_accepted() {
+        assert!(
+            check_compressor_blade_loading("FanLpCompression", Some(0.35), Some(1.1), false)
+                .is_ok()
+        );
+        // Missing metrics are never checked.
+        assert!(check_compressor_blade_loading("FanLpCompression", None, None, false).is_ok());
+    }
+
+    #[test]
+    fn compressor_loading_over_diffusion_factor_bound_needs_override() {
+        let result = check_compressor_blade_loading("FanLpCompression", Some(0.45), None, false);
+        assert_eq!(
+            result,
+            Err(ValidationError::CompressorLoadingOutOfBounds {
+                element_id: "FanLpCompression".to_string(),
+                metric: "diffusionFactor",
+                value: 0.45,
+                bound: 0.4,
+            })
+        );
+        assert!(check_compressor_blade_loading("FanLpCompression", Some(0.45), None, true).is_ok());
+    }
+
+    #[test]
+    fn compressor_loading_demonstrated_extended_mach_needs_override() {
+        // 1.2 < 1.3 <= 1.35: rejected without override, accepted with one.
+        assert!(
+            check_compressor_blade_loading("CoreHpCompressor", None, Some(1.3), false).is_err()
+        );
+        assert!(check_compressor_blade_loading("CoreHpCompressor", None, Some(1.3), true).is_ok());
+    }
+
+    #[test]
+    fn compressor_loading_beyond_demonstrated_ceiling_is_never_accepted() {
+        // Above 1.35 is rejected even with an override -- it's the doc's own outer ceiling, not
+        // just the routine/demonstrated split.
+        let result = check_compressor_blade_loading("CoreHpCompressor", None, Some(1.4), true);
+        assert_eq!(
+            result,
+            Err(ValidationError::CompressorLoadingOutOfBounds {
+                element_id: "CoreHpCompressor".to_string(),
+                metric: "relativeMach",
+                value: 1.4,
+                bound: 1.35,
+            })
+        );
     }
 
     #[test]

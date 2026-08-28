@@ -20,8 +20,17 @@ fn row_to_element(row: &Row) -> Result<Element> {
     let labels: Vec<String> = row.get("labels").context("missing labels")?;
     let active: bool = row.get("active").context("missing active")?;
     let origin: String = row.get("origin").context("missing origin")?;
+    // Every node carries both the generic `:Element` label and its specific kind's label (e.g.
+    // `:Parameter`), and Neo4j's `labels(n)` order is NOT the MERGE clause's label order -- it's
+    // determined by each label's internal token id, which depends on which label was first
+    // created anywhere in the database. That means "Element" can legitimately sort before a
+    // node's real, more specific label (confirmed empirically: freshly-introduced labels like
+    // `:Parameter` sorted first as `["Element", "Parameter"]`, while long-lived ones like
+    // `:Structure` sorted as `["Structure", "Element"]`) -- so the generic label must be skipped
+    // explicitly rather than relying on encountering the specific one first.
     let kind = labels
         .iter()
+        .filter(|l| l.as_str() != NodeKind::Element.as_label())
         .find_map(|l| NodeKind::from_label(l))
         .unwrap_or(NodeKind::Element);
     Ok(Element {

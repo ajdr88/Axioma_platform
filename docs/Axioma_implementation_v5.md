@@ -647,3 +647,98 @@ whole graph as infeasible.
   Wiring `archspace_client.rs` into a real `/cem/mode-b/design-space/*` HTTP surface (§1.2a) and
   building `cem-core`'s own encode/decode logic against it is P2.1 proper's job, now re-scoped
   (impl §4.1) on the strength of this ratified ADR rather than an unresolved "Proposed" one.
+
+---
+
+## 11. Phase 3: FR-COMP Content Landed **[REV-D]**
+
+`docs/IMPLEMENTATION_KICKOFF.md` Phase 3 called for landing FR-COMP-01…06 as actual content
+against `Turbofan-Ref`, plus the Interface Contract worked examples. Recorded here is what was
+actually seeded and verified, not what was planned.
+
+### 11.1 What was seeded, with real element ids
+
+`apps/api/src/main.rs::seed_turbofan_ref` now calls a new `seed_fr_comp_content` step (part of the
+same genesis commit, so it's covered by that function's own existing diff-accuracy discipline) that
+creates, for each of `FanLpCompression`/`CoreHpCompressor`:
+
+- **FR-COMP-01** — a real `:Requirement` (`REQ-FAN-SPEC`/`REQ-CORE-SPEC`), `Satisfy`-linked from
+  its subsystem, carrying the 9-field structured spec as body properties. Numeric values reuse
+  `cem-core`'s own reference constants where they overlap (bypass ratio = 5.0, matching
+  `cem_core::REFERENCE_BYPASS_RATIO`) — duplicated as a literal rather than exposing that constant
+  publicly, since `cem-core` deliberately stays a zero-I/O, self-contained crate.
+- **FR-COMP-02** — the **first-ever real instantiation** of Phase 1's `:Constraint`/`:Parameter`
+  `NodeKind`s: one `:Constraint` per subsystem (`FanPerformanceMapConstraint`/
+  `CorePerformanceMapConstraint`) carrying an explicitly-flagged-illustrative sampled-points
+  property (`sourceNote: "illustrative shape only -- real constitutive equations not yet sourced"`
+  — reqs v5 §5.15 itself says the real off-design equations aren't sourced yet, so this doesn't
+  pretend otherwise), plus two `:Parameter` elements per subsystem (equivalent weight flow, speed),
+  each `Bound`-edged `Parameter --Bound--> subsystem` (the real `EdgeKind::Bound` endpoint rule:
+  source must be a `Parameter`). The Constraint's body lists which Parameter ids it uses as a plain
+  JSON array — there's no dedicated "constraint uses parameter" edge in the Phase 1 schema, and
+  inventing one mid-content-authoring would be designing schema outside its own phase; flagged as a
+  real, honest gap for whenever Parametrics evaluation (§4.1, Phase 5) actually gets built.
+- **FR-COMP-03** — landed as a **pure, tested `sysml-core` function only, not wired into any HTTP
+  endpoint this pass**: `sysml_core::check_compressor_blade_loading` (+ a new
+  `ValidationError::CompressorLoadingOutOfBounds` variant), exercising the exact thresholds reqs v5
+  already cites (diffusion factor > 0.4 needs override; relative Mach > 1.35 is never accepted even
+  with one; 1.2 < Mach ≤ 1.35 needs override). Confirmed via 4 unit tests covering each boundary.
+  **Why not wired in yet**: the only generic body-mutation endpoint (`PATCH
+  .../elements/:id/body`) validates nothing kind-specific for *any* element kind today — Hazard
+  severity, Stage-Tracking status, etc. are all unvalidated JSONB-bag conventions. Bolting a
+  diffusion-factor/Mach check onto that one endpoint would make it inconsistently stricter than
+  every other kind-specific property already flowing through it. `traceability.rs`'s
+  `?acknowledge=true`/`409` pattern is the existing human-override REST convention, noted here for
+  whenever a real kind-specific validation calling convention gets built (Phase 5 API-surface work,
+  §1.2a) — matching how P2.2's own `autonomy::decide` stayed pure-and-tested before `mode_b.rs`
+  wired it in once a real caller existed.
+- **FR-COMP-05** — two real `:Port` elements per subsystem (Fan: station 1 inlet / station 2 exit;
+  Core: station 2 inlet / station 3 exit — station 2 legitimately shared between them, a real
+  system-model detail per §5.16's convention, not an inconsistency), `Contains`-edged from their
+  subsystem, carrying equivalent weight flow/speed (and `bleedFractionB` on Core's exit port only,
+  per the reconciliation table's bleed-origin assignment) as body properties.
+- **FR-COMP-06** — landed as a body-property convention only (`negotiable: true`, `flagged: false`
+  on the two spec Requirements) — a real automatic incompatibility *detector* needs formulas this
+  codebase doesn't have yet; this is the hook a future real check sets, not an active check itself.
+- **Interface Contract worked examples** (§2.6's table) merged (read-then-write,
+  `mode_b.rs::upsert_subsystem_contract`'s exact pattern, so this never clobbers or is clobbered by
+  a real Mode B `accept` run touching the same subsystem body later) onto `FanLpCompression`/
+  `CoreHpCompressor`'s existing bodies using `cem_core::build_interface_contract`'s real six
+  camelCase keys, tagged `specProvenance: "docs-worked-example"` so it's never confused with a real
+  run's `modeBProvenance` tag.
+
+**FR-COMP-04 (stage-count consistency) is explicitly deferred to Phase 4** — it needs Turbine-side
+content (stage-count Parameters, a `ChoiceConstraint` edge) outside this phase's compressor-only
+scope; a lopsided compressor-only half of a cross-subsystem constraint would be worse than clearly
+deferring it.
+
+### 11.2 A real, pre-existing bug found and fixed while seeding this content
+
+`apps/api/src/store/neo4j.rs`'s `row_to_element` resolved an element's `NodeKind` by scanning
+`labels(n)` and returning the first label `NodeKind::from_label` recognized. **Neo4j's `labels(n)`
+order is not the `MERGE` clause's label order** — it's determined by each label's internal token
+id, which depends on which label was first created *anywhere in the database*, not per-node. Since
+every element carries both the generic `:Element` label and its specific one, and `:Element` is
+itself a valid `NodeKind`, a freshly-introduced label (here, `:Parameter` — genuinely never
+instantiated before this pass) could sort *after* `:Element` in `labels(n)`, causing `row_to_element`
+to silently resolve the element's kind as the generic `Element` instead of `Parameter`. Confirmed
+empirically against the live Neo4j instance: `FanLpCompression` (a long-lived `:Structure`) returned
+`["Structure", "Element"]`, while `FanEquivalentWeightFlowParam` (brand new) returned `["Element",
+"Parameter"]` — same function, opposite label order. This broke `create_edge`'s
+`check_relationship_endpoints` call for the new `Parameter --Bound--> subsystem` edges (source kind
+read back as `Element`, not `Parameter`, so the real endpoint rule rejected it) — caught by the new
+integration test, not anticipated by the plan. Fixed by explicitly filtering out the generic
+`:Element` label before matching, rather than relying on encountering the specific label first.
+This was latent for every `NodeKind` this whole codebase has ever created, not something Phase 3
+introduced — it simply took a genuinely new label to expose it, since every previously-existing
+label happened to have an internal token id lower than `:Element`'s.
+
+### 11.3 Verification
+
+- `cargo test -p sysml-core`: 28/28 passing (incl. the 4 new `check_compressor_blade_loading` tests).
+- `cargo build/clippy/fmt --workspace`: clean.
+- Full `apps/api` `--ignored` suite against the live Docker stack: 45/45 passing, including the new
+  `seed_turbofan_ref_lands_fr_comp_content_for_both_compressor_subsystems` test and, critically,
+  `mode_b_accept_wires_traceability_and_interface_contract_is_fully_populated` — confirming the
+  Interface Contract merge composes correctly with Mode B's own `accept`-path writes to the same
+  subsystem bodies rather than clobbering them.
