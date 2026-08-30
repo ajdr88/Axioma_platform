@@ -13,6 +13,7 @@ mod auth;
 mod autonomy;
 mod collections;
 mod control_sim;
+mod export;
 mod fuml_client;
 mod import;
 mod information;
@@ -322,6 +323,22 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/collections/:id/freeze",
             post(collections::freeze_collection),
+        )
+        .route(
+            "/api/v0/projects/:projectId/elements/:elementId/attachments",
+            get(export::list_attachments).post(export::create_attachment),
+        )
+        .route(
+            "/api/v0/projects/:projectId/attachments/:id",
+            get(export::download_attachment),
+        )
+        .route(
+            "/api/v0/projects/:projectId/export/table",
+            get(export::export_table),
+        )
+        .route(
+            "/api/v0/projects/:projectId/export/report",
+            post(export::export_report),
         )
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -1417,7 +1434,7 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
 
     let pointer = state
         .objects
-        .put_placeholder(
+        .put_object(
             "turbine/casing-placeholder.txt",
             b"placeholder geometry blob".to_vec(),
         )
@@ -2918,7 +2935,7 @@ mod tests {
             .unwrap();
 
         let pointer = objects
-            .put_placeholder("integration-test/blob.txt", b"placeholder".to_vec())
+            .put_object("integration-test/blob.txt", b"placeholder".to_vec())
             .await
             .unwrap();
         assert!(
@@ -5871,6 +5888,274 @@ mod tests {
         assert!(
             rejected.is_err(),
             "over-ceiling depth/maxFanout must be rejected at save time"
+        );
+    }
+
+    async fn response_text(response: Response) -> String {
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collecting response body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("response body should be valid UTF-8")
+    }
+
+    /// Builds a real `multipart/form-data` request body by hand (axum's `Multipart` extractor
+    /// implements `FromRequest`, which needs a real `Request`, not a plain struct literal like
+    /// every other extractor this test suite constructs directly) and extracts it the same way
+    /// axum's own router would on a real upload.
+    async fn make_multipart(
+        state: &AppState,
+        file_name: &str,
+        content_type: &str,
+        contents: &[u8],
+    ) -> axum::extract::Multipart {
+        let boundary = "axioma-test-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: {content_type}\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(contents);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        use axum::extract::FromRequest;
+        axum::extract::Multipart::from_request(request, state)
+            .await
+            .expect("constructing a test multipart request")
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-EXPORT-04) — real bytes in, real bytes out.
+    /// `ObjectStore` had no read method at all before this pass; this is the first real
+    /// end-to-end exercise of both halves of the pointer pattern together.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn attachment_upload_list_download_round_trips_real_bytes() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "attachments").await;
+        make_structure(&state.neo4j, &project.id, "TurbineHpLp").await;
+
+        let contents = b"a real, not-a-placeholder attachment body";
+        let multipart = make_multipart(&state, "notes.txt", "text/plain", contents).await;
+        let uploaded = export::create_attachment(
+            State(state.clone()),
+            Path((project.id.clone(), "TurbineHpLp".to_string())),
+            multipart,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(uploaded.file_name, "notes.txt");
+        assert_eq!(uploaded.content_type, "text/plain");
+        assert_eq!(uploaded.size_bytes, contents.len() as i64);
+
+        let listed = export::list_attachments(
+            State(state.clone()),
+            Path((project.id.clone(), "TurbineHpLp".to_string())),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, uploaded.id);
+
+        let downloaded = export::download_attachment(
+            State(state.clone()),
+            Path((project.id.clone(), uploaded.id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(downloaded.status(), StatusCode::OK);
+        assert_eq!(
+            downloaded
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/plain"
+        );
+        let downloaded_bytes = axum::body::to_bytes(downloaded.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&downloaded_bytes[..], &contents[..]);
+
+        // A bogus attachment id is a 404, not a panic or a 500.
+        let missing = export::download_attachment(
+            State(state.clone()),
+            Path((project.id.clone(), "does-not-exist".to_string())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-EXPORT-02) — CSV export scoped both ways: by
+    /// `NodeKind` and by a frozen Collection's real membership (reusing this same phase's own
+    /// `/collections/dynamic`+`/freeze`, not a second invented "scope" mechanism).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn export_table_as_csv_scoped_by_kind_and_by_collection() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "export-table").await;
+        make_structure(&state.neo4j, &project.id, "Alpha").await;
+        make_structure(&state.neo4j, &project.id, "Beta").await;
+
+        let by_kind = export::export_table(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Query(export::ExportTableQuery {
+                kind: Some(NodeKind::Structure),
+                collection_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            by_kind
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/csv"
+        );
+        let csv = response_text(by_kind).await;
+        assert!(csv.starts_with("id,name,kind,origin,active\n"));
+        assert!(csv.contains("Alpha,Alpha,Structure,Human,true"));
+        assert!(csv.contains("Beta,Beta,Structure,Human,true"));
+
+        let saved = collections::save_dynamic_collection(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(collections::SaveDynamicCollectionRequest {
+                name: "Just Alpha".to_string(),
+                root_id: "Alpha".to_string(),
+                depth: 0,
+                max_fanout: 10,
+                direction: traceability::Direction::Outgoing,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let frozen = collections::freeze_collection(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), saved.id.clone())),
+        )
+        .await
+        .unwrap();
+        let frozen_body = axum::body::to_bytes(frozen.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let frozen: collections::FreezeCollectionResponse =
+            serde_json::from_slice(&frozen_body).unwrap();
+
+        let by_collection = export::export_table(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Query(export::ExportTableQuery {
+                kind: None,
+                collection_id: Some(frozen.collection_id),
+            }),
+        )
+        .await
+        .unwrap();
+        let csv = response_text(by_collection).await;
+        // depth=0 from Alpha with no outgoing edges visits nothing -- an empty-but-valid CSV
+        // (header only), not an error, confirming the scope really is collection membership and
+        // not silently falling back to "everything."
+        assert_eq!(csv, "id,name,kind,origin,active\n");
+
+        // Neither ?kind= nor ?collectionId= is a precise 400, not a silent empty export.
+        let neither = export::export_table(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Query(export::ExportTableQuery {
+                kind: None,
+                collection_id: None,
+            }),
+        )
+        .await;
+        assert!(neither.is_err());
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-EXPORT-03) — the report HTML contains the same
+    /// hazard data `risk_register_reflects_hazard_severity_and_mitigated_control` already proves
+    /// the JSON endpoint gets right, confirming `build_risk_register` is genuinely shared (not a
+    /// second, independently-computed pipeline).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn export_report_renders_risk_register_html_matching_the_json_endpoint() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "export-report").await;
+
+        state
+            .neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "HAZ-EXPORT-TEST".to_string(),
+                    kind: NodeKind::Hazard,
+                    name: "Export Test Hazard".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .postgres
+            .upsert_body(
+                &project.id,
+                &ElementBody {
+                    element_id: "HAZ-EXPORT-TEST".to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "severity": "Catastrophic", "likelihood": "Frequent" }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let report = export::export_report(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(export::ExportReportRequest {
+                template_id: "risk-register".to_string(),
+                scope_element_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            report
+                .headers()
+                .get(axum::http::header::CONTENT_DISPOSITION)
+                .is_some(),
+            "report export should set Content-Disposition so a browser click downloads it"
+        );
+        let html = response_text(report).await;
+        assert!(html.contains("HAZ-EXPORT-TEST"));
+        assert!(html.contains("Export Test Hazard"));
+        assert!(html.contains("Catastrophic"));
+        // 5 (Catastrophic) x 5 (Frequent) = 25, the same risk_index the JSON endpoint computes.
+        assert!(html.contains("25"));
+
+        let unknown_template = export::export_report(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(export::ExportReportRequest {
+                template_id: "mil-std-882".to_string(),
+                scope_element_id: None,
+            }),
+        )
+        .await;
+        assert!(
+            unknown_template.is_err(),
+            "an unregistered template must be a precise error, not a silent fallback"
         );
     }
 

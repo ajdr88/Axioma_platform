@@ -68,8 +68,12 @@ impl ObjectStore {
         Ok(())
     }
 
-    /// Puts a placeholder blob and returns its pointer (`s3://bucket/key`) — never the bytes.
-    pub async fn put_placeholder(&self, key: &str, bytes: Vec<u8>) -> Result<String> {
+    /// Puts a blob and returns its pointer (`s3://bucket/key`) — never the bytes. Named to match
+    /// `get_object` below (renamed from `put_placeholder` during Phase 5's FR-EXPORT-04 work,
+    /// which needed the read half added — the "placeholder" name was accurate for its one
+    /// original caller, `seed_turbofan_ref`'s fake casing blob, but not for a real user-attached
+    /// file's real bytes).
+    pub async fn put_object(&self, key: &str, bytes: Vec<u8>) -> Result<String> {
         self.client
             .put_object()
             .bucket(&self.bucket)
@@ -79,5 +83,25 @@ impl ObjectStore {
             .await
             .with_context(|| format!("putting object {key}"))?;
         Ok(format!("s3://{}/{key}", self.bucket))
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-EXPORT-04) — the missing read half of the
+    /// pointer pattern. Nothing before this pass ever needed to read a blob back out.
+    pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("getting object {key}"))?;
+        let bytes = output
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("reading object body {key}"))?
+            .into_bytes();
+        Ok(bytes.to_vec())
     }
 }

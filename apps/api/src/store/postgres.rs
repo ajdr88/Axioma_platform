@@ -85,6 +85,30 @@ impl PostgresStore {
         .await
         .context("indexing dynamic_collections project_id column")?;
 
+        // docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-EXPORT-04) — attachment metadata; the bytes
+        // themselves live in the object store (`object_key`), never here (NFR-DATA-02).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS attachments (\
+                id TEXT PRIMARY KEY, \
+                project_id TEXT NOT NULL, \
+                element_id TEXT NOT NULL, \
+                file_name TEXT NOT NULL, \
+                content_type TEXT NOT NULL, \
+                object_key TEXT NOT NULL, \
+                size_bytes BIGINT NOT NULL\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .context("creating attachments table")?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS attachments_element_id_idx \
+             ON attachments (project_id, element_id)",
+        )
+        .execute(&pool)
+        .await
+        .context("indexing attachments element_id column")?;
+
         Ok(Self { pool })
     }
 
@@ -237,4 +261,111 @@ impl PostgresStore {
         .with_context(|| format!("fetching dynamic collection {id}"))?;
         Ok(row)
     }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-EXPORT-04) — attachment metadata row. `id` is
+    /// server-minted, matching every other entity-creation convention in this codebase.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_attachment(
+        &self,
+        project_id: &str,
+        id: &str,
+        element_id: &str,
+        file_name: &str,
+        content_type: &str,
+        object_key: &str,
+        size_bytes: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO attachments \
+             (id, project_id, element_id, file_name, content_type, object_key, size_bytes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(id)
+        .bind(project_id)
+        .bind(element_id)
+        .bind(file_name)
+        .bind(content_type)
+        .bind(object_key)
+        .bind(size_bytes)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("saving attachment {id}"))?;
+        Ok(())
+    }
+
+    /// Tuple-typed, not a derived struct — matches every other query in this file (no
+    /// `#[derive(sqlx::FromRow)]` anywhere in this codebase yet, and the `sqlx` dependency
+    /// doesn't enable the `macros` feature that derive needs; a plain tuple avoids adding one).
+    pub async fn list_attachments(
+        &self,
+        project_id: &str,
+        element_id: &str,
+    ) -> Result<Vec<AttachmentMeta>> {
+        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT id, file_name, content_type, size_bytes FROM attachments \
+             WHERE project_id = $1 AND element_id = $2",
+        )
+        .bind(project_id)
+        .bind(element_id)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("listing attachments for {element_id}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, file_name, content_type, size_bytes)| AttachmentMeta {
+                id,
+                file_name,
+                content_type,
+                size_bytes,
+            })
+            .collect())
+    }
+
+    /// Enough to actually stream the bytes back — `object_key` is deliberately never part of
+    /// `AttachmentMeta` (an internal object-store detail no client needs to see).
+    pub async fn get_attachment(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Option<AttachmentRecord>> {
+        let row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT file_name, content_type, object_key FROM attachments \
+             WHERE id = $1 AND project_id = $2",
+        )
+        .bind(id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("fetching attachment {id}"))?;
+        Ok(
+            row.map(|(file_name, content_type, object_key)| AttachmentRecord {
+                file_name,
+                content_type,
+                object_key,
+            }),
+        )
+    }
+}
+
+/// Attachment metadata as returned to a client listing an element's attachments — never includes
+/// `object_key` (an internal object-store detail, not something a caller needs to see or use
+/// directly; downloading goes through `get_attachment` + `ObjectStore::get_object` instead).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttachmentMeta {
+    pub id: String,
+    #[serde(rename = "fileName")]
+    pub file_name: String,
+    #[serde(rename = "contentType")]
+    pub content_type: String,
+    #[serde(rename = "sizeBytes")]
+    pub size_bytes: i64,
+}
+
+/// Enough to actually stream the bytes back — used only by the download handler, never returned
+/// to a client as JSON (that's `AttachmentMeta`'s job).
+#[derive(Debug, Clone)]
+pub struct AttachmentRecord {
+    pub file_name: String,
+    pub content_type: String,
+    pub object_key: String,
 }

@@ -16,14 +16,17 @@ ADR-011 ratified), **Phase 3** (FR-COMP-01/02/05/06 seeded as real content on `T
 FR-COMP-03 validated-but-unwired, FR-COMP-04 deferred to Phase 4 — see impl v5 §11), **Phase 4**
 (the reconciled 5-subsystem turbofan system-model instance seeded — station 0–8 Ports, boundary
 Functions, SelectionChoice/ConnectionChoice primitives, FR-COMP-04 unblocked, `REQ-THRUST` wired
-into the seeded structure — see impl v5 §12), and **Phase 5's "Foundation slice"** (canvas visual
+into the seeded structure — see impl v5 §12), **Phase 5's "Foundation slice"** (canvas visual
 types for Function/SelectionChoice/ConnectionChoice + ArchDerives/IncompatibleWith/ChoiceConstraint
 edges, review-gate origin UI, `/parametrics/evaluate` + `/information/elements` +
-`/collections/dynamic|freeze` — see impl v5 §13; document-import's pipeline, Export/Reporting, and
-Interaction view + Swimlane mode remain unbuilt, the last blocked on a real `Allocate` `EdgeKind`
-gap found during scoping) are all built and verified. Phase 6 (test-scenario authoring) and the
-rest of Phase 5 are still open. `docs/claude/*.md` holds the original amendment/analysis docs
-Phase 0 merged, kept for history.
+`/collections/dynamic|freeze` — see impl v5 §13), and **Phase 5's Export & Reporting**
+(`/elements/:id/attachments` + `/export/table` (CSV) + `/export/report` (one HTML template,
+`"risk-register"`) + a client-side "Export PNG" canvas button — see impl v5 §14; research found
+none of the three mechanisms this group's own design assumed already existed actually did) are all
+built and verified. Still unbuilt within Phase 5: the document-import pipeline, and Interaction
+view + Swimlane mode (the latter blocked on a real `Allocate` `EdgeKind` gap found during
+scoping). Phase 6 (test-scenario authoring) is also still open. `docs/claude/*.md` holds the
+original amendment/analysis docs Phase 0 merged, kept for history.
 
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2

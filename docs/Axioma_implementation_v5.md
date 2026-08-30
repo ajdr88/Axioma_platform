@@ -923,9 +923,82 @@ verification happened to surface again.
 
 `/parametrics/constraints`/`/parametrics/bindings`/`/information/data-types` (already covered by the
 generic endpoints, §13.1). The document-import async job pipeline (§1.1a — needs an LLM-structuring
-capability that doesn't exist). `/export/*`/`/interactions/*` and their `diagram-engine`
-counterparts (ADR-009 unresolved; headless-render/report-template generalization not attempted).
+capability that doesn't exist). `/export/*` **was subsequently built — see §14**.
+`/interactions/*` and its `diagram-engine` counterpart remain unbuilt (ADR-009 unresolved).
 Swimlane mode (FR-CORE-12) — its own spec text assumes an `Allocate` `EdgeKind` that Phase 1 never
 actually created, a real gap flagged here rather than silently invented around. The choice-
 resolution click-to-resolve interaction and design-space stats sidebar from the turbofan amendment
 §3.5 — both depend on the still-unbuilt Mode B design-space HTTP surface (§1.2a).
+
+---
+
+## 14. Phase 5 continued: Export & Reporting (FR-EXPORT-01..04) **[REV-D]**
+
+The user asked to continue working through Phase 5's deferred verticals in sequence, starting with
+**Export & Reporting**. Reqs v5 §5.12 frames all four FR-EXPORT items as reusing existing
+mechanisms; research before designing anything found **none of the three referenced mechanisms
+actually existed in reusable form**, which materially changed this work's real scope.
+
+### 14.1 What was found before designing anything
+
+- **FR-SAFE-05's risk-register export (`traceability.rs::get_risk_register`) was a single
+  hardcoded query→struct→JSON pipeline**, not a template+scope engine — its own doc comment
+  already said so ("no literal ARP4761 template exists... this is this project's own reasonable
+  field layout"). `format: "ARP4761"` was a hardcoded literal. There was nothing to "generalize."
+- **No "Generic Table view" exists anywhere in `apps/web`** — FR-EXPORT-02's premise references a
+  UI component that was never built.
+- **`GeometryPointer` (`packages/sysml-core/src/lib.rs`) was dead code** — never constructed or
+  used anywhere except its own round-trip unit test. The real pattern at the one call site
+  (`seed_turbofan_ref`) was a plain string URI embedded in `ElementBody.properties`.
+  **`ObjectStore` had a write method (`put_placeholder`) and no read method at all** — a real gap,
+  since an attachment necessarily needs a download path.
+
+### 14.2 What was built
+
+- **FR-EXPORT-04 (attachments)** — `ObjectStore::get_object` (the missing read half;
+  `put_placeholder` renamed to `put_object` to match, its one call site — `seed_turbofan_ref` —
+  updated). New Postgres `attachments` table (mirrors `dynamic_collections`'s creation pattern).
+  Three endpoints (`POST/GET .../elements/:id/attachments`, `GET .../attachments/:id`) — multipart
+  upload (`axum`'s `multipart` feature, not previously enabled), metadata list, byte-stream
+  download. No Neo4j write, no `record_commit` — an attachment references an existing element by
+  id without creating/modifying any graph node/edge, matching reqs v5 §5.12's "none of them write
+  to the graph" framing read as "the topology store specifically."
+- **FR-EXPORT-02 (tabular)** — `GET .../export/table` (CSV only; XLSX needs a new crate not
+  justified this pass), scoped by `?kind=X` (a `NodeKind` filter) or `?collectionId=Y` (a frozen
+  `/collections/{id}/freeze` result's real membership — Phase 5's own Collections feature standing
+  in for the nonexistent Generic Table view's "scope," a real non-duplicative connection rather
+  than a second invented scoping mechanism). Fixed baseline columns; hand-rolled RFC4180 CSV
+  writer (no new crate justified for ~10 lines of well-known escaping logic).
+- **FR-EXPORT-03 (report)** — `traceability::get_risk_register`'s data-gathering was split into
+  `pub(crate) build_risk_register`, now called by both the unchanged existing JSON endpoint and a
+  new `POST .../export/report { templateId, scopeElementId? }` (`export.rs`). Exactly one template
+  is registered — `"risk-register"`, rendered as a plain HTML table (no PDF crate justified for one
+  template; reqs v5 explicitly accepts "PDF/HTML"). Any other `templateId` is a precise 400 naming
+  what's missing, never a silent fallback — same discipline as `sysml-core`'s own validation layer.
+- **FR-EXPORT-01 (diagram image)** — client-side only. `html-to-image`'s `toPng` captures
+  `Canvas`'s existing `canvasWrapperRef` (the same DOM node the clustering margin math already
+  measures) on a new "Export PNG" toolbar button in `page.tsx`, triggering a normal browser
+  download. Confirmed via a live Playwright check: a real ~190KB PNG (correct magic bytes)
+  downloads with the project id in its filename, no console errors. The **server-side
+  headless-render path for full-diagram export "at any size"** (reqs' other named half, reusing
+  the virtualization/clustering machinery in reverse) is real, separate new capability — not
+  attempted this pass.
+
+### 14.3 Explicitly not attempted this pass
+
+XLSX writing; PDF generation; the server-side headless diagram render; any MIL-STD-882/ISO-26262
+report template variant — none has a concrete spec to build against, the same gap
+`get_risk_register`'s own pre-existing doc comment already flagged before this pass touched it.
+
+### 14.4 Verification
+
+- `cargo build/clippy/fmt --workspace`; `pnpm --filter @axioma/web exec tsc --noEmit`/Biome; a real
+  `next build` (catches any SSR/bundling issue the new `html-to-image` dependency could introduce —
+  none found).
+- Full `apps/api` `--ignored` suite against the live Docker stack: 52/52 passing, including three
+  new tests (attachment upload→list→download round-trip with real bytes; table export scoped both
+  ways; report export producing HTML that contains the same hazard data
+  `risk_register_reflects_hazard_severity_and_mitigated_control` already proves the JSON endpoint
+  computes) and confirming that existing test itself is unaffected by the `build_risk_register`
+  refactor.
+- Live Playwright verification of the "Export PNG" button (§14.2) — not just passing tests.

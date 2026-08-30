@@ -11,7 +11,7 @@ cem-core = { path = "../../packages/cem-core" }
 sysml-core = { path = "../../packages/sysml-core" }
 sysml-textual = { path = "../../packages/sysml-textual" }
 
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 tokio = { workspace = true }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = { workspace = true }

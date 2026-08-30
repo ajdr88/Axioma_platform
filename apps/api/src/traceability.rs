@@ -407,36 +407,36 @@ pub async fn delete_element(
 }
 
 #[derive(Debug, serde::Serialize)]
-struct RiskRegisterEntry {
+pub(crate) struct RiskRegisterEntry {
     #[serde(rename = "hazardId")]
-    hazard_id: String,
-    description: String,
+    pub(crate) hazard_id: String,
+    pub(crate) description: String,
     #[serde(rename = "causingStructure")]
-    causing_structure: Option<String>,
+    pub(crate) causing_structure: Option<String>,
     #[serde(rename = "severityClassification")]
-    severity_classification: String,
-    likelihood: String,
+    pub(crate) severity_classification: String,
+    pub(crate) likelihood: String,
     #[serde(rename = "riskIndex")]
-    risk_index: u32,
-    controls: Vec<RiskRegisterControl>,
+    pub(crate) risk_index: u32,
+    pub(crate) controls: Vec<RiskRegisterControl>,
     #[serde(rename = "residualRisk")]
-    residual_risk: u32,
-    status: &'static str,
+    pub(crate) residual_risk: u32,
+    pub(crate) status: &'static str,
 }
 
 #[derive(Debug, serde::Serialize)]
-struct RiskRegisterControl {
-    id: String,
-    name: String,
-    status: String,
+pub(crate) struct RiskRegisterControl {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) status: String,
 }
 
 #[derive(Debug, serde::Serialize)]
-struct RiskRegister {
+pub(crate) struct RiskRegister {
     #[serde(rename = "projectId")]
-    project_id: String,
-    format: &'static str,
-    entries: Vec<RiskRegisterEntry>,
+    pub(crate) project_id: String,
+    pub(crate) format: &'static str,
+    pub(crate) entries: Vec<RiskRegisterEntry>,
 }
 
 const SEVERITY_LEVELS: [&str; 5] = ["Negligible", "Minor", "Moderate", "Major", "Catastrophic"];
@@ -453,31 +453,34 @@ fn score_of(levels: &[&str], value: Option<&str>) -> u32 {
     }
 }
 
-/// `GET /api/v0/projects/:projectId/safety/risk-register` (FR-SAFE-05, T-P1.3-04). An
+/// The data-gathering half of the risk register — split out of `get_risk_register` during
+/// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-EXPORT-03) so `export::export_report`'s
+/// `"risk-register"` template reuses this exact logic rather than a second, parallel
+/// implementation (reqs v5 §5.12's own "no new parallel pipeline" instruction). An
 /// ARP4761-*shaped* JSON export — no literal ARP4761 template exists anywhere in the docs to copy
 /// against, so this is this project's own reasonable field layout (hazard/severity/likelihood/
 /// Risk Index/causing structure/linked controls+status/residual risk), same interpretation
 /// precedent as `HazardRiskPanel.tsx`'s Risk Index formula itself. MIL-STD-882/ISO-26262 variants
 /// are not built — no test or concrete spec covers their shape.
-pub async fn get_risk_register(
-    State(state): State<AppState>,
-    Path(project_id): Path<String>,
-) -> Result<Response, ApiError> {
-    let elements = state.neo4j.list_elements(&project_id).await?;
+pub(crate) async fn build_risk_register(
+    state: &AppState,
+    project_id: &str,
+) -> anyhow::Result<RiskRegister> {
+    let elements = state.neo4j.list_elements(project_id).await?;
     let causes_edges = state
         .neo4j
-        .edges_of_kind(&project_id, EdgeKind::Causes)
+        .edges_of_kind(project_id, EdgeKind::Causes)
         .await?;
     let mitigated_by_edges = state
         .neo4j
-        .edges_of_kind(&project_id, EdgeKind::MitigatedBy)
+        .edges_of_kind(project_id, EdgeKind::MitigatedBy)
         .await?;
     let elements_by_id: HashMap<&str, &sysml_core::Element> =
         elements.iter().map(|e| (e.id.as_str(), e)).collect();
 
     let mut entries = Vec::new();
     for hazard in elements.iter().filter(|e| e.kind == NodeKind::Hazard) {
-        let body = state.postgres.get_body(&project_id, &hazard.id).await?;
+        let body = state.postgres.get_body(project_id, &hazard.id).await?;
         let properties = body
             .as_ref()
             .and_then(|b| b.get("properties"))
@@ -504,7 +507,7 @@ pub async fn get_risk_register(
             let Some(control) = elements_by_id.get(edge.target.as_str()) else {
                 continue;
             };
-            let control_body = state.postgres.get_body(&project_id, &control.id).await?;
+            let control_body = state.postgres.get_body(project_id, &control.id).await?;
             let control_status = control_body
                 .as_ref()
                 .and_then(|b| b.get("properties"))
@@ -542,11 +545,20 @@ pub async fn get_risk_register(
         });
     }
 
-    let register = RiskRegister {
-        project_id: project_id.clone(),
+    Ok(RiskRegister {
+        project_id: project_id.to_string(),
         format: "ARP4761",
         entries,
-    };
+    })
+}
+
+/// `GET /api/v0/projects/:projectId/safety/risk-register` (FR-SAFE-05, T-P1.3-04) — the real HTTP
+/// handler, now just `build_risk_register` plus the download-header wrapping.
+pub async fn get_risk_register(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let register = build_risk_register(&state, &project_id).await?;
     let mut response = Json(register).into_response();
     response.headers_mut().insert(
         axum::http::header::CONTENT_DISPOSITION,

@@ -802,6 +802,31 @@ function Canvas({
   const canvasWrapperRef = useRef<HTMLDivElement>(null);
   const reactFlowInstance = useReactFlow<FlowNode<AxiomaBlockData>, FlowEdge<AxiomaEdgeData>>();
   const [showTextPanel, setShowTextPanel] = useState(false);
+  const [exportingPng, setExportingPng] = useState(false);
+
+  /** docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-EXPORT-01) — client-side, current-viewport only.
+   * Captures `canvasWrapperRef` (the same node the clustering margin math already measures) via
+   * `html-to-image`'s `toPng`, since it's just whatever's currently rendered in the DOM -- React
+   * Flow doesn't use `onlyRenderVisibleElements`, so this is the real on-screen canvas, not a
+   * partial capture. The server-side headless-render path for a full-diagram export "at any
+   * size" (reqs v5 §5.12's other named half) is a separate, larger capability, not attempted
+   * here. */
+  async function handleExportPng() {
+    if (!canvasWrapperRef.current || exportingPng) {
+      return;
+    }
+    setExportingPng(true);
+    try {
+      const { toPng } = await import("html-to-image");
+      const dataUrl = await toPng(canvasWrapperRef.current, { backgroundColor: "#07070C" });
+      const link = document.createElement("a");
+      link.download = `axioma-canvas-${projectId ?? "export"}.png`;
+      link.href = dataUrl;
+      link.click();
+    } finally {
+      setExportingPng(false);
+    }
+  }
   const textualHandleRef = useRef<TextualEditorPanelHandle | null>(null);
   const setTextualHandle = useCallback((handle: TextualEditorPanelHandle) => {
     textualHandleRef.current = handle;
@@ -1248,6 +1273,14 @@ function Canvas({
                 className="!px-2 !py-1 text-xs"
               >
                 Text View
+              </Button>
+              <Button
+                variant="ghost"
+                disabled={exportingPng}
+                onClick={handleExportPng}
+                className="!px-2 !py-1 text-xs"
+              >
+                {exportingPng ? "Exporting…" : "Export PNG"}
               </Button>
             </div>
           </GlassPanel>
