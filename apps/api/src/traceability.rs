@@ -67,7 +67,25 @@ const MAX_ALLOWED_FANOUT: u32 = 500;
 /// Result page size for the traceability endpoint's cursor pagination.
 const PAGE_SIZE: usize = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+/// NFR-PERF-04's "explicit, enforced budget" check, factored out of `get_traceability` so
+/// docs/IMPLEMENTATION_KICKOFF.md Phase 5's `/collections/dynamic` (a Dynamic Query is itself a
+/// stored, re-runnable traversal — FR-CORE-10 — and must be rejected at *save* time under the
+/// same ceiling this endpoint already enforces at *request* time) reuses one ceiling, not a
+/// second one.
+pub(crate) fn validate_budget(depth: u32, max_fanout: u32) -> Result<(), ApiError> {
+    if depth > MAX_ALLOWED_DEPTH || max_fanout > MAX_ALLOWED_FANOUT {
+        return Err(import::BadRequest(format!(
+            "depth/maxFanout exceed this server's caps (max depth {MAX_ALLOWED_DEPTH}, max fanout {MAX_ALLOWED_FANOUT})"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+// `Serialize` added for docs/IMPLEMENTATION_KICKOFF.md Phase 5 -- `collections.rs`'s Dynamic Query
+// definition embeds a `Direction` directly into a stored JSONB value (round-tripped via
+// `serde_json`, not this module's own private `as_str`, which stays module-private).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Direction {
     Incoming,
@@ -224,12 +242,7 @@ pub async fn get_traceability(
             import::BadRequest("explicit maxDepth and maxFanout are required".to_string()).into(),
         );
     };
-    if depth > MAX_ALLOWED_DEPTH || max_fanout > MAX_ALLOWED_FANOUT {
-        return Err(import::BadRequest(format!(
-            "depth/maxFanout exceed this server's caps (max depth {MAX_ALLOWED_DEPTH}, max fanout {MAX_ALLOWED_FANOUT})"
-        ))
-        .into());
-    }
+    validate_budget(depth, max_fanout)?;
     if state
         .neo4j
         .get_element(&project_id, &element_id)

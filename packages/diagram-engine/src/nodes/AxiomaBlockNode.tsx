@@ -49,6 +49,24 @@ const originBorder: Record<Origin, string> = {
 const kindAccent: Partial<Record<NodeKind, { dot: string; band: string }>> = {
   Hazard: { dot: "bg-alert", band: "bg-alert/10" },
   Control: { dot: "bg-cobalt-glow", band: "bg-cobalt-glow/20" },
+  // docs/IMPLEMENTATION_KICKOFF.md Phase 5 (turbofan amendment §3.5's ADSG canvas gap) — these
+  // three kinds (Phase 4's first-ever real content) previously rendered identically to a plain
+  // Structure. Deliberately reusing this existing accent extensibility point rather than three
+  // new bespoke node components (see this feature's plan) — a distinct color plus `kindGlyph`
+  // below is enough to make them recognizable at a glance without duplicating this whole card's
+  // provenance/validation/rename chrome three times over.
+  Function: { dot: "bg-[#B98CE8]", band: "bg-[#B98CE8]/10" },
+  SelectionChoice: { dot: "bg-[#E8A93A]", band: "bg-[#E8A93A]/10" },
+  ConnectionChoice: { dot: "bg-[#3AC7E8]", band: "bg-[#3AC7E8]/10" },
+};
+
+/** A single-character shape-cue next to the header dot, rendered in the same slot `hasHazard`'s
+ * badge already uses — so these three kinds are distinguishable by more than color alone (color
+ * alone isn't accessible/distinct enough at small canvas zoom levels). */
+const kindGlyph: Partial<Record<NodeKind, string>> = {
+  Function: "ƒ",
+  SelectionChoice: "◈",
+  ConnectionChoice: "⇄",
 };
 
 /**
@@ -100,6 +118,7 @@ export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData })
     ? "!h-3.5 !w-3.5 !border-2 !border-obsidian !bg-cobalt-glow !cursor-crosshair transition-transform hover:!scale-125 hover:!bg-white"
     : "!h-2 !w-2 !border-2 !border-obsidian !bg-graphite !cursor-default";
   const accent = kindAccent[data.kind];
+  const glyph = kindGlyph[data.kind];
 
   return (
     <div
@@ -119,6 +138,15 @@ export function AxiomaBlockNode({ data }: NodeProps & { data: AxiomaBlockData })
             className="h-2 w-2 rounded-full bg-alert"
             title="Linked Hazard — see the Hazard/Risk panel"
           />
+        )}
+        {glyph && (
+          <span
+            className="flex-shrink-0 text-xs leading-none text-white/60"
+            title={`${data.kind} (FR-ARCH)`}
+            aria-hidden
+          >
+            {glyph}
+          </span>
         )}
         {isRenaming ? (
           <input

@@ -11,11 +11,14 @@ mod alf_ir;
 mod archspace_client;
 mod auth;
 mod autonomy;
+mod collections;
 mod control_sim;
 mod fuml_client;
 mod import;
+mod information;
 mod mode_a;
 mod mode_b;
+mod parametrics;
 mod store;
 mod traceability;
 mod trade_study;
@@ -303,6 +306,22 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/simulate/control-state-machine",
             post(control_sim::simulate_control_state_machine),
+        )
+        .route(
+            "/api/v0/projects/:projectId/parametrics/evaluate",
+            post(parametrics::evaluate),
+        )
+        .route(
+            "/api/v0/projects/:projectId/information/elements",
+            post(information::create_information_element),
+        )
+        .route(
+            "/api/v0/projects/:projectId/collections/dynamic",
+            post(collections::save_dynamic_collection),
+        )
+        .route(
+            "/api/v0/projects/:projectId/collections/:id/freeze",
+            post(collections::freeze_collection),
         )
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -5644,6 +5663,215 @@ mod tests {
                 traversal.visited
             );
         }
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-PARAM-03) — evaluates
+    /// `parametrics::evaluate` against Phase 3's real, already-seeded
+    /// `FanPerformanceMapConstraint` rather than a throwaway fixture. Its
+    /// `sampledPointsAtDesignSpeed` is `[(550, 1.30), (550, 1.40), (0, 1.35)]`
+    /// (`seed_fr_comp_content`'s own literal values) — sorted ascending by x this is
+    /// `[(0, 1.35), (550, 1.30), (550, 1.40)]`, so an input of 275 falls in the first window
+    /// `(0, 1.35)-(550, 1.30)` and interpolates to exactly `1.325`, a deterministic value worth
+    /// asserting precisely, not just "some number came back."
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn parametrics_evaluate_interpolates_fan_performance_map_and_rejects_out_of_range() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "parametrics-evaluate").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let response = parametrics::evaluate(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(parametrics::EvaluateRequest {
+                constraint_ids: vec!["FanPerformanceMapConstraint".to_string()],
+                equivalent_weight_flow_lb_per_sec: 275.0,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.results.len(), 1);
+        let result = &response.results[0];
+        assert_eq!(result.constraint_id, "FanPerformanceMapConstraint");
+        assert!(result.error.is_none(), "expected no error, got {result:?}");
+        assert!(
+            (result.pressure_ratio.unwrap() - 1.325).abs() < 1e-9,
+            "expected pressureRatio ~1.325, got {:?}",
+            result.pressure_ratio
+        );
+
+        // Out-of-range input: a typed "not evaluable" reason, not a silent/wrong extrapolation.
+        let out_of_range = parametrics::evaluate(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(parametrics::EvaluateRequest {
+                constraint_ids: vec!["FanPerformanceMapConstraint".to_string()],
+                equivalent_weight_flow_lb_per_sec: 9_999.0,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(out_of_range.results[0].pressure_ratio.is_none());
+        assert!(out_of_range.results[0].error.is_some());
+
+        // An unknown Constraint id is also a typed error, not a 500.
+        let unknown = parametrics::evaluate(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(parametrics::EvaluateRequest {
+                constraint_ids: vec!["NoSuchConstraint".to_string()],
+                equivalent_weight_flow_lb_per_sec: 275.0,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(unknown.results[0].error.is_some());
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-INFO-01/03) — a real `:InformationElement` with
+    /// its `abstractionLevel` set in the same call/commit.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn create_information_element_lands_a_real_element_with_abstraction_level() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "information-elements").await;
+
+        let element = information::create_information_element(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(information::CreateInformationElementRequest {
+                name: "Engine Health Telemetry Record".to_string(),
+                abstraction_level: information::AbstractionLevel::Logical,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(element.kind, NodeKind::InformationElement);
+
+        let reloaded = state
+            .neo4j
+            .get_element(&project.id, &element.id)
+            .await
+            .unwrap()
+            .expect("element should exist");
+        assert_eq!(reloaded.kind, NodeKind::InformationElement);
+        assert_eq!(reloaded.name, "Engine Health Telemetry Record");
+
+        let body = state
+            .postgres
+            .get_body(&project.id, &element.id)
+            .await
+            .unwrap()
+            .expect("element should have a body");
+        assert_eq!(body["properties"]["abstractionLevel"], "Logical");
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-10/11) — saves a Dynamic Query over the
+    /// seeded Turbofan-Ref fixture, freezes it, and confirms the resulting `:Collection`/`Member`
+    /// edges match `traceability::run_traversal`'s own result for the same parameters (the freeze
+    /// handler reuses that traversal engine rather than a second implementation). Also confirms
+    /// the save-time budget rejection NFR-PERF-04 requires.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn dynamic_collection_freeze_matches_the_traversal_it_reruns() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "dynamic-collection").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let expected = traceability::run_traversal(
+            &state,
+            &project.id,
+            "Engine",
+            1,
+            500,
+            traceability::Direction::Outgoing,
+        )
+        .await
+        .unwrap();
+
+        let saved = collections::save_dynamic_collection(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(collections::SaveDynamicCollectionRequest {
+                name: "Engine's direct subsystems".to_string(),
+                root_id: "Engine".to_string(),
+                depth: 1,
+                max_fanout: 500,
+                direction: traceability::Direction::Outgoing,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let frozen = collections::freeze_collection(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), saved.id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(frozen.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(frozen.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: collections::FreezeCollectionResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        let mut got: Vec<&str> = response.member_ids.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        let mut want: Vec<&str> = expected.visited.keys().map(String::as_str).collect();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "frozen membership should match the traversal it reran"
+        );
+
+        let collection = state
+            .neo4j
+            .get_element(&project.id, &response.collection_id)
+            .await
+            .unwrap()
+            .expect("Collection should exist");
+        assert_eq!(collection.kind, NodeKind::Collection);
+
+        let member_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::Member)
+            .await
+            .unwrap();
+        for member_id in &response.member_ids {
+            assert!(
+                member_edges
+                    .iter()
+                    .any(|e| e.source == response.collection_id && &e.target == member_id),
+                "expected {} -Member-> {member_id}, got {member_edges:?}",
+                response.collection_id
+            );
+        }
+
+        // Save-time budget rejection (NFR-PERF-04: "rejected at save time, not just at run time").
+        let rejected = collections::save_dynamic_collection(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(collections::SaveDynamicCollectionRequest {
+                name: "Over budget".to_string(),
+                root_id: "Engine".to_string(),
+                depth: 999,
+                max_fanout: 999_999,
+                direction: traceability::Direction::Outgoing,
+            }),
+        )
+        .await;
+        assert!(
+            rejected.is_err(),
+            "over-ceiling depth/maxFanout must be rejected at save time"
+        );
     }
 
     /// Compiles `control_sim::golden_alf_transitions` (the pilot's Idle->Armed->Running->Shutdown

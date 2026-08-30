@@ -835,3 +835,97 @@ meaningfully consume TSFC/Thrust/Weight/Jet-Mach/etc. tags doesn't exist yet (Ph
   which this phase's new `FanBypassDuctExitPort`/`CoreBleedOfftakePort` correctly breaks — fixed to
   assert the two named compressor ports are present among the subsystem's children, not an exact
   count, so a future phase adding one more port doesn't re-break the same assertion again.
+
+---
+
+## 13. Phase 5: Foundation Slice — Canvas Visual Types, Review-Gate Origin, Parametrics/
+## Information/Collections **[REV-D]**
+
+`docs/IMPLEMENTATION_KICKOFF.md` Phase 5 spans six new REST endpoint groups and three
+`diagram-engine` efforts of very different size and risk. Presented with the real scope (research
+below), the user chose the **Foundation slice**: the review-gate origin UI, ADSG canvas visual
+types, and the Parametrics/Information/Collections backend surface — the fully-unblocked subset.
+Document-import's async pipeline, Export/Reporting, and the Interaction view + Swimlane mode are
+explicitly deferred (see §13.4).
+
+### 13.1 What was found before designing anything
+
+- **`diagram-engine` had exactly one node renderer for every `NodeKind`** (`AxiomaBlockNode`) and
+  one edge renderer (`AxiomaEdge`). Phase 4's new `:Function`/`:SelectionChoice`/`:ConnectionChoice`
+  content rendered as plain generic cards, indistinguishable from a `:Structure`.
+- **The main canvas only ever rendered `Contains` edges** — `Causes`/`MitigatedBy`/`Concerns` are
+  fetched into their own React state, consumed only by side panels, never added to the canvas's own
+  edge array. Rendering `ArchDerives`/`IncompatibleWith`/`ChoiceConstraint` on the canvas was
+  therefore new territory, not a style tweak to something already rendered.
+- **`AutonomyPanel.tsx`'s `Proposal` interface didn't declare an `origin` field at all**, even
+  though `apps/api` has returned one on every proposal since Phase 1 — the client silently
+  discarded it. Only `cem-generated` is ever actually produced (`mode_b.rs`'s sole
+  `create_proposal` call); `human-authored`/`document-import` have no real producer yet.
+- **The generic `POST /elements` (any `NodeKind`) and `POST/GET/DELETE /edges` (any `EdgeKind`)
+  endpoints already cover most of what §1.4 asks Parametrics/Information/Collections to add** —
+  `/parametrics/constraints`, `/parametrics/bindings`, `/information/data-types` would be pure
+  wrapper duplicates of endpoints that already exist. What's genuinely new: evaluating a Constraint
+  (no expression/lookup evaluator exists anywhere) and Dynamic Query definition + execution (no
+  stored-query concept exists).
+
+### 13.2 What was built
+
+- **Canvas visual types** — deliberately **not** three new bespoke node components (the turbofan
+  amendment's literal §3.5 suggestion). `AxiomaBlockNode`'s existing `kindAccent` map is already the
+  per-kind visual-differentiation extensibility point; duplicating its card-chrome logic three times
+  over would be premature abstraction. Extended `kindAccent` with `Function`/`SelectionChoice`/
+  `ConnectionChoice` entries plus a new parallel `kindGlyph` map (a single-character shape cue — ƒ /
+  ◈ / ⇄ — next to the existing dot, in the same slot the Hazard-linkage badge already uses).
+  `ArchDerives`/`IncompatibleWith`/`ChoiceConstraint` are now fetched via the existing generic
+  `GET /edges?kind=X` surface and merged into the canvas's own edge array as read-only `axiomaEdge`s
+  (distinct dashed color per kind, `reconnectable: false`, an id prefix that can't collide with
+  `Contains`'s own convention) — confirmed live in a Playwright check against the real seeded
+  fixture: exactly 5 Function/4 SelectionChoice/2 ConnectionChoice glyphs rendered, and edge stroke
+  colors matched 12 `ArchDerives`/1 `IncompatibleWith`/2 `ChoiceConstraint` exactly.
+- **Review-gate origin UI** — `Proposal` gained `origin`, rendered as an inline badge, plus an
+  origin `<select>` filter matching the canvas's own existing origin-filter dropdown's visual
+  convention (no `Tabs` component exists anywhere in `@axioma/ui-components` to justify inventing
+  one). No backend change — the field was already there.
+- **`POST /parametrics/evaluate`** (`apps/api/src/parametrics.rs`) — deliberately **not** a general
+  arithmetic-expression parser (reqs v5 doesn't concretely specify one); evaluates the one shape
+  §5.15 already gives real content for — linear interpolation over a Constraint's
+  `sampledPointsAtDesignSpeed` tabulated curve. Tested directly against Phase 3's real
+  `FanPerformanceMapConstraint` (interpolates to exactly `1.325` at input `275.0`, a deterministic
+  value derived from that Constraint's own literal seed data), plus out-of-range and unknown-id
+  cases, both typed "not evaluable" reasons rather than a silent/wrong extrapolation or a 500.
+- **`POST /information/elements`** (`apps/api/src/information.rs`) — a real `:InformationElement`
+  with `abstractionLevel` (FR-INFO-03) set in the same call/commit. `/information/data-types` isn't
+  built separately — no `:DataType` `NodeKind` exists; a Data Type is itself just an
+  `:InformationElement`.
+- **`POST /collections/dynamic` + `POST /collections/{id}/freeze`**
+  (`apps/api/src/collections.rs`) — a new Postgres `dynamic_collections` table stores a query
+  *definition* (`rootId`/`depth`/`maxFanout`/`direction`, the exact shape
+  `traceability::run_traversal` already takes); `freeze` actually re-runs that traversal (reused,
+  not reimplemented) and materializes a real `:Collection` + one `Member` edge per visited element.
+  Save-time budget rejection reuses a new `traceability::validate_budget`, factored out of the
+  traceability endpoint's own previously-inline ceiling check so both call sites enforce one
+  ceiling, not two. Confirmed the frozen membership matches `run_traversal`'s own result for
+  identical parameters, and that an over-ceiling save is rejected (NFR-PERF-04).
+
+### 13.3 A real, unrelated finding hit during manual verification
+
+Restarting the API to manually verify the frontend changes in a browser surfaced that the live dev
+Postgres had **484 accumulated test/throwaway projects**, and the long-lived "Turbofan Reference"
+project had been seeded before Phases 3–5 existed — `ensure_seeded()` only runs once, at genesis, so
+none of this session's new content had ever actually reached it. This is the same gotcha this
+session's own memory already documents (test pollution silently defeating the genesis-seed gate);
+recovered the same documented way — truncated the versioning/content tables and let
+`ensure_seeded()` reseed fresh — after explicit confirmation, since it's a destructive local-dev-DB
+action. Not a Phase 5 defect; a pre-existing dev-environment hygiene issue this pass's manual
+verification happened to surface again.
+
+### 13.4 Explicitly not attempted this pass
+
+`/parametrics/constraints`/`/parametrics/bindings`/`/information/data-types` (already covered by the
+generic endpoints, §13.1). The document-import async job pipeline (§1.1a — needs an LLM-structuring
+capability that doesn't exist). `/export/*`/`/interactions/*` and their `diagram-engine`
+counterparts (ADR-009 unresolved; headless-render/report-template generalization not attempted).
+Swimlane mode (FR-CORE-12) — its own spec text assumes an `Allocate` `EdgeKind` that Phase 1 never
+actually created, a real gap flagged here rather than silently invented around. The choice-
+resolution click-to-resolve interaction and design-space stats sidebar from the turbofan amendment
+§3.5 — both depend on the still-unbuilt Mode B design-space HTTP surface (§1.2a).

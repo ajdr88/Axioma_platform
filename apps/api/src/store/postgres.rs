@@ -62,6 +62,29 @@ impl PostgresStore {
         .await
         .context("indexing project_id column")?;
 
+        // docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-10/11) — a Dynamic Query's definition
+        // (root/depth/maxFanout/direction, the exact shape `traceability::run_traversal` already
+        // takes). `definition` is JSONB, same "structured body, no schema-per-field" convention as
+        // `element_bodies.body` -- avoids a column per query parameter for a shape likely to grow.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dynamic_collections (\
+                id TEXT PRIMARY KEY, \
+                project_id TEXT NOT NULL, \
+                name TEXT NOT NULL, \
+                definition JSONB NOT NULL\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .context("creating dynamic_collections table")?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS dynamic_collections_project_id_idx \
+             ON dynamic_collections (project_id)",
+        )
+        .execute(&pool)
+        .await
+        .context("indexing dynamic_collections project_id column")?;
+
         Ok(Self { pool })
     }
 
@@ -172,5 +195,46 @@ impl PostgresStore {
             .await
             .with_context(|| format!("deleting body/position for {element_id}"))?;
         Ok(())
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-10) — stores a Dynamic Query's definition
+    /// (not its result, which is only ever computed on demand — see `get_dynamic_collection`'s
+    /// caller, `collections::freeze_collection`). `id` is server-minted, matching every other
+    /// element/entity creation convention in this codebase.
+    pub async fn save_dynamic_collection(
+        &self,
+        project_id: &str,
+        id: &str,
+        name: &str,
+        definition: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO dynamic_collections (id, project_id, name, definition) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(project_id)
+        .bind(name)
+        .bind(definition)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("saving dynamic collection {id}"))?;
+        Ok(())
+    }
+
+    pub async fn get_dynamic_collection(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Option<(String, serde_json::Value)>> {
+        let row: Option<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT name, definition FROM dynamic_collections WHERE id = $1 AND project_id = $2",
+        )
+        .bind(id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("fetching dynamic collection {id}"))?;
+        Ok(row)
     }
 }

@@ -46,11 +46,18 @@ interface ProposeResponse {
   branchId: string | null;
 }
 
+/** Distinct from the FR-CORE-08 `Origin` type (`Human`/`AiSuggested`/`AiAutoMerged`, a per-Element
+ * provenance field) — this is `apps/api/src/store/versioning.rs`'s `proposals.origin` column,
+ * which the client previously declared nothing for at all and silently discarded on every fetch. */
+type ProposalOrigin = "cem-generated" | "human-authored" | "document-import";
+const PROPOSAL_ORIGINS: ProposalOrigin[] = ["cem-generated", "human-authored", "document-import"];
+
 interface Proposal {
   id: string;
   subsystemId: string;
   status: string;
   reason: string;
+  origin: ProposalOrigin;
 }
 
 interface AutonomyPanelProps {
@@ -91,6 +98,12 @@ export function AutonomyPanel({ projectId, onClose }: AutonomyPanelProps) {
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [proposalsError, setProposalsError] = useState<string | null>(null);
   const [reviewBusyId, setReviewBusyId] = useState<string | null>(null);
+  /** FR-CORE-16's "one mechanism, three origins" review gate — filters the already-loaded
+   * proposals list client-side, same pattern as the canvas's own origin-filter dropdown
+   * (`page.tsx`'s `originFilter`). `human-authored`/`document-import` have no real producer yet
+   * (only `mode_b.rs` ever creates a `cem-generated` proposal), so those filters legitimately show
+   * nothing until Phase 1.1a's document-import pipeline and FR-PM-05 exist — not a bug. */
+  const [originFilter, setOriginFilter] = useState<ProposalOrigin | "all">("all");
 
   // Guards against the initial GET resolving after the user has already touched the level/
   // threshold fields — without this, a slow fetch can silently stomp an in-progress edit (or,
@@ -363,9 +376,24 @@ export function AutonomyPanel({ projectId, onClose }: AutonomyPanelProps) {
       </div>
 
       <div>
-        <p className="mb-1 text-[10px] uppercase tracking-widest text-white/40">
-          Pending proposals{branchId ? ` (branch ${branchId.slice(0, 8)})` : ""}
-        </p>
+        <div className="mb-1 flex items-center justify-between gap-2">
+          <p className="text-[10px] uppercase tracking-widest text-white/40">
+            Pending proposals{branchId ? ` (branch ${branchId.slice(0, 8)})` : ""}
+          </p>
+          <select
+            data-autonomy-origin-filter
+            value={originFilter}
+            onChange={(event) => setOriginFilter(event.target.value as ProposalOrigin | "all")}
+            className="rounded border border-white/10 bg-obsidian/60 px-1 py-0.5 text-[10px] text-white/70"
+          >
+            <option value="all">all origins</option>
+            {PROPOSAL_ORIGINS.map((o) => (
+              <option key={o} value={o}>
+                {o}
+              </option>
+            ))}
+          </select>
+        </div>
         {proposalsError && <p className="mb-2 text-xs text-alert">{proposalsError}</p>}
         {!branchId && (
           <p className="text-[11px] text-white/40">
@@ -376,40 +404,50 @@ export function AutonomyPanel({ projectId, onClose }: AutonomyPanelProps) {
           <p className="text-[11px] text-white/40">No proposals on this branch.</p>
         )}
         <div data-autonomy-proposals className="space-y-1.5">
-          {proposals.map((p) => (
-            <div
-              key={p.id}
-              data-autonomy-proposal-id={p.id}
-              className="flex items-center justify-between gap-2 rounded border border-white/10 p-2 text-xs"
-            >
-              <div>
-                <p className="font-mono text-white/80">{p.subsystemId}</p>
-                <p className="text-[10px] text-graphite">
-                  {p.status} &middot; {p.reason}
-                </p>
-              </div>
-              {p.status === "pending" && (
-                <div className="flex gap-1">
-                  <Button
-                    variant="primary"
-                    className="!px-2 !py-1 text-[10px]"
-                    disabled={reviewBusyId === p.id}
-                    onClick={() => handleReview(p.id, "accept")}
-                  >
-                    Accept
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    className="!px-2 !py-1 text-[10px]"
-                    disabled={reviewBusyId === p.id}
-                    onClick={() => handleReview(p.id, "reject")}
-                  >
-                    Reject
-                  </Button>
+          {proposals
+            .filter((p) => originFilter === "all" || p.origin === originFilter)
+            .map((p) => (
+              <div
+                key={p.id}
+                data-autonomy-proposal-id={p.id}
+                className="flex items-center justify-between gap-2 rounded border border-white/10 p-2 text-xs"
+              >
+                <div>
+                  <p className="font-mono text-white/80">
+                    {p.subsystemId}{" "}
+                    <span
+                      className="rounded bg-white/5 px-1 py-0.5 text-[9px] uppercase tracking-wide text-white/50"
+                      title="Proposal origin (FR-CORE-16)"
+                    >
+                      {p.origin}
+                    </span>
+                  </p>
+                  <p className="text-[10px] text-graphite">
+                    {p.status} &middot; {p.reason}
+                  </p>
                 </div>
-              )}
-            </div>
-          ))}
+                {p.status === "pending" && (
+                  <div className="flex gap-1">
+                    <Button
+                      variant="primary"
+                      className="!px-2 !py-1 text-[10px]"
+                      disabled={reviewBusyId === p.id}
+                      onClick={() => handleReview(p.id, "accept")}
+                    >
+                      Accept
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      className="!px-2 !py-1 text-[10px]"
+                      disabled={reviewBusyId === p.id}
+                      onClick={() => handleReview(p.id, "reject")}
+                    >
+                      Reject
+                    </Button>
+                  </div>
+                )}
+              </div>
+            ))}
         </div>
       </div>
     </Panel>

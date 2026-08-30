@@ -126,6 +126,43 @@ function toFlowEdge(edge: ApiEdge): FlowEdge<AxiomaEdgeData> {
   };
 }
 
+/** docs/IMPLEMENTATION_KICKOFF.md Phase 5 (turbofan amendment §3.5's ADSG canvas gap) — renders
+ * `ArchDerives`/`IncompatibleWith`/`ChoiceConstraint` on the main canvas for the first time (they
+ * previously weren't fetched into the canvas's own edge state at all, only `Contains` was).
+ * Read-only: `reconnectable: false` so a user dragging one of these can never trigger
+ * `onReconnect`'s Contains-only mutation, and the id prefix can't collide with
+ * `getEdgeId`'s `-contains-` convention. */
+const ARCH_EDGE_STYLES: Record<
+  string,
+  { slug: string; style: { stroke: string; strokeDasharray: string } }
+> = {
+  ArchDerives: { slug: "archderives", style: { stroke: "#B98CE8", strokeDasharray: "4 3" } },
+  IncompatibleWith: {
+    slug: "incompatiblewith",
+    style: { stroke: "#FF5C5C", strokeDasharray: "2 3" },
+  },
+  ChoiceConstraint: {
+    slug: "choiceconstraint",
+    style: { stroke: "#E8A93A", strokeDasharray: "6 3" },
+  },
+};
+
+function toFlowArchEdge(
+  edge: ApiEdge,
+  kind: keyof typeof ARCH_EDGE_STYLES,
+): FlowEdge<AxiomaEdgeData> {
+  const { slug, style } = ARCH_EDGE_STYLES[kind];
+  return {
+    id: `${edge.source}-${slug}-${edge.target}`,
+    source: edge.source,
+    target: edge.target,
+    type: "axiomaEdge",
+    style,
+    reconnectable: false,
+    data: {},
+  };
+}
+
 /** Reads an upstream error out of a proxy response — JSON `{error}` (the "API unreachable" 502)
  * or plain text (a rejected `ValidationError`/`BadRequest`, which apps/api returns as text). */
 async function readErrorMessage(res: Response): Promise<string> {
@@ -220,15 +257,27 @@ export default function Home() {
     const token = ++reloadTokenRef.current;
     setStatus("loading");
     try {
-      const [elementsRes, containsRes, positionsRes, causesRes, mitigatedByRes, concernsRes] =
-        await Promise.all([
-          fetch(apiPath(currentProjectId, "/elements")),
-          fetch(apiPath(currentProjectId, "/contains")),
-          fetch(apiPath(currentProjectId, "/positions")),
-          fetch(apiPath(currentProjectId, "/edges?kind=Causes")),
-          fetch(apiPath(currentProjectId, "/edges?kind=MitigatedBy")),
-          fetch(apiPath(currentProjectId, "/edges?kind=Concerns")),
-        ]);
+      const [
+        elementsRes,
+        containsRes,
+        positionsRes,
+        causesRes,
+        mitigatedByRes,
+        concernsRes,
+        archDerivesRes,
+        incompatibleWithRes,
+        choiceConstraintRes,
+      ] = await Promise.all([
+        fetch(apiPath(currentProjectId, "/elements")),
+        fetch(apiPath(currentProjectId, "/contains")),
+        fetch(apiPath(currentProjectId, "/positions")),
+        fetch(apiPath(currentProjectId, "/edges?kind=Causes")),
+        fetch(apiPath(currentProjectId, "/edges?kind=MitigatedBy")),
+        fetch(apiPath(currentProjectId, "/edges?kind=Concerns")),
+        fetch(apiPath(currentProjectId, "/edges?kind=ArchDerives")),
+        fetch(apiPath(currentProjectId, "/edges?kind=IncompatibleWith")),
+        fetch(apiPath(currentProjectId, "/edges?kind=ChoiceConstraint")),
+      ]);
       for (const res of [
         elementsRes,
         containsRes,
@@ -236,6 +285,9 @@ export default function Home() {
         causesRes,
         mitigatedByRes,
         concernsRes,
+        archDerivesRes,
+        incompatibleWithRes,
+        choiceConstraintRes,
       ]) {
         if (!res.ok) {
           throw new Error(await readErrorMessage(res));
@@ -247,6 +299,9 @@ export default function Home() {
       const causes: ApiEdge[] = await causesRes.json();
       const mitigatedBy: ApiEdge[] = await mitigatedByRes.json();
       const concerns: ApiEdge[] = await concernsRes.json();
+      const archDerives: ApiEdge[] = await archDerivesRes.json();
+      const incompatibleWith: ApiEdge[] = await incompatibleWithRes.json();
+      const choiceConstraint: ApiEdge[] = await choiceConstraintRes.json();
       if (reloadTokenRef.current !== token) {
         return;
       }
@@ -254,7 +309,15 @@ export default function Home() {
       const storedPositions = new Map(
         positionEntries.map((p) => [p.elementId, { x: p.x, y: p.y }]),
       );
-      const allEdgePairs = [...contains, ...causes, ...mitigatedBy, ...concerns];
+      const allEdgePairs = [
+        ...contains,
+        ...causes,
+        ...mitigatedBy,
+        ...concerns,
+        ...archDerives,
+        ...incompatibleWith,
+        ...choiceConstraint,
+      ];
       const elkPositions = await computeElkLayout(elements, allEdgePairs);
       if (reloadTokenRef.current !== token) {
         return;
@@ -268,7 +331,12 @@ export default function Home() {
           ),
         ),
       );
-      setEdges(contains.map(toFlowEdge));
+      setEdges([
+        ...contains.map(toFlowEdge),
+        ...archDerives.map((e) => toFlowArchEdge(e, "ArchDerives")),
+        ...incompatibleWith.map((e) => toFlowArchEdge(e, "IncompatibleWith")),
+        ...choiceConstraint.map((e) => toFlowArchEdge(e, "ChoiceConstraint")),
+      ]);
       setCausesEdges(causes);
       setMitigatedByEdges(mitigatedBy);
       setConcernsEdges(concerns);
