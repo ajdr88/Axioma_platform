@@ -1329,3 +1329,108 @@ raising axum's request body limit for larger attachment uploads.
   screenshot-timing artifact of the verification script, not a real bug); uploaded a real file and
   downloaded it back, confirming byte-identical content; downloaded a real CSV via Export Table
   with the correct header and rows; downloaded a real HTML file via Export Report.
+
+---
+
+## 18. Phase 6: Test Coverage **[REV-D]**
+
+`docs/IMPLEMENTATION_KICKOFF.md` Phase 6: land the 19 test IDs named in each amendment's own §4 —
+`T-PARAM-*`, `T-INFO-*`, `T-INTX-*`, `T-EXPORT-*`, `T-CORE-10/12-*`, `T-CORE-03-EXT`,
+`T-DOCIMPORT-01…07` — as they become exercisable, prioritizing `T-DOCIMPORT-06` and "the Phase 2
+sidecar's own round-trip tests." This closes out the phase-numbered roadmap in
+`docs/IMPLEMENTATION_KICKOFF.md` entirely.
+
+### 18.1 What was found before writing anything
+
+- **The Phase 2 sidecar round-trip is already done, not a gap.**
+  `archspace_design_space_round_trips_through_the_sidecar` (already in `main.rs`'s test module)
+  already exercises the real gRPC boundary against the Dockerized `cem-archspace` service — see
+  §10.1's own text. Nothing to add there.
+- **Several of the 19 definitions describe capabilities this session's own earlier passes already,
+  honestly scoped out** — writing a test against their literal wording would either fail against
+  real code (not useful CI hygiene for a documented, deliberate scope-down) or require quietly
+  building new production features mid-"test coverage" pass (scope creep). Found by reading the
+  actual code, not assumed: no general algebraic Parametrics evaluator exists (§1's own doc
+  comment — only linear interpolation over tabulated points); no XLSX/column-selection export
+  (CSV, fixed columns only, §14); no server-side full-diagram headless render (§14, client-side
+  viewport PNG only); no orphan-Action rejection (FR-CORE-13, blocked on an undecided
+  Action/Activity `NodeKind` question); no OCR (§15, deliberately not built); no Object Flow/Action
+  model at all (same blocker as FR-CORE-13); no dedicated Data Type/Enumeration endpoint
+  (FR-INFO-02, confirmed unbuilt in §17.2).
+- **Several of the 19 were already substantially covered by existing tests from earlier passes**,
+  confirmed by reading the test module before writing anything new — a real, non-obvious finding
+  that shrank this pass's actual scope: `dynamic_collection_freeze_matches_the_traversal_it_reruns`
+  already asserted save-time budget rejection (T-CORE-10-01's other half);
+  `interaction_pipeline_stores_messages_and_fragments_correctly` already exercises a
+  `timingConstraint`, a fragment with a `guard`, and `refInteractionId` (T-INTX-01/02, near-fully);
+  `parametrics_evaluate_interpolates_fan_performance_map_and_rejects_out_of_range` already covers
+  T-PARAM-02 in full; `allocate_edge_round_trips_through_the_generic_edge_endpoint` already covers
+  T-CORE-12-01's allocation half; `export_table_as_csv_scoped_by_kind_and_by_collection` and
+  `export_report_renders_risk_register_html_matching_the_json_endpoint` already cover T-EXPORT-02/
+  03 to the extent they're built; `document_import_pipeline_drafts_and_accepts_a_real_requirement`
+  already runs the full pipeline successfully, the behavioral half of T-DOCIMPORT-06.
+
+### 18.2 What was actually new — 5 tests, not 19
+
+Given the above, only 7 of the 19 IDs had a real, previously-uncovered gap worth a new test, landed
+as 5 test functions (some share setup across adjacent IDs rather than re-running an expensive real
+Ollama-backed pipeline per ID):
+
+- **`bound_edge_endpoint_rejects_a_non_parameter_source` (T-PARAM-01, adapted)** — the real
+  "type-checked binding" this system enforces is `EdgeKind::Bound`'s kind-based endpoint rule
+  (`sysml-core`: source must be `NodeKind::Parameter`), not unit/value-type checking, which doesn't
+  exist. Confirms a non-Parameter source is rejected and a real Parameter source succeeds.
+- **`dynamic_collection_reflects_a_newly_added_element_on_refreeze` (T-CORE-10-01, other half)** —
+  freeze once, add a new element reachable from the same root, freeze the same saved definition
+  again, confirm the new element appears. Each freeze creates a new `:Collection` snapshot rather
+  than updating one in place — "re-evaluation" here means calling freeze again, not a live-updating
+  single element. **A real test-authoring mistake found and fixed while writing this**: the first
+  draft used `Contains` edges for the fixture and got an empty traversal back —
+  `Neo4jStore::trace_neighbors`'s Cypher query only matches `SATISFY|VERIFY|REFINE|DERIVE|COPY`
+  relationship types, `Contains` is a structurally separate edge never included in traceability/
+  collection traversals. Fixed by using `Refine` instead, matching every other traceability test's
+  own established fixture convention.
+- **`derive_and_copy_edges_round_trip_and_are_traceability_distinguishable_from_contains`
+  (T-CORE-03-EXT)** — confirmed `Derive`/`Copy` are already in that same relationship-type set
+  (real, pre-existing, just never asserted by a test), so both are queryable via the real
+  `GET .../traceability` endpoint today. "Distinguishable from Containment" is verified by
+  construction (no `Contains` edge exists in the fixture at all, so every `viaEdgeKind` result can
+  only be `Derive`/`Copy`).
+- **`document_import_produces_multiple_candidates_with_full_provenance_and_surfaces_via_the_real_
+  proposals_endpoint` (T-DOCIMPORT-01/02/03, strengthened)** — a 3-"shall"-sentence document
+  produces 3 candidates (the existing acceptance test only ever used one), every candidate's full
+  `provenance` block is asserted (never checked before), and the resulting proposal is confirmed
+  visible through the real `GET /cem/proposals/:branchId` list endpoint — the same one human-
+  authored/cem-generated proposals use — not just a direct Postgres read.
+- **`document_import_surfaces_structure_suggestions_and_low_confidence_candidates_without_
+  dropping_either` (T-DOCIMPORT-04/05, adapted)** — neither the suggestion path nor the
+  low-confidence path had any test before this. The spec's literal T-DOCIMPORT-05 scenarios
+  (a requirement split across a page break, one embedded in a table) aren't what the built
+  heuristic detects (`segment()`'s confidence is a pure sentence-length threshold, 20–400 chars);
+  tested with a deliberately short "shall" sentence instead, against the same real PASS criterion
+  (surfaced with `confidence: "low"`, never dropped). **A second test-authoring mistake found and
+  fixed**: the first draft matched the low-confidence candidate by its exact extracted sentence
+  text — but `shall_text` is the LLM's *drafted* wording from the Structuring stage, not the raw
+  extracted sentence verbatim (segmentation/confidence-scoring happens before the LLM call and is
+  deterministic; the LLM's rewording of that sentence is not). Fixed by matching on `confidence ==
+  Low` instead of exact text.
+
+### 18.3 Explicitly not attempted this pass
+
+Building any of the unbuilt capabilities named in §18.1's first bullet to make a spec sentence
+literally pass — none has a concrete implementation ask beyond "make this specific test scenario
+work," which is exactly the kind of guessing-ahead-of-the-spec this session's own established
+discipline commits against. Dynamic/scheduled re-evaluation triggers for Dynamic Collections
+(still on-demand only, matching `collections.rs`'s own documented scope). Physically stopping the
+`cem-archspace` Docker container mid-test to verify T-DOCIMPORT-06's Product-2 independence at
+runtime — no precedent for Docker orchestration from within this codebase's tests; verified by
+construction instead (§18.1).
+
+### 18.4 Verification
+
+- `cargo build/clippy/fmt --workspace` clean.
+- Full `apps/api` `--ignored` suite against the live Docker stack: **62/62 passing** (57 existing +
+  5 new), zero regressions. Both test-authoring mistakes in §18.2 were caught by actually running
+  the new tests against the real stack before considering them done, not just by getting them to
+  compile.
+- No frontend changes this pass — no `tsc`/Biome/`next build` needed.

@@ -6594,6 +6594,381 @@ mod tests {
             .any(|e| e.source == "SomeAction" && e.target == "OwningLane"));
     }
 
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 6 (T-PARAM-01) — `EdgeKind::Bound`'s real endpoint
+    /// rule (`sysml_core::check_relationship_endpoints`: source must be `NodeKind::Parameter`) is
+    /// the actual "type-checked binding" this system enforces — there's no general Value-
+    /// Property/unit type-checker (`parametrics.rs`'s own doc comment: deliberately not a general
+    /// expression evaluator), so this tests the real kind-based legality check rather than
+    /// T-PARAM-01's literal "mismatched types" wording.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn bound_edge_endpoint_rejects_a_non_parameter_source() {
+        let (neo4j, _postgres, _objects, versioning) = connect_test_stores().await;
+        let project = test_project(&versioning, "bound-edge").await;
+        make_structure(&neo4j, &project.id, "NotAParameter").await;
+        neo4j
+            .upsert_element(
+                &project.id,
+                &Element {
+                    id: "RealParameter".to_string(),
+                    kind: NodeKind::Parameter,
+                    name: "Real Parameter".to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+        make_structure(&neo4j, &project.id, "BoundTarget").await;
+
+        let rejected = neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "NotAParameter".to_string(),
+                    target: "BoundTarget".to_string(),
+                    kind: EdgeKind::Bound,
+                },
+            )
+            .await;
+        assert!(
+            rejected.is_err(),
+            "a Bound edge from a non-Parameter source must be rejected"
+        );
+
+        neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "RealParameter".to_string(),
+                    target: "BoundTarget".to_string(),
+                    kind: EdgeKind::Bound,
+                },
+            )
+            .await
+            .expect("a Bound edge from a real Parameter must succeed");
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 6 (T-CORE-10-01) — the save-time budget-rejection half
+    /// is already covered by `dynamic_collection_freeze_matches_the_traversal_it_reruns`; this
+    /// covers the other half, "a new matching element appears in the collection on next
+    /// re-evaluation without manual action." Each freeze creates a new `:Collection` snapshot
+    /// rather than updating one in place, so "re-evaluation" here means calling freeze again on
+    /// the same saved definition and comparing member sets.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn dynamic_collection_reflects_a_newly_added_element_on_refreeze() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "dynamic-collection-refreeze").await;
+        make_structure(&state.neo4j, &project.id, "Root").await;
+        make_structure(&state.neo4j, &project.id, "FirstChild").await;
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "Root".to_string(),
+                    target: "FirstChild".to_string(),
+                    kind: EdgeKind::Refine,
+                },
+            )
+            .await
+            .unwrap();
+
+        let saved = collections::save_dynamic_collection(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Json(collections::SaveDynamicCollectionRequest {
+                name: "Root's children".to_string(),
+                root_id: "Root".to_string(),
+                depth: 1,
+                max_fanout: 50,
+                direction: traceability::Direction::Outgoing,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let first_freeze = collections::freeze_collection(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), saved.id.clone())),
+        )
+        .await
+        .unwrap();
+        let first_body = axum::body::to_bytes(first_freeze.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_response: collections::FreezeCollectionResponse =
+            serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_response.member_ids, vec!["FirstChild".to_string()]);
+
+        // Add a second matching element after the first freeze — the saved definition itself
+        // never changes, only the live graph does.
+        make_structure(&state.neo4j, &project.id, "SecondChild").await;
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "Root".to_string(),
+                    target: "SecondChild".to_string(),
+                    kind: EdgeKind::Refine,
+                },
+            )
+            .await
+            .unwrap();
+
+        let second_freeze = collections::freeze_collection(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), saved.id.clone())),
+        )
+        .await
+        .unwrap();
+        let second_body = axum::body::to_bytes(second_freeze.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second_response: collections::FreezeCollectionResponse =
+            serde_json::from_slice(&second_body).unwrap();
+        let mut got = second_response.member_ids.clone();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["FirstChild".to_string(), "SecondChild".to_string()],
+            "re-evaluating (re-freezing) the same saved definition must pick up the newly added element"
+        );
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 6 (T-CORE-03-EXT) — `Derive`/`Copy` are already
+    /// included in `Neo4jStore::trace_neighbors`'s relationship-type set
+    /// (`SATISFY|VERIFY|REFINE|DERIVE|COPY`), so they're queryable via the real
+    /// `GET .../traceability` endpoint today, not just round-trippable through the generic edge
+    /// endpoint. "Distinguishable from Containment" is verified by construction here: no
+    /// `Contains` edge exists in this fixture at all, so every result's `viaEdgeKind` can only be
+    /// `Derive`/`Copy`.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn derive_and_copy_edges_round_trip_and_are_traceability_distinguishable_from_contains() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "derive-copy").await;
+        for id in ["ReqHigh", "ReqLow", "ReqLowCopy"] {
+            state
+                .neo4j
+                .upsert_element(
+                    &project.id,
+                    &Element {
+                        id: id.to_string(),
+                        kind: NodeKind::Requirement,
+                        name: id.to_string(),
+                        active: true,
+                        origin: Origin::Human,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "ReqLow".to_string(),
+                    target: "ReqHigh".to_string(),
+                    kind: EdgeKind::Derive,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "ReqLowCopy".to_string(),
+                    target: "ReqLow".to_string(),
+                    kind: EdgeKind::Copy,
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = traceability::get_traceability(
+            State(state.clone()),
+            Path((project.id.clone(), "ReqHigh".to_string())),
+            Query(traceability::TraceabilityQuery {
+                depth: Some(3),
+                max_fanout: Some(50),
+                direction: Some(traceability::Direction::Both),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response_json(response).await;
+        let results = body["results"].as_array().unwrap();
+
+        let low = results
+            .iter()
+            .find(|r| r["id"] == "ReqLow")
+            .expect("ReqLow should be reachable via Derive");
+        assert_eq!(low["viaEdgeKind"], "Derive");
+
+        let low_copy = results
+            .iter()
+            .find(|r| r["id"] == "ReqLowCopy")
+            .expect("ReqLowCopy should be reachable via Copy, two hops out");
+        assert_eq!(low_copy["viaEdgeKind"], "Copy");
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 6 (T-DOCIMPORT-01/02/03) — strengthens the existing
+    /// single-candidate acceptance test (`document_import_pipeline_drafts_and_accepts_a_real_
+    /// requirement`) along three real, previously-uncovered axes: multiple "shall" sentences in
+    /// one document each become their own candidate (not just one), every candidate's full
+    /// `provenance` block is asserted (the existing test never checked it), and the resulting
+    /// proposal is confirmed visible through the *real* `GET /cem/proposals/:branchId` list
+    /// endpoint — the same one human-authored/cem-generated proposals use — not just a direct
+    /// store read.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including Ollama)"]
+    async fn document_import_produces_multiple_candidates_with_full_provenance_and_surfaces_via_the_real_proposals_endpoint(
+    ) {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "document-import-multi").await;
+
+        let pdf_bytes = build_minimal_pdf(
+            "The turbine control system shall limit rotor overspeed to below 105 percent. \
+             The fuel control unit shall regulate flow within plus or minus two percent. \
+             The ignition system shall achieve light-off within three seconds.",
+        );
+        let multipart = make_multipart(&state, "spec.pdf", "application/pdf", &pdf_bytes).await;
+        let created = document_import::create_import_job(
+            State(state.clone()),
+            Path(project.id.clone()),
+            multipart,
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let job = wait_for_import_job_terminal(&state, &project.id, &created.job_id).await;
+        assert_eq!(job.status, "AwaitingReview", "error: {:?}", job.error);
+        let candidates: Vec<document_import::DraftedRequirement> =
+            serde_json::from_value(job.candidates.expect("should have candidates")).unwrap();
+        assert_eq!(
+            candidates.len(),
+            3,
+            "three independent \"shall\" sentences should draft three candidates, got {candidates:?}"
+        );
+        for candidate in &candidates {
+            assert!(!candidate.provenance.model_name.is_empty());
+            assert!(!candidate.provenance.model_version.is_empty());
+            assert!(!candidate.provenance.prompt_template_hash.is_empty());
+            assert_eq!(candidate.citation.page, 1);
+        }
+
+        let proposed = document_import::create_import_proposal(
+            State(state.clone()),
+            Path((project.id.clone(), created.job_id.clone())),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        // The same review-gate surface a human-authored/cem-generated proposal uses — not a
+        // second, divergent document-import-only view (FR-CORE-16).
+        let listed = mode_b::list_proposals(
+            State(state.clone()),
+            Path((project.id.clone(), proposed.branch_id.clone())),
+        )
+        .await
+        .unwrap()
+        .0;
+        let listed_proposal = listed
+            .iter()
+            .find(|p| p.id == proposed.proposal_id)
+            .expect("the document-import proposal should be visible via the real list endpoint");
+        assert_eq!(listed_proposal.origin, "document-import");
+        assert_eq!(listed_proposal.status, "pending");
+
+        let accepted = mode_b::accept_proposal(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), proposed.proposal_id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 6 (T-DOCIMPORT-04/05) — neither the structure-
+    /// suggestion path nor the low-confidence path had any test before this. Both are deterministic
+    /// (no LLM call — `segment`/`extract_suggestions`), so this only needs the job to reach
+    /// `AwaitingReview`, not a full accept. The spec's literal T-DOCIMPORT-05 scenarios (a
+    /// requirement split across a page break, one embedded in a table) aren't what the built
+    /// heuristic actually detects — `segment()`'s confidence is a pure sentence-length heuristic —
+    /// so this exercises that real mechanism (a deliberately short "shall" sentence) instead,
+    /// against the same PASS criterion (surfaced, never silently dropped).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including Ollama)"]
+    async fn document_import_surfaces_structure_suggestions_and_low_confidence_candidates_without_dropping_either(
+    ) {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "document-import-suggestions").await;
+
+        let pdf_bytes = build_minimal_pdf(
+            "The turbine control system shall confirm the Combustor Assembly meets thermal limits. \
+             It shall run.",
+        );
+        let multipart = make_multipart(&state, "spec.pdf", "application/pdf", &pdf_bytes).await;
+        let created = document_import::create_import_job(
+            State(state.clone()),
+            Path(project.id.clone()),
+            multipart,
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let job = wait_for_import_job_terminal(&state, &project.id, &created.job_id).await;
+        assert_eq!(job.status, "AwaitingReview", "error: {:?}", job.error);
+
+        // FR-CORE-17 — a display-only hint, never an auto-created Structure.
+        let suggestions: Vec<String> =
+            serde_json::from_value(job.suggestions.expect("should have suggestions")).unwrap();
+        assert!(
+            suggestions.iter().any(|s| s.contains("Combustor")),
+            "expected a 'Combustor ...' suggestion, got {suggestions:?}"
+        );
+        assert!(
+            state
+                .neo4j
+                .get_element(&project.id, "CombustorAssembly")
+                .await
+                .unwrap()
+                .is_none(),
+            "a structure suggestion must never auto-create a real Structure element"
+        );
+
+        // FR-CORE-18 — a deliberately short "shall" sentence (<20 chars trimmed) is Low
+        // confidence, surfaced anyway, never dropped. Matched by confidence, not by exact text —
+        // `shall_text` is the LLM's drafted wording, not necessarily the raw extracted sentence
+        // verbatim (segmentation/confidence-scoring happens before the LLM call and is
+        // deterministic; the LLM's own rewording of that short sentence is not).
+        let candidates: Vec<document_import::DraftedRequirement> =
+            serde_json::from_value(job.candidates.expect("should have candidates")).unwrap();
+        assert_eq!(candidates.len(), 2);
+        let low_confidence_count = candidates
+            .iter()
+            .filter(|c| c.confidence == document_import::Confidence::Low)
+            .count();
+        assert_eq!(
+            low_confidence_count, 1,
+            "expected exactly one Low-confidence candidate (the short 'It shall run' sentence), got {candidates:?}"
+        );
+    }
+
     /// Compiles `control_sim::golden_alf_transitions` (the pilot's Idle->Armed->Running->Shutdown
     /// Control state machine, now `pub(crate)` since `trade_study` needs the same known-good
     /// program — see that function's doc comment) into wire-format transitions, for tests that

@@ -673,3 +673,41 @@
 | NFR-COMP-04 | T-P1.1-05 |
 
 **Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` is verified by at least one test above, **except FR-COMP-01…06 and FR-ARCH-01…08**, which have no test-spec rows yet (see this document's header — Phase 6 work, not part of this doc-consolidation pass). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
+
+## Phase 6 landed status **[REV-D]**
+
+`docs/IMPLEMENTATION_KICKOFF.md` Phase 6 asked for the 19 test IDs above (`T-PARAM-*`, `T-INFO-*`,
+`T-INTX-*`, `T-EXPORT-*`, `T-CORE-10/12-*`, `T-CORE-03-EXT`, `T-DOCIMPORT-01…07`) to land "as they
+become exercisable." Cross-checked against real, already-built behavior — not the idealized scope
+these definitions were originally written against — before writing anything. Full disposition and
+reasoning: `docs/Axioma_implementation_v5.md` §18. Summary, most-current first:
+
+- **Built and tested for real** (`apps/api/src/main.rs`'s `#[ignore]`d integration suite):
+  T-CORE-03-EXT, T-CORE-10-01 (both halves — the existing `dynamic_collection_freeze_matches_the_
+  traversal_it_reruns` already covered save-time budget rejection; a new
+  `dynamic_collection_reflects_a_newly_added_element_on_refreeze` covers live re-evaluation),
+  T-DOCIMPORT-01/02/03 (strengthened via one new test —
+  `document_import_produces_multiple_candidates_with_full_provenance_and_surfaces_via_the_real_
+  proposals_endpoint`), T-DOCIMPORT-04/05 (one new test —
+  `document_import_surfaces_structure_suggestions_and_low_confidence_candidates_without_dropping_
+  either`), T-PARAM-01 (adapted — tests the real `EdgeKind::Bound` kind-based endpoint rule, not
+  unit/value-type checking, which doesn't exist — new test
+  `bound_edge_endpoint_rejects_a_non_parameter_source`).
+- **Already covered by a pre-existing test, nothing new needed**: T-PARAM-02
+  (`parametrics_evaluate_interpolates_fan_performance_map_and_rejects_out_of_range`), T-INTX-01/02
+  (`interaction_pipeline_stores_messages_and_fragments_correctly` — already exercises
+  `timingConstraint`, a fragment with a `guard`, and `refInteractionId`), T-DOCIMPORT-06 (the
+  existing acceptance test already runs the full pipeline successfully; "no Product-2 dispatch" is
+  verified by construction — `document_import.rs`/`mode_b.rs`'s document-import branch reference
+  neither `archspace_client` nor `scheduler`, confirmed by direct code reading, not a runtime trace
+  — no span-based verification infrastructure exists for this the way Mode A's cem-core-dispatch
+  claim has), T-EXPORT-02 (`export_table_as_csv_scoped_by_kind_and_by_collection`), T-EXPORT-03
+  (`export_report_renders_risk_register_html_matching_the_json_endpoint`), T-CORE-12-01's
+  allocation half (`allocate_edge_round_trips_through_the_generic_edge_endpoint`).
+- **Explicitly not exercisable — flagged, not built to make the spec sentence pass**: T-INFO-01's
+  Data Type half (FR-INFO-02 has no dedicated endpoint), T-INFO-02 (no Object Flow/Action model
+  exists — same blocked Action/Activity `NodeKind` decision as FR-CORE-13), T-EXPORT-01 (no
+  server-side full-diagram render, client-side viewport PNG only), T-CORE-12-01's orphan-Action
+  half (FR-CORE-13, same blocker), T-DOCIMPORT-07 (OCR was deliberately never built — a scanned
+  PDF correctly fails via the existing `document_import_with_no_extractable_text_fails_with_a_
+  precise_reason` test's own code path, the honest opposite of "OCR runs automatically").

@@ -41,7 +41,14 @@ creator, `TraceabilityPanel`'s new Dynamic Collection save/freeze UI, `ElementIn
 Collection-members and Attachments sections, and toolbar Export Table/Report triggers — plus a
 binary-safe fix to the shared `proxyRequest` helper (it built every response via `.text()`, which
 would have corrupted non-UTF-8 attachment downloads) and a new `proxyMultipart` helper for real
-file uploads — see impl v5 §17. Phase 6 (test-scenario authoring) is still open.
+file uploads — see impl v5 §17. **Phase 6** (test coverage — landing the `T-PARAM-*`/`T-INFO-*`/
+`T-INTX-*`/`T-EXPORT-*`/`T-CORE-10/12-*`/`T-CORE-03-EXT`/`T-DOCIMPORT-01…07` test IDs) is now also
+done — see impl v5 §18: of 19 IDs, 7 had a real gap and got 5 new tests (62/62 passing overall),
+most were already covered by earlier passes' own tests (confirmed by reading the suite first, not
+assumed), and several describe capabilities this session already, honestly scoped out (no general
+algebraic Parametrics, no XLSX export, no server-side full-diagram render, no orphan-Action
+rejection, no OCR) — flagged, not built just to make a spec sentence pass. **This closes out every
+phase in `docs/IMPLEMENTATION_KICKOFF.md`.**
 `docs/claude/*.md` holds the original amendment/analysis docs Phase 0
 merged, kept for history.
 
@@ -230,7 +237,8 @@ dependency, lowest urgency of the merged groups.*
 8. **P2.4 Expand (Mo 15+):** more subsystems, increasing physics complexity.
 
 **FR-COMP/FR-ARCH have no test-spec rows yet** (unlike every other v5 addition) — authoring them
-is `docs/IMPLEMENTATION_KICKOFF.md` Phase 6 work, not done as part of the Phase 0 doc merge.
+was never part of Phase 6's own 19 named test IDs (see impl v5 §18) and remains open; a distinct,
+still-uncovered gap from the now-closed Phase 6 pass, not done as part of the Phase 0 doc merge.
 
 ## Working conventions
 - Check the **ADR log** (implementation doc §2.5) before making any technology decision —
