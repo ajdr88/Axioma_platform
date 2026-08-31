@@ -63,6 +63,40 @@ export function HazardRiskPanel({
     [hazards, controlIds],
   );
   const { bodies, updateProperty, error } = useElementBodies(trackedIds, projectId);
+  const [exportingReport, setExportingReport] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
+
+  /** FR-EXPORT-03 — a real downloadable HTML document via `/export/report`, not the JSON
+   * `/safety/risk-register` endpoint this link used to point at (which just navigated the
+   * browser to raw JSON despite its "Export" label — a real, pre-existing mismatch fixed here
+   * alongside the new capability). Mirrors `page.tsx`'s `handleExportPng`'s `link.download`/
+   * `link.click()` pattern, sourcing the blob from a fetch response instead of canvas capture. */
+  async function handleExportReport() {
+    setExportingReport(true);
+    setReportError(null);
+    try {
+      const res = await fetch(`/api/projects/${projectId}/export/report`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ templateId: "risk-register" }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.error ?? `request failed with status ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `risk-register-${projectId}.html`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setReportError(err instanceof Error ? err.message : "failed to export report");
+    } finally {
+      setExportingReport(false);
+    }
+  }
 
   const visibleHazards = hazards.filter((hazard) => {
     if (subsystemFilter === "all") {
@@ -82,12 +116,15 @@ export function HazardRiskPanel({
 
       {error && <p className="mb-2 text-xs text-alert">{error}</p>}
 
-      <a
-        href={`/api/projects/${projectId}/safety/risk-register`}
-        className="mb-3 block w-full rounded border border-white/10 px-2 py-1 text-center text-xs text-white/70 hover:bg-white/5"
+      <Button
+        variant="ghost"
+        disabled={exportingReport}
+        onClick={handleExportReport}
+        className="mb-3 w-full justify-center !py-1 text-xs"
       >
-        Export Risk Register (ARP4761)
-      </a>
+        {exportingReport ? "Exporting…" : "Export Report (ARP4761, HTML)"}
+      </Button>
+      {reportError && <p className="-mt-2 mb-3 text-xs text-alert">{reportError}</p>}
 
       <div className="mb-3">
         <label

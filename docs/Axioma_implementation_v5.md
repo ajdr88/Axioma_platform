@@ -1212,3 +1212,120 @@ never-yet-UI'd endpoints named in §16.4.
   and is reflected back in the dropdown's own next render. This pass caught and fixed one real bug
   this way (Swimlane View not calling `fitView` on entry, leaving the lane grid off-screen behind
   the toolbar panel) beyond what `cargo test`/`tsc` alone could have caught.
+
+---
+
+## 17. Frontend UI for Parametrics, Information Elements, Collections, Export & Attachments
+## **[REV-D]**
+
+§16.4 flagged that five already-built backend capability groups — Parametrics evaluate,
+Information Elements, Dynamic/Static Collections, Export & Reporting, and Element Attachments —
+had zero frontend callers and zero Next.js proxy routes. This pass closes that gap with real UI,
+not just routes, for all five, and closes out `docs/IMPLEMENTATION_KICKOFF.md` Phase 5 entirely.
+
+### 17.1 The proxy layer needed a real fix, not just eight new files
+
+`apps/web/src/lib/api-proxy.ts`'s `proxyRequest` built every response via `await upstream.text()`.
+That's a real correctness bug for the new attachment-download route: an arbitrary uploaded file
+(image, PDF, anything non-UTF-8) would be corrupted by a decode/re-encode round-trip through a JS
+string. Fixed by switching the shared relay to `arrayBuffer()` — confirmed behavior-preserving for
+every existing JSON/CSV/HTML caller (all 28 pre-existing proxy routes just do a thin
+`return proxyRequest(...)`, none inspect the body as a string) and now correct for binary content.
+
+A new `proxyMultipart(path, request)` forwards a browser `FormData` upload's exact bytes and
+original `Content-Type` (boundary included) straight through — passing a raw `ArrayBuffer` as
+`fetch`'s body, not a reconstructed `FormData`, is what makes the manually-copied header survive
+(`fetch` only auto-generates a new, mismatched-boundary Content-Type when the body is `FormData`
+itself). Verified for real: uploaded a file through the browser, downloaded it back through the
+same proxy, and confirmed the bytes are identical — the one thing `tsc`/`cargo test` can't catch on
+their own.
+
+Eight new route files (`parametrics/evaluate`, `information/elements`, `collections/dynamic`,
+`collections/:id/freeze`, `elements/:id/attachments` GET+POST, `attachments/:id`, `export/table`,
+`export/report`) — `elements/:id/attachments` reuses the existing `[id]` segment name (not
+`[elementId]`), matching every sibling route already under `elements/[id]/`; Next.js requires one
+consistent dynamic-segment name per path position.
+
+### 17.2 What got built, per capability
+
+- **Parametrics (FR-PARAM-03)** — new `ParametricsPanel.tsx`: checkbox-select any `Constraint`
+  element, one numeric input for `equivalentWeightFlowLbPerSec`, Evaluate, per-constraint
+  `pressureRatio` or a typed error rendered inline. No UI for FR-PARAM-01/02 (Constraint/Binding
+  authoring) — those already go through the generic `POST /elements`/`POST /edges` endpoints, which
+  already have UI (the toolbar's "+ Add Node" and the canvas's own edge-drag), so nothing new was
+  needed there.
+- **Information Elements (FR-INFO-01/03)** — the toolbar's "+ Add Node" gained a kind selector
+  (`Structure` / `Information Element`) and, for the latter, an abstraction-level selector
+  (Conceptual/Logical/Physical). A new `createInformationElement` posts to the dedicated endpoint
+  (atomic `abstractionLevel` write) and shares its node-placement tail with the existing
+  `createElement` via a new `placeNewElement` helper. No new UI needed to *view*
+  `abstractionLevel` afterward — it lands in the body's `properties`, already shown/editable by
+  `ElementInspector`'s existing generic property-row editor.
+- **Dynamic/Static Collections (FR-CORE-10/11)** — reused `TraceabilityPanel.tsx`'s existing
+  root/depth/maxFanout/direction state (exactly what `POST /collections/dynamic` needs) rather than
+  building a second form: a "Save as Dynamic Collection" name field + button, and a "Freeze" button
+  per saved collection. Saved collections are `Home`-level state in `page.tsx`, not local to the
+  panel — `TraceabilityPanel` unmounts on close (conditionally rendered), so panel-local state would
+  be lost every close, not just on reload; there's still no LIST endpoint, so a full page reload
+  does lose them — a real, accepted gap, not silently hidden. `ElementInspector` gained a
+  `elementKind === "Collection"` section listing real member names (fetched via `GET
+  /edges?kind=Member`, filtered client-side to the collection's own id — no source-filter param
+  exists on that endpoint, same pattern `InteractionPanel` already uses for `Contains`) plus an
+  "Export as Table (CSV)" link scoped by `?collectionId=`.
+- **Export & Reporting (FR-EXPORT-02/03)** — a `NodeKind` selector + "Export Table" link next to
+  the existing "Export PNG" button in the main toolbar (a GET with `Content-Disposition` needs no
+  JS, matching the anchor-download precedent already in `HazardRiskPanel`). `HazardRiskPanel`'s
+  pre-existing "Export Risk Register (ARP4761)" link — which pointed at `/safety/risk-register`, a
+  JSON endpoint, and so just navigated the browser to raw JSON despite its "Export" label — is
+  replaced with a real "Export Report (HTML)" button using the new `/export/report` endpoint
+  (`fetch` → `blob()` → `URL.createObjectURL` → synthetic click, mirroring `handleExportPng`'s
+  existing download pattern). A real, deliberate correction alongside the new capability, not a
+  silent behavior change left unmentioned.
+- **Attachments (FR-EXPORT-04)** — `ElementInspector` gained an unconditional "Attachments"
+  section (every element kind, not gated): list with per-file download links, a file input +
+  Upload button using `FormData` (the browser sets the multipart boundary; `proxyMultipart`
+  forwards it untouched). axum has no `DefaultBodyLimit` layer configured anywhere — uploads
+  default-cap at axum's built-in 2MB. Not changed this pass; flagged here as a known limit.
+
+### 17.3 A real, pre-existing data-fixture gap found during live verification (not a code bug)
+
+Live-evaluating the seeded `FanPerformanceMapConstraint` through the new `ParametricsPanel`
+returned `"no such Constraint"` — `parametrics.rs::evaluate_one`'s own correct, typed error for a
+missing Postgres body. Direct `GET .../elements/FanPerformanceMapConstraint/body` on the live
+"Turbofan Reference" project confirmed it: 404, no body row, despite `main.rs`'s
+`seed_fr_comp_content` correctly writing one (confirmed by reading that code — the
+`sampledPointsAtDesignSpeed` write is really there). `ensure_seeded()`'s gate is "skip entirely if
+any project already exists" (`state.versioning.count_projects().await? > 0`) — this session's own
+long history of manual Postgres-table resets (recorded in the auto-memory file, done to clear test
+pollution) drifted Postgres and Neo4j out of sync for this one long-lived shared "Turbofan
+Reference" fixture: the Neo4j Constraint node survived a reset that the Postgres body row didn't.
+**Not a `parametrics.rs` bug** — verified by backfilling the one element's body through the
+existing generic `PUT .../elements/:id/body` endpoint (the same path `ElementInspector`'s own Save
+button uses) and re-running the evaluation, which then correctly interpolated
+(`pressureRatio = 1.3` at the sampled boundary). Flagged here rather than "fixed" broadly — a
+general reseed-drift fix is a separate, larger concern than this vertical's own scope.
+
+### 17.4 Explicitly not attempted this pass
+
+FR-INFO-02 (Data Type/Enumeration authoring UI — no dedicated backend endpoint exists either, per
+§13.1's own finding); FR-EXPORT-01's server-side full-diagram headless render (client-side PNG
+export already covers the other half, §14); XLSX export (CSV only, matching `export.rs`'s own
+scope); column-selection on table export; manual add/remove-by-hand editing of a frozen Static
+Collection (FR-CORE-11's other named capability — this pass's Collection view is read-only);
+raising axum's request body limit for larger attachment uploads.
+
+### 17.5 Verification
+
+- `cargo build/clippy/fmt --workspace` clean (no Rust changes this pass); `pnpm --filter @axioma/web
+  exec tsc --noEmit` clean; Biome clean; a real `next build` succeeded and listed all eight new
+  proxy routes in its route table.
+- Live verification against the real running dev server via a headless Chromium driver
+  (Playwright, fetched on demand — not a new repo dependency): evaluated a real Constraint and got
+  a real interpolated `pressureRatio`; created an Information Element via the toolbar and confirmed
+  `abstractionLevel: "Conceptual"` landed in its body via a direct API check; saved and froze a
+  Dynamic Collection, confirmed the new `:Collection` element and its 6 real `Member` edges render
+  correctly in `ElementInspector` after allowing the fetch to resolve (an initial screenshot raced
+  the fetch and showed "No members." — re-checked with a longer wait and confirmed it was a
+  screenshot-timing artifact of the verification script, not a real bug); uploaded a real file and
+  downloaded it back, confirming byte-identical content; downloaded a real CSV via Export Table
+  with the correct header and rows; downloaded a real HTML file via Export Report.

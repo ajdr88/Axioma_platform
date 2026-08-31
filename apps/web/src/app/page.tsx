@@ -45,6 +45,7 @@ import { ElementInspector } from "@/components/ElementInspector";
 import { HazardRiskPanel } from "@/components/HazardRiskPanel";
 import { InteractionPanel } from "@/components/InteractionPanel";
 import { MissionPlanningPanel } from "@/components/MissionPlanningPanel";
+import { ParametricsPanel } from "@/components/ParametricsPanel";
 import { PartSearchPanel } from "@/components/PartSearchPanel";
 import { StageTrackingPanel } from "@/components/StageTrackingPanel";
 import type { TextualEditorPanelHandle } from "@/components/TextualEditorPanel";
@@ -79,6 +80,29 @@ interface Project {
 /** A representative sample, not an exhaustive list — matches the regions a real
  * `infrastructure/` deployment would plausibly parameterize (roadmap: NFR-COMP-01/02). */
 const REGIONS = ["us-east", "eu-west", "ap-south"] as const;
+
+/** FR-EXPORT-02's toolbar "Export Table" kind scope — every real `NodeKind` except `"Element"`
+ * (too generic a base kind to export meaningfully) and `"CandidateStructureSuggestion"`
+ * (proposal-scoped only, never present on Main). */
+const EXPORTABLE_NODE_KINDS: NodeKind[] = [
+  "Structure",
+  "Requirement",
+  "Port",
+  "Hazard",
+  "Control",
+  "Mission",
+  "Stakeholder",
+  "SimulationRun",
+  "Constraint",
+  "Parameter",
+  "InformationElement",
+  "Interaction",
+  "InteractionFragment",
+  "Collection",
+  "Function",
+  "SelectionChoice",
+  "ConnectionChoice",
+];
 
 /** Every read/write in this file is scoped to the current project (roadmap: Git-backed model
  * versioning) — `/api/projects/:projectId/...` mirrors `apps/api`'s own route restructuring. */
@@ -191,6 +215,8 @@ export default function Home() {
   const [showPartSearchPanel, setShowPartSearchPanel] = useState(false);
   const [showAutonomyPanel, setShowAutonomyPanel] = useState(false);
   const [showTraceabilityPanel, setShowTraceabilityPanel] = useState(false);
+  /** FR-PARAM-03 — panel toggle, same convention as every other panel below. */
+  const [showParametricsPanel, setShowParametricsPanel] = useState(false);
   /** docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12) — replaces the normal ELK/clustering
    * layout with a lane-partitioned one while active; mutually exclusive with clustering (not
    * combined this pass — see `swimlane.ts`'s own doc comment). */
@@ -204,6 +230,21 @@ export default function Home() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [newProjectRegion, setNewProjectRegion] = useState<string>(REGIONS[0]);
+  /** FR-INFO-01/03 — "+ Add Node" toolbar kind picker; `InformationElement` needs a second,
+   * dedicated create call (`/information/elements`) to set `abstractionLevel` atomically, unlike
+   * every other kind which goes through the generic `createElement`. */
+  const [newElementKind, setNewElementKind] = useState<"Structure" | "InformationElement">(
+    "Structure",
+  );
+  const [newInfoAbstractionLevel, setNewInfoAbstractionLevel] = useState<
+    "Conceptual" | "Logical" | "Physical"
+  >("Conceptual");
+  /** FR-EXPORT-02 — the `NodeKind` scope for the toolbar's "Export Table" link. */
+  const [exportTableKind, setExportTableKind] = useState<NodeKind>("Structure");
+  /** FR-CORE-10/11 — lifted here (not local to `TraceabilityPanel`) since that panel unmounts on
+   * close; see `TraceabilityPanel`'s own prop doc comment for why. No LIST endpoint exists, so
+   * this is still lost on a full page reload — a real, accepted gap. */
+  const [savedCollections, setSavedCollections] = useState<{ id: string; name: string }[]>([]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode<AxiomaBlockData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge<AxiomaEdgeData>>([]);
@@ -402,6 +443,26 @@ export default function Home() {
   /** Shared by "+ Add Node" and the Hazard/Risk panel's Hazard/Control creation — POSTs the
    * element, gives it a jittered starting position (so repeated adds don't stack exactly), and
    * adds it to canvas state. Returns `null` (after showing a notice) on failure. */
+  // Same reasoning as computeElkLayout's isolated-node placement (packages/diagram-engine/src
+  // /layout.ts): the flow-space origin sits directly under the fixed top-left toolbar panel once
+  // the canvas fits content into view, so a fresh node must not jitter-spawn near (0, 0). Shared
+  // by every "create one new element" path (generic Structure/etc. and the dedicated Information
+  // Element create call below) — the placement/PATCH/setNodes tail is identical either way.
+  async function placeNewElement(element: ApiElement): Promise<FlowNode<AxiomaBlockData> | null> {
+    if (!projectId) {
+      return null;
+    }
+    const position = { x: 400 + Math.random() * 200, y: 400 + Math.random() * 200 };
+    await fetch(apiPath(projectId, `/elements/${element.id}/position`), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(position),
+    });
+    const newNode = toFlowNode(element, position);
+    setNodes((nds) => [...nds, newNode]);
+    return newNode;
+  }
+
   async function createElement(
     name: string,
     kind: NodeKind,
@@ -419,22 +480,36 @@ export default function Home() {
       return null;
     }
     const element: ApiElement = await res.json();
-    // Same reasoning as computeElkLayout's isolated-node placement (packages/diagram-engine/src
-    // /layout.ts): the flow-space origin sits directly under the fixed top-left toolbar panel
-    // once the canvas fits content into view, so a fresh node must not jitter-spawn near (0, 0).
-    const position = { x: 400 + Math.random() * 200, y: 400 + Math.random() * 200 };
-    await fetch(apiPath(projectId, `/elements/${element.id}/position`), {
-      method: "PATCH",
+    return placeNewElement(element);
+  }
+
+  /** FR-INFO-01/03 — the dedicated create call, not the generic `/elements` endpoint, so
+   * `abstractionLevel` lands atomically in the same request. */
+  async function createInformationElement(
+    name: string,
+    abstractionLevel: "Conceptual" | "Logical" | "Physical",
+  ): Promise<FlowNode<AxiomaBlockData> | null> {
+    if (!projectId) {
+      return null;
+    }
+    const res = await fetch(apiPath(projectId, "/information/elements"), {
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(position),
+      body: JSON.stringify({ name, abstractionLevel }),
     });
-    const newNode = toFlowNode(element, position);
-    setNodes((nds) => [...nds, newNode]);
-    return newNode;
+    if (!res.ok) {
+      showNotice(await readErrorMessage(res));
+      return null;
+    }
+    const element: ApiElement = await res.json();
+    return placeNewElement(element);
   }
 
   async function handleAddNode() {
-    const newNode = await createElement("New Element", "Structure");
+    const newNode =
+      newElementKind === "InformationElement"
+        ? await createInformationElement("New Information Element", newInfoAbstractionLevel)
+        : await createElement("New Element", "Structure");
     if (newNode) {
       setNodes((nds) =>
         nds.map((n) =>
@@ -582,6 +657,45 @@ export default function Home() {
     await reloadModel();
   }
 
+  /** FR-CORE-10 — saves a Dynamic Collection definition; passed to `TraceabilityPanel`. */
+  async function handleSaveDynamicCollection(params: {
+    name: string;
+    rootId: string;
+    depth: number;
+    maxFanout: number;
+    direction: "both" | "incoming" | "outgoing";
+  }) {
+    if (!projectId) {
+      return;
+    }
+    const res = await fetch(apiPath(projectId, "/collections/dynamic"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    if (!res.ok) {
+      showNotice(await readErrorMessage(res));
+      return;
+    }
+    const { id }: { id: string } = await res.json();
+    setSavedCollections((prev) => [...prev, { id, name: params.name }]);
+  }
+
+  /** FR-CORE-11 — freezes a saved Dynamic Collection into a real `:Collection` element; the
+   * resulting element is picked up by the following `reloadModel()`, same as every other
+   * mutation that creates a new graph element outside `createElement`'s own local `setNodes`. */
+  async function handleFreezeCollection(id: string) {
+    if (!projectId) {
+      return;
+    }
+    const res = await fetch(apiPath(projectId, `/collections/${id}/freeze`), { method: "POST" });
+    if (!res.ok) {
+      showNotice(await readErrorMessage(res));
+      return;
+    }
+    await reloadModel();
+  }
+
   async function handleToggleActive(node: FlowNode<AxiomaBlockData>) {
     if (!projectId) {
       return;
@@ -718,11 +832,22 @@ export default function Home() {
         setShowAutonomyPanel={setShowAutonomyPanel}
         showTraceabilityPanel={showTraceabilityPanel}
         setShowTraceabilityPanel={setShowTraceabilityPanel}
+        showParametricsPanel={showParametricsPanel}
+        setShowParametricsPanel={setShowParametricsPanel}
         showSwimlaneView={showSwimlaneView}
         setShowSwimlaneView={setShowSwimlaneView}
         elements={elements}
         allocateEdges={allocateEdges}
         handleAllocate={handleAllocate}
+        newElementKind={newElementKind}
+        setNewElementKind={setNewElementKind}
+        newInfoAbstractionLevel={newInfoAbstractionLevel}
+        setNewInfoAbstractionLevel={setNewInfoAbstractionLevel}
+        exportTableKind={exportTableKind}
+        setExportTableKind={setExportTableKind}
+        savedCollections={savedCollections}
+        handleSaveDynamicCollection={handleSaveDynamicCollection}
+        handleFreezeCollection={handleFreezeCollection}
         originFilter={originFilter}
         setOriginFilter={setOriginFilter}
         nodes={nodes}
@@ -779,11 +904,30 @@ interface CanvasProps {
   setShowAutonomyPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showTraceabilityPanel: boolean;
   setShowTraceabilityPanel: React.Dispatch<React.SetStateAction<boolean>>;
+  showParametricsPanel: boolean;
+  setShowParametricsPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showSwimlaneView: boolean;
   setShowSwimlaneView: React.Dispatch<React.SetStateAction<boolean>>;
   elements: ApiElement[];
   allocateEdges: ApiEdge[];
   handleAllocate: (elementId: string, laneId: string) => Promise<void>;
+  newElementKind: "Structure" | "InformationElement";
+  setNewElementKind: React.Dispatch<React.SetStateAction<"Structure" | "InformationElement">>;
+  newInfoAbstractionLevel: "Conceptual" | "Logical" | "Physical";
+  setNewInfoAbstractionLevel: React.Dispatch<
+    React.SetStateAction<"Conceptual" | "Logical" | "Physical">
+  >;
+  exportTableKind: NodeKind;
+  setExportTableKind: React.Dispatch<React.SetStateAction<NodeKind>>;
+  savedCollections: { id: string; name: string }[];
+  handleSaveDynamicCollection: (params: {
+    name: string;
+    rootId: string;
+    depth: number;
+    maxFanout: number;
+    direction: "both" | "incoming" | "outgoing";
+  }) => Promise<void>;
+  handleFreezeCollection: (id: string) => Promise<void>;
   originFilter: Origin | "all";
   setOriginFilter: (filter: Origin | "all") => void;
   nodes: FlowNode<AxiomaBlockData>[];
@@ -842,11 +986,22 @@ function Canvas({
   setShowAutonomyPanel,
   showTraceabilityPanel,
   setShowTraceabilityPanel,
+  showParametricsPanel,
+  setShowParametricsPanel,
   showSwimlaneView,
   setShowSwimlaneView,
   elements,
   allocateEdges,
   handleAllocate,
+  newElementKind,
+  setNewElementKind,
+  newInfoAbstractionLevel,
+  setNewInfoAbstractionLevel,
+  exportTableKind,
+  setExportTableKind,
+  savedCollections,
+  handleSaveDynamicCollection,
+  handleFreezeCollection,
   originFilter,
   setOriginFilter,
   nodes,
@@ -1240,6 +1395,33 @@ function Canvas({
                 Edit Mode: {editMode ? "On" : "Off"}
               </Button>
               {editMode && (
+                <select
+                  value={newElementKind}
+                  onChange={(event) =>
+                    setNewElementKind(event.target.value as "Structure" | "InformationElement")
+                  }
+                  className="rounded border border-white/10 bg-obsidian/60 px-1 py-1 text-xs text-white/80"
+                >
+                  <option value="Structure">Structure</option>
+                  <option value="InformationElement">Information Element</option>
+                </select>
+              )}
+              {editMode && newElementKind === "InformationElement" && (
+                <select
+                  value={newInfoAbstractionLevel}
+                  onChange={(event) =>
+                    setNewInfoAbstractionLevel(
+                      event.target.value as "Conceptual" | "Logical" | "Physical",
+                    )
+                  }
+                  className="rounded border border-white/10 bg-obsidian/60 px-1 py-1 text-xs text-white/80"
+                >
+                  <option value="Conceptual">Conceptual</option>
+                  <option value="Logical">Logical</option>
+                  <option value="Physical">Physical</option>
+                </select>
+              )}
+              {editMode && (
                 <Button variant="ghost" onClick={handleAddNode} className="!px-2 !py-1 text-xs">
                   + Add Node
                 </Button>
@@ -1291,6 +1473,7 @@ function Canvas({
                   setShowPartSearchPanel(false);
                   setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
+                  setShowParametricsPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
@@ -1307,6 +1490,7 @@ function Canvas({
                   setShowPartSearchPanel(false);
                   setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
+                  setShowParametricsPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
@@ -1323,6 +1507,7 @@ function Canvas({
                   setShowPartSearchPanel(false);
                   setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
+                  setShowParametricsPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
@@ -1339,6 +1524,7 @@ function Canvas({
                   setShowPartSearchPanel(false);
                   setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
+                  setShowParametricsPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
@@ -1355,6 +1541,7 @@ function Canvas({
                   setShowTradeStudyPanel(false);
                   setShowAutonomyPanel(false);
                   setShowTraceabilityPanel(false);
+                  setShowParametricsPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
@@ -1371,6 +1558,7 @@ function Canvas({
                   setShowTradeStudyPanel(false);
                   setShowPartSearchPanel(false);
                   setShowTraceabilityPanel(false);
+                  setShowParametricsPanel(false);
                   setSelectedNodeId(null);
                 }}
                 className="!px-2 !py-1 text-xs"
@@ -1387,10 +1575,28 @@ function Canvas({
                   setShowTradeStudyPanel(false);
                   setShowPartSearchPanel(false);
                   setShowAutonomyPanel(false);
+                  setShowParametricsPanel(false);
                 }}
                 className="!px-2 !py-1 text-xs"
               >
                 Traceability
+              </Button>
+              <Button
+                variant={showParametricsPanel ? "primary" : "ghost"}
+                onClick={() => {
+                  setShowParametricsPanel((v) => !v);
+                  setShowHazardPanel(false);
+                  setShowMissionPanel(false);
+                  setShowStagePanel(false);
+                  setShowTradeStudyPanel(false);
+                  setShowPartSearchPanel(false);
+                  setShowAutonomyPanel(false);
+                  setShowTraceabilityPanel(false);
+                  setSelectedNodeId(null);
+                }}
+                className="!px-2 !py-1 text-xs"
+              >
+                Parametrics
               </Button>
               <Button
                 variant={showSwimlaneView ? "primary" : "ghost"}
@@ -1418,6 +1624,27 @@ function Canvas({
               >
                 {exportingPng ? "Exporting…" : "Export PNG"}
               </Button>
+              <select
+                value={exportTableKind}
+                onChange={(event) => setExportTableKind(event.target.value as NodeKind)}
+                className="rounded border border-white/10 bg-obsidian/60 px-1 py-1 text-xs text-white/80"
+              >
+                {EXPORTABLE_NODE_KINDS.map((kind) => (
+                  <option key={kind} value={kind}>
+                    {kind}
+                  </option>
+                ))}
+              </select>
+              <a
+                href={
+                  projectId
+                    ? `${apiPath(projectId, "/export/table")}?kind=${encodeURIComponent(exportTableKind)}`
+                    : "#"
+                }
+                className="inline-flex items-center rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-xs text-white/80 hover:bg-white/10"
+              >
+                Export Table
+              </a>
             </div>
           </GlassPanel>
 
@@ -1449,6 +1676,7 @@ function Canvas({
                   allocateEdges.find((edge) => edge.source === selectedNode.id)?.target ?? null
                 }
                 onAllocate={(laneId) => handleAllocate(selectedNode.id, laneId)}
+                elements={elements}
               />
             ))}
 
@@ -1457,6 +1685,17 @@ function Canvas({
               selectedNode={selectedNode}
               projectId={projectId}
               onClose={() => setShowTraceabilityPanel(false)}
+              savedCollections={savedCollections}
+              onSaveDynamicCollection={handleSaveDynamicCollection}
+              onFreezeCollection={handleFreezeCollection}
+            />
+          )}
+
+          {showParametricsPanel && projectId && (
+            <ParametricsPanel
+              projectId={projectId}
+              elements={elements}
+              onClose={() => setShowParametricsPanel(false)}
             />
           )}
 

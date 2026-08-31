@@ -406,9 +406,24 @@ Constraints and Bindings are graph elements like any other (`:Constraint`, `:Par
 
 A Constraint's parameters are typed by Data Types/Value Types (FR-INFO-02); binding-time validation (FR-PARAM-02) reuses the same type-checking machinery `sysml-core` already runs for other relationship legality checks (FR-CORE-05).
 
+**[REV-D, implemented `docs/IMPLEMENTATION_KICKOFF.md` Phase 5 — see impl v5 §17.2]:** FR-PARAM-03
+is built end-to-end, UI included (`ParametricsPanel.tsx`): a real, synchronous linear-interpolation
+evaluator over a Constraint's tabulated `sampledPointsAtDesignSpeed`, never touching
+`cem-core`/`cem-connectors`/`scheduler`. FR-PARAM-01/02 (Constraint/Binding authoring) have no
+dedicated UI of their own — they already go through the generic element/edge creation UI, which
+predates this pass. FR-PARAM-04's traceability claim is untested against a real Constraint↔
+Requirement Satisfy/Verify edge — no test has exercised that specific combination yet.
+
 ### 5.10 Information/Data Architecture **[REV-D]**
 
 Information Elements (FR-INFO-01) get a new node label, `:InformationElement`, alongside the existing set (impl §2.3, amended). They participate in the same containment/traceability rules as other elements (NFR-REL-02) — no special-casing. The Conceptual/Logical/Physical tiering (FR-INFO-03) is a **property on the element** (an enumerated `abstractionLevel` field), not three separate node labels, keeping the schema simple and avoiding a proliferation of near-duplicate types for what is fundamentally the same concept at different refinement stages.
+
+**[REV-D, implemented `docs/IMPLEMENTATION_KICKOFF.md` Phase 5 — see impl v5 §17.2]:** FR-INFO-01/03
+now have real UI, not just the API from Phase 5's Foundation slice (impl v5 §13) — a toolbar kind
+picker for creating an Information Element with its `abstractionLevel` set atomically. Viewing/
+editing `abstractionLevel` afterward reuses `ElementInspector`'s existing generic property editor,
+no dedicated UI needed. FR-INFO-02 (custom Data Types/Enumerations) still has no dedicated
+endpoint or UI — unchanged from §13's own finding.
 
 ### 5.11 Interaction / Timing Modeling, and Swimlane Allocation **[REV-D]**
 
@@ -432,9 +447,27 @@ All four FR-EXPORT items are **read paths only** — none of them write to the g
 - **FR-EXPORT-03 (report):** templated document generation, following the same pattern already used for FR-SAFE-05's ARP4761/MIL-STD-882 export — generalize that template mechanism to accept a report template + a model scope, rather than building a second, safety-specific-only pipeline (ADR-010). This directly parallels FR-PM-05's "one mechanism, two/three origins" pattern used for the review gate.
 - **FR-EXPORT-04 (attachments):** identical mechanism to how Mode C geometry/mesh files are referenced from the graph by pointer into the S3-compatible object store (NFR-DATA-02) — reuse that pointer-reference pattern for arbitrary user-attached files rather than inventing a second attachment mechanism.
 
+**[REV-D, implemented `docs/IMPLEMENTATION_KICKOFF.md` Phase 5 — see impl v5 §14 (API) and §17.2
+(UI)]:** FR-EXPORT-02/03/04 all now have real UI, not just the API. FR-EXPORT-02 is CSV-scoped by
+kind or by a frozen Collection's id (no XLSX, no column selection — impl v5 §14's own scope-down,
+unchanged). FR-EXPORT-03 has exactly one registered template (`"risk-register"`) with a real
+"Export Report (HTML)" download button in `HazardRiskPanel`, replacing that panel's own
+pre-existing link to the JSON `/safety/risk-register` endpoint (which never actually downloaded a
+file despite its "Export" label — a real, pre-existing mismatch corrected alongside the new
+capability, impl v5 §17.2). FR-EXPORT-01's server-side full-diagram headless render is still
+unbuilt (client-side viewport PNG export, §14, covers the other named half).
+
 ### 5.13 Dynamic Element Collections **[REV-D]**
 
 A Dynamic Query (FR-CORE-10) is a stored graph query (Cypher-equivalent, scoped by the same query-budget rules as any other traversal — NFR-PERF-04 applies; an unbounded Dynamic Query is rejected at save time, not just at run time) plus a re-evaluation policy (on-demand / on-write-to-scope / scheduled). A Static Snapshot Collection (FR-CORE-11) is the frozen result set: a `:Collection` node with explicit `member` edges (not the acyclic containment edge itself, to avoid conflating "organizational grouping" with "structural decomposition" — NFR-REL-02's acyclicity guarantee must not be threatened by a collection that legitimately references elements from anywhere in the graph, including elements that already have a different container).
+
+**[REV-D, implemented `docs/IMPLEMENTATION_KICKOFF.md` Phase 5 — see impl v5 §17.2]:** FR-CORE-10/11
+now have real UI (reusing `TraceabilityPanel`'s existing root/depth/fanout/direction picker to
+define a Dynamic Collection, plus a "Freeze" action and a read-only member list on the resulting
+`:Collection` element). Only on-demand re-evaluation exists (no scheduled/on-write trigger); there's
+still no LIST endpoint for saved Dynamic Collections (client-side state only, lost on a full page
+reload — flagged, not hidden); Static Collection membership is view-only, no manual add/remove UI
+yet (FR-CORE-11's own "add/remove members by hand" half).
 
 ### 5.14 Documents → Draft Model Pipeline **[REV-D]**
 

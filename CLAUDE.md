@@ -35,8 +35,14 @@ as plain content on the existing `:Interaction`/`:InteractionFragment` elements,
 browser verification also found and fixed a missing `fitView` call, and separately found that
 `/parametrics/evaluate`, `/information/elements`, `/collections/*`, and `/export/*` all still lack
 a Next.js proxy route — real but not yet blocking, since none has a frontend caller yet, see impl
-v5 §16.4) are all built and verified. This closes out Phase 5 entirely. Phase 6 (test-scenario
-authoring) is still open. `docs/claude/*.md` holds the original amendment/analysis docs Phase 0
+v5 §16.4) are all built and verified. This closes out Phase 5 entirely. A follow-up pass then
+closed that flagged proxy/UI gap for real: `ParametricsPanel.tsx`, a toolbar Information Element
+creator, `TraceabilityPanel`'s new Dynamic Collection save/freeze UI, `ElementInspector`'s new
+Collection-members and Attachments sections, and toolbar Export Table/Report triggers — plus a
+binary-safe fix to the shared `proxyRequest` helper (it built every response via `.text()`, which
+would have corrupted non-UTF-8 attachment downloads) and a new `proxyMultipart` helper for real
+file uploads — see impl v5 §17. Phase 6 (test-scenario authoring) is still open.
+`docs/claude/*.md` holds the original amendment/analysis docs Phase 0
 merged, kept for history.
 
 ## What this is

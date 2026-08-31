@@ -1,12 +1,20 @@
 "use client";
 
 import { UNALLOCATED_LANE_ID } from "@axioma/diagram-engine";
+import type { Element as ApiElement } from "@axioma/shared-types";
 import { Button, Panel } from "@axioma/ui-components";
 import { useEffect, useState } from "react";
 
 interface PropertyRow {
   key: string;
   value: string;
+}
+
+interface AttachmentMeta {
+  id: string;
+  file_name: string;
+  content_type: string;
+  size_bytes: number;
 }
 
 type LoadState = { status: "loading" } | { status: "error"; message: string } | { status: "ready" };
@@ -45,6 +53,9 @@ interface ElementInspectorProps {
   /** The lane (Structure id) this element is currently allocated to, or `null` for unallocated. */
   currentLaneId?: string | null;
   onAllocate?: (laneId: string) => Promise<void>;
+  /** Already loaded by `page.tsx` — reused for the Collection-members id→name lookup, mirroring
+   * `InteractionPanel`'s own `elements` prop rather than a second element fetch. */
+  elements: ApiElement[];
 }
 
 /**
@@ -65,6 +76,7 @@ export function ElementInspector({
   laneOptions,
   currentLaneId,
   onAllocate,
+  elements,
 }: ElementInspectorProps) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [rationale, setRationale] = useState("");
@@ -72,6 +84,10 @@ export function ElementInspector({
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [allocating, setAllocating] = useState(false);
+  const [memberNames, setMemberNames] = useState<string[]>([]);
+  const [attachments, setAttachments] = useState<AttachmentMeta[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
 
   async function handleAllocateChange(laneId: string) {
     if (!onAllocate) {
@@ -161,6 +177,75 @@ export function ElementInspector({
       cancelled = true;
     };
   }, [elementId, projectId]);
+
+  // FR-CORE-11 — a Collection's members are `Member` edges (source=collection), not `Contains`.
+  // No source-filtered edges endpoint exists, so this fetches every `Member` edge in the project
+  // and filters locally, the same pattern `InteractionPanel` already uses for `Contains`.
+  useEffect(() => {
+    if (elementKind !== "Collection") {
+      setMemberNames([]);
+      return;
+    }
+    let cancelled = false;
+    async function loadMembers() {
+      const res = await fetch(`/api/projects/${projectId}/edges?kind=Member`);
+      if (!res.ok || cancelled) {
+        return;
+      }
+      const edges: { source: string; target: string }[] = await res.json();
+      const names = edges
+        .filter((e) => e.source === elementId)
+        .map((e) => elements.find((el) => el.id === e.target)?.name ?? e.target);
+      if (!cancelled) {
+        setMemberNames(names);
+      }
+    }
+    loadMembers();
+    return () => {
+      cancelled = true;
+    };
+  }, [elementId, elementKind, projectId, elements]);
+
+  const loadAttachments = async () => {
+    const res = await fetch(`/api/projects/${projectId}/elements/${elementId}/attachments`);
+    if (res.ok) {
+      setAttachments(await res.json());
+    }
+  };
+
+  // FR-EXPORT-04 — every element (not gated by kind) can carry file attachments.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: loadAttachments closes over elementId/projectId, both already listed — adding the function itself (a new reference every render) would re-run this on every render instead of only on elementId/projectId change
+  useEffect(() => {
+    loadAttachments();
+    setAttachmentError(null);
+  }, [elementId, projectId]);
+
+  async function handleUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+    setUploading(true);
+    setAttachmentError(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch(`/api/projects/${projectId}/elements/${elementId}/attachments`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.error ?? `upload failed with status ${res.status}`);
+      }
+      await loadAttachments();
+    } catch (error) {
+      setAttachmentError(error instanceof Error ? error.message : "failed to upload attachment");
+    } finally {
+      setUploading(false);
+    }
+  }
 
   async function handleSave() {
     setSaving(true);
@@ -327,6 +412,73 @@ export function ElementInspector({
               </select>
             </div>
           )}
+
+          {elementKind === "Collection" && (
+            <div className="border-t border-white/10 pt-3">
+              <p className="mb-1.5 text-[10px] uppercase tracking-widest text-white/40">
+                Members (FR-CORE-11)
+              </p>
+              {memberNames.length === 0 && <p className="text-xs text-white/40">No members.</p>}
+              {memberNames.length > 0 && (
+                <ul className="mb-2 space-y-0.5">
+                  {memberNames.map((name) => (
+                    <li key={name} className="truncate text-xs text-white/80">
+                      {name}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <a
+                href={`/api/projects/${projectId}/export/table?collectionId=${elementId}`}
+                className="block w-full rounded border border-white/10 px-2 py-1 text-center text-xs text-white/70 hover:bg-white/5"
+              >
+                Export as Table (CSV)
+              </a>
+            </div>
+          )}
+
+          <div className="border-t border-white/10 pt-3">
+            <p className="mb-1.5 text-[10px] uppercase tracking-widest text-white/40">
+              Attachments (FR-EXPORT-04)
+            </p>
+            {attachmentError && <p className="mb-1.5 text-xs text-alert">{attachmentError}</p>}
+            {attachments.length === 0 && (
+              <p className="mb-1.5 text-xs text-white/40">No attachments.</p>
+            )}
+            {attachments.length > 0 && (
+              <ul className="mb-1.5 space-y-1">
+                {attachments.map((a) => (
+                  <li
+                    key={a.id}
+                    data-attachment-id={a.id}
+                    className="flex items-center justify-between gap-2 rounded border border-white/10 p-1.5"
+                  >
+                    <span className="truncate text-xs text-white/80">
+                      {a.file_name}{" "}
+                      <span className="text-graphite">
+                        ({Math.max(1, Math.round(a.size_bytes / 1024))} KB)
+                      </span>
+                    </span>
+                    <a
+                      href={`/api/projects/${projectId}/attachments/${a.id}`}
+                      className="shrink-0 text-[11px] text-cobalt-glow hover:underline"
+                    >
+                      Download
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <label className="block">
+              <input
+                type="file"
+                onChange={handleUpload}
+                disabled={uploading}
+                className="w-full text-xs text-white/60 file:mr-2 file:rounded file:border file:border-white/10 file:bg-white/5 file:px-2 file:py-1 file:text-xs file:text-white/80"
+              />
+            </label>
+            {uploading && <p className="mt-1 text-xs text-white/40">Uploading…</p>}
+          </div>
 
           {elementKind === "Requirement" && (
             <div className="border-t border-white/10 pt-3">

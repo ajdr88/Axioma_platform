@@ -21,10 +21,29 @@ interface TraceabilityResponse {
   fanoutTruncated: boolean;
 }
 
+interface SavedCollection {
+  id: string;
+  name: string;
+}
+
 interface TraceabilityPanelProps {
   selectedNode: FlowNode<AxiomaBlockData> | null;
   projectId: string;
   onClose: () => void;
+  /** docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-10/11) — lifted to `page.tsx`'s `Home`-level
+   * state rather than local to this panel: this panel unmounts on close (conditionally rendered,
+   * not hidden), so panel-local state would be wiped every time the panel closes, not just on
+   * page reload. There's no `GET`-list endpoint for Dynamic Collections either way, so this list
+   * is still lost on a full page reload — a real, accepted gap, not silently hidden. */
+  savedCollections: SavedCollection[];
+  onSaveDynamicCollection: (params: {
+    name: string;
+    rootId: string;
+    depth: number;
+    maxFanout: number;
+    direction: Direction;
+  }) => Promise<void>;
+  onFreezeCollection: (id: string) => Promise<void>;
 }
 
 /**
@@ -34,7 +53,14 @@ interface TraceabilityPanelProps {
  * `direction=incoming` is the same query T-P1.3-01's "change-impact"/"blast radius" is answered
  * with — this panel doesn't special-case that, it's just this endpoint with that direction picked.
  */
-export function TraceabilityPanel({ selectedNode, projectId, onClose }: TraceabilityPanelProps) {
+export function TraceabilityPanel({
+  selectedNode,
+  projectId,
+  onClose,
+  savedCollections,
+  onSaveDynamicCollection,
+  onFreezeCollection,
+}: TraceabilityPanelProps) {
   const [depth, setDepth] = useState(3);
   const [maxFanout, setMaxFanout] = useState(50);
   const [direction, setDirection] = useState<Direction>("both");
@@ -43,6 +69,9 @@ export function TraceabilityPanel({ selectedNode, projectId, onClose }: Traceabi
   const [fanoutTruncated, setFanoutTruncated] = useState(false);
   const [status, setStatus] = useState<"idle" | "loading" | "error">("idle");
   const [errorMessage, setErrorMessage] = useState("");
+  const [collectionName, setCollectionName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [freezingId, setFreezingId] = useState<string | null>(null);
 
   // Stale results from a previous root would otherwise sit under the new root's label until the
   // user notices and re-runs the query by hand. selectedNode?.id is a deliberate reset trigger,
@@ -53,7 +82,36 @@ export function TraceabilityPanel({ selectedNode, projectId, onClose }: Traceabi
     setNextCursor(null);
     setFanoutTruncated(false);
     setStatus("idle");
+    setCollectionName("");
   }, [selectedNode?.id]);
+
+  async function handleSaveDynamicCollection() {
+    if (!selectedNode || !collectionName.trim()) {
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSaveDynamicCollection({
+        name: collectionName.trim(),
+        rootId: selectedNode.id,
+        depth,
+        maxFanout,
+        direction,
+      });
+      setCollectionName("");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleFreeze(id: string) {
+    setFreezingId(id);
+    try {
+      await onFreezeCollection(id);
+    } finally {
+      setFreezingId(null);
+    }
+  }
 
   async function runQuery(cursor: string | null, append: boolean) {
     if (!selectedNode) {
@@ -141,6 +199,49 @@ export function TraceabilityPanel({ selectedNode, projectId, onClose }: Traceabi
                 <option value="outgoing">Outgoing</option>
               </select>
             </label>
+          </div>
+
+          <div className="mb-3 border-t border-white/10 pt-2">
+            <p className="mb-1 text-[10px] uppercase tracking-widest text-white/40">
+              Save as Dynamic Collection (FR-CORE-10)
+            </p>
+            <div className="flex gap-1.5">
+              <input
+                value={collectionName}
+                onChange={(event) => setCollectionName(event.target.value)}
+                placeholder="collection name"
+                className="flex-1 rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80 outline-none"
+              />
+              <Button
+                variant="ghost"
+                onClick={handleSaveDynamicCollection}
+                disabled={saving || !collectionName.trim()}
+                className="!px-2 !py-1 text-xs"
+              >
+                {saving ? "Saving…" : "Save"}
+              </Button>
+            </div>
+            {savedCollections.length > 0 && (
+              <div className="mt-2 space-y-1">
+                {savedCollections.map((c) => (
+                  <div
+                    key={c.id}
+                    data-saved-collection-id={c.id}
+                    className="flex items-center justify-between gap-2 rounded border border-white/10 p-1.5"
+                  >
+                    <span className="truncate text-xs text-white/80">{c.name}</span>
+                    <Button
+                      variant="ghost"
+                      onClick={() => handleFreeze(c.id)}
+                      disabled={freezingId === c.id}
+                      className="!px-2 !py-0.5 text-[11px]"
+                    >
+                      {freezingId === c.id ? "Freezing…" : "Freeze"}
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           <Button
