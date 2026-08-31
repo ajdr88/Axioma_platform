@@ -13,6 +13,7 @@ mod auth;
 mod autonomy;
 mod collections;
 mod control_sim;
+mod document_import;
 mod export;
 mod fuml_client;
 mod import;
@@ -339,6 +340,26 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/export/report",
             post(export::export_report),
+        )
+        .route(
+            "/api/v0/projects/:projectId/import/documents",
+            post(document_import::create_import_job),
+        )
+        .route(
+            "/api/v0/projects/:projectId/import/documents/:jobId",
+            get(document_import::get_import_job_status),
+        )
+        .route(
+            "/api/v0/projects/:projectId/import/documents/:jobId/candidates",
+            get(document_import::get_import_job_candidates),
+        )
+        .route(
+            "/api/v0/projects/:projectId/import/documents/:jobId/suggestions",
+            get(document_import::get_import_job_suggestions),
+        )
+        .route(
+            "/api/v0/projects/:projectId/import/documents/:jobId/proposal",
+            post(document_import::create_import_proposal),
         )
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -6157,6 +6178,231 @@ mod tests {
             unknown_template.is_err(),
             "an unregistered template must be a precise error, not a silent fallback"
         );
+    }
+
+    /// Hand-builds a minimal, real, single-page PDF with one text-showing operator — no bundled
+    /// test fixture ships with the `pdf-extract` crate (crates.io publishes exclude its
+    /// test-only files), and computing byte offsets programmatically here (rather than a static
+    /// byte literal with manually-counted offsets) avoids a fragile, easy-to-miscount xref table.
+    /// An empty `page_text` produces a page with no content-showing operator at all, for the
+    /// no-extractable-text test case.
+    fn build_minimal_pdf(page_text: &str) -> Vec<u8> {
+        fn escape_pdf_string(s: &str) -> String {
+            s.replace('\\', "\\\\")
+                .replace('(', "\\(")
+                .replace(')', "\\)")
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offsets = vec![0usize];
+        buf.extend_from_slice(b"%PDF-1.4\n");
+
+        let push_obj = |buf: &mut Vec<u8>, offsets: &mut Vec<usize>, text: String| {
+            offsets.push(buf.len());
+            buf.extend_from_slice(text.as_bytes());
+        };
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+        );
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+        );
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> \
+             /MediaBox [0 0 612 792] /Contents 5 0 R >>\nendobj\n"
+                .to_string(),
+        );
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),
+        );
+        let content = if page_text.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "BT /F1 12 Tf 72 712 Td ({}) Tj ET",
+                escape_pdf_string(page_text)
+            )
+        };
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            format!(
+                "5 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+                content.len(),
+                content
+            ),
+        );
+
+        let xref_offset = buf.len();
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            xref.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        xref.push_str("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n");
+        xref.push_str(&xref_offset.to_string());
+        xref.push_str("\n%%EOF");
+        buf.extend_from_slice(xref.as_bytes());
+        buf
+    }
+
+    async fn wait_for_import_job_terminal(
+        state: &AppState,
+        project_id: &str,
+        job_id: &str,
+    ) -> store::postgres::ImportJobRecord {
+        for _ in 0..100 {
+            let job = state
+                .postgres
+                .get_import_job(project_id, job_id)
+                .await
+                .unwrap()
+                .expect("job should exist");
+            if job.status == "AwaitingReview" || job.status == "Failed" {
+                return job;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        panic!("import job {job_id} did not reach a terminal status in time");
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-14..18) — the full pipeline end to end: a
+    /// real PDF containing a "shall" sentence, through Extraction/Segmentation/Drafting/
+    /// Validation to `AwaitingReview`, then a real `document-import` proposal, then accept,
+    /// confirming a real `:Requirement` element lands with citation/confidence/provenance.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including Ollama)"]
+    async fn document_import_pipeline_drafts_and_accepts_a_real_requirement() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "document-import").await;
+
+        let pdf_bytes = build_minimal_pdf(
+            "The turbofan control system shall limit rotor overspeed to below 105 percent.",
+        );
+        let multipart = make_multipart(&state, "spec.pdf", "application/pdf", &pdf_bytes).await;
+        let created = document_import::create_import_job(
+            State(state.clone()),
+            Path(project.id.clone()),
+            multipart,
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let job = wait_for_import_job_terminal(&state, &project.id, &created.job_id).await;
+        assert_eq!(
+            job.status, "AwaitingReview",
+            "expected AwaitingReview, got {:?} (error: {:?})",
+            job.status, job.error
+        );
+        let candidates = job
+            .candidates
+            .expect("AwaitingReview job should have candidates");
+        let candidates: Vec<document_import::DraftedRequirement> =
+            serde_json::from_value(candidates).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].citation.page, 1);
+        assert!(candidates[0]
+            .shall_text
+            .to_lowercase()
+            .contains("overspeed"));
+
+        let proposed = document_import::create_import_proposal(
+            State(state.clone()),
+            Path((project.id.clone(), created.job_id.clone())),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let proposal = state
+            .versioning
+            .get_proposal(&project.id, &proposed.proposal_id)
+            .await
+            .unwrap()
+            .expect("proposal should exist");
+        assert_eq!(proposal.origin, "document-import");
+        assert_eq!(proposal.status, "pending");
+
+        let accepted = mode_b::accept_proposal(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), proposed.proposal_id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+
+        let elements = state.neo4j.list_elements(&project.id).await.unwrap();
+        let drafted_element = elements
+            .iter()
+            .find(|e| e.kind == NodeKind::Requirement && e.origin == Origin::AiSuggested)
+            .expect("accept should have created a real Requirement element");
+        let body = state
+            .postgres
+            .get_body(&project.id, &drafted_element.id)
+            .await
+            .unwrap()
+            .expect("drafted requirement should have a body");
+        assert!(!body["properties"]["shallText"].as_str().unwrap().is_empty());
+        assert_eq!(body["properties"]["citation"]["page"], 1);
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-14) — a PDF with no extractable text layer
+    /// (this pass's deliberate OCR scope-down) fails the job with a precise reason, not a crash.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn document_import_with_no_extractable_text_fails_with_a_precise_reason() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "document-import-no-text").await;
+
+        let pdf_bytes = build_minimal_pdf("");
+        let multipart = make_multipart(&state, "scanned.pdf", "application/pdf", &pdf_bytes).await;
+        let created = document_import::create_import_job(
+            State(state.clone()),
+            Path(project.id.clone()),
+            multipart,
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let job = wait_for_import_job_terminal(&state, &project.id, &created.job_id).await;
+        assert_eq!(job.status, "Failed");
+        assert!(job.error.unwrap().to_lowercase().contains("ocr"));
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-18) — "a document that yields zero
+    /// extractable requirements is a reported failure state, not an empty successful import,"
+    /// implemented literally.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn document_import_with_no_shall_sentences_fails_as_empty_import() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "document-import-empty").await;
+
+        let pdf_bytes =
+            build_minimal_pdf("This document contains only descriptive prose, no requirements.");
+        let multipart = make_multipart(&state, "prose.pdf", "application/pdf", &pdf_bytes).await;
+        let created = document_import::create_import_job(
+            State(state.clone()),
+            Path(project.id.clone()),
+            multipart,
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let job = wait_for_import_job_terminal(&state, &project.id, &created.job_id).await;
+        assert_eq!(job.status, "Failed");
+        assert!(job.error.unwrap().to_lowercase().contains("no candidate"));
     }
 
     /// Compiles `control_sim::golden_alf_transitions` (the pilot's Idle->Armed->Running->Shutdown

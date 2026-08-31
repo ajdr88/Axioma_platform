@@ -109,6 +109,34 @@ impl PostgresStore {
         .await
         .context("indexing attachments element_id column")?;
 
+        // docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-14..18) — status row for the async
+        // documents-to-draft-model pipeline. `status` is a plain TEXT enum stored as its exact
+        // spec string (Extracting/Segmenting/Drafting/Validating/AwaitingReview/Failed), same
+        // "enum-as-string column" convention already used for autonomy level (L0..L4).
+        // `candidates`/`suggestions` are JSONB, same "structured body, no schema-per-field"
+        // convention as every other body/definition column in this store.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS document_import_jobs (\
+                id TEXT PRIMARY KEY, \
+                project_id TEXT NOT NULL, \
+                file_name TEXT NOT NULL, \
+                status TEXT NOT NULL, \
+                candidates JSONB, \
+                suggestions JSONB, \
+                error TEXT\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .context("creating document_import_jobs table")?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS document_import_jobs_project_id_idx \
+             ON document_import_jobs (project_id)",
+        )
+        .execute(&pool)
+        .await
+        .context("indexing document_import_jobs project_id column")?;
+
         Ok(Self { pool })
     }
 
@@ -345,6 +373,122 @@ impl PostgresStore {
             }),
         )
     }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-14..18) — creates the job row in its
+    /// initial `Extracting` status. `id` is server-minted, matching every other entity-creation
+    /// convention in this codebase.
+    pub async fn create_import_job(
+        &self,
+        project_id: &str,
+        id: &str,
+        file_name: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO document_import_jobs (id, project_id, file_name, status) \
+             VALUES ($1, $2, $3, 'Extracting')",
+        )
+        .bind(id)
+        .bind(project_id)
+        .bind(file_name)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("creating import job {id}"))?;
+        Ok(())
+    }
+
+    /// Advances (or fails) a job's status — `error` is only ever set alongside `status = Failed`,
+    /// left `NULL` otherwise (a prior failure reason must not linger once retried, though this
+    /// pass has no retry path yet).
+    pub async fn update_import_job_status(
+        &self,
+        project_id: &str,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE document_import_jobs SET status = $1, error = $2 \
+             WHERE id = $3 AND project_id = $4",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(id)
+        .bind(project_id)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("updating import job {id} status to {status}"))?;
+        Ok(())
+    }
+
+    pub async fn set_import_job_candidates(
+        &self,
+        project_id: &str,
+        id: &str,
+        candidates: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE document_import_jobs SET candidates = $1 WHERE id = $2 AND project_id = $3",
+        )
+        .bind(candidates)
+        .bind(id)
+        .bind(project_id)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("setting candidates for import job {id}"))?;
+        Ok(())
+    }
+
+    pub async fn set_import_job_suggestions(
+        &self,
+        project_id: &str,
+        id: &str,
+        suggestions: &serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE document_import_jobs SET suggestions = $1 WHERE id = $2 AND project_id = $3",
+        )
+        .bind(suggestions)
+        .bind(id)
+        .bind(project_id)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("setting suggestions for import job {id}"))?;
+        Ok(())
+    }
+
+    pub async fn get_import_job(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Option<ImportJobRecord>> {
+        type Row = (
+            String,
+            String,
+            String,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<String>,
+        );
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT id, file_name, status, candidates, suggestions, error \
+             FROM document_import_jobs WHERE id = $1 AND project_id = $2",
+        )
+        .bind(id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("fetching import job {id}"))?;
+        Ok(row.map(
+            |(id, file_name, status, candidates, suggestions, error)| ImportJobRecord {
+                id,
+                file_name,
+                status,
+                candidates,
+                suggestions,
+                error,
+            },
+        ))
+    }
 }
 
 /// Attachment metadata as returned to a client listing an element's attachments — never includes
@@ -368,4 +512,21 @@ pub struct AttachmentRecord {
     pub file_name: String,
     pub content_type: String,
     pub object_key: String,
+}
+
+/// A document-import job's full stored state — `document_import.rs` reads/writes this directly;
+/// never returned to a client as-is (each of the four `GET`/status endpoints surfaces only the
+/// slice it needs).
+#[derive(Debug, Clone)]
+pub struct ImportJobRecord {
+    /// Mirrors the row's own primary key for completeness — no current caller needs it (the id is
+    /// already known from the request path that fetched this record), kept rather than dropped
+    /// from the `SELECT` since a future caller (e.g. a "list jobs" endpoint) naturally would.
+    #[allow(dead_code)]
+    pub id: String,
+    pub file_name: String,
+    pub status: String,
+    pub candidates: Option<serde_json::Value>,
+    pub suggestions: Option<serde_json::Value>,
+    pub error: Option<String>,
 }

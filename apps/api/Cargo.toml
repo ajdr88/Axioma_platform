@@ -58,6 +58,12 @@ sha2 = "0.10"
 tonic = "0.12"
 prost = "0.13"
 
+# docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-14, documents -> draft model pipeline) — real
+# per-page text extraction from an in-memory PDF (`extract_text_from_mem_by_pages`, verified
+# directly against docs.rs before adding). Text-layer extraction only, no OCR (see
+# `document_import.rs`'s own doc comment for the deliberate scope-down).
+pdf-extract = "0.12"
+
 [build-dependencies]
 tonic-build = "0.12"
 

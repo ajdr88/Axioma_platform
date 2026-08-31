@@ -6,7 +6,7 @@ any earlier v1–v4 docs or prior drafts of this file — if something here conf
 the docs win; flag it and ask. (v3/v4 requirements/implementation docs are kept in `docs/` for
 history, not deleted — do not treat their presence as ambiguity about which is current.)
 
-**v5/v4 status (2026-08-30):** these are the result of `docs/IMPLEMENTATION_KICKOFF.md`'s Phase 0
+**v5/v4 status (2026-08-31):** these are the result of `docs/IMPLEMENTATION_KICKOFF.md`'s Phase 0
 doc-consolidation pass — a large body of new capability (Parametrics, Information/Data Architecture,
 Interaction/Timing modeling, Export/Reporting, a documents→draft-model pipeline, compressor
 subsystem requirements, and a full turbofan ADSG system model + Mode B design-space representation)
@@ -19,13 +19,17 @@ Functions, SelectionChoice/ConnectionChoice primitives, FR-COMP-04 unblocked, `R
 into the seeded structure — see impl v5 §12), **Phase 5's "Foundation slice"** (canvas visual
 types for Function/SelectionChoice/ConnectionChoice + ArchDerives/IncompatibleWith/ChoiceConstraint
 edges, review-gate origin UI, `/parametrics/evaluate` + `/information/elements` +
-`/collections/dynamic|freeze` — see impl v5 §13), and **Phase 5's Export & Reporting**
+`/collections/dynamic|freeze` — see impl v5 §13), **Phase 5's Export & Reporting**
 (`/elements/:id/attachments` + `/export/table` (CSV) + `/export/report` (one HTML template,
 `"risk-register"`) + a client-side "Export PNG" canvas button — see impl v5 §14; research found
-none of the three mechanisms this group's own design assumed already existed actually did) are all
-built and verified. Still unbuilt within Phase 5: the document-import pipeline, and Interaction
-view + Swimlane mode (the latter blocked on a real `Allocate` `EdgeKind` gap found during
-scoping). Phase 6 (test-scenario authoring) is also still open. `docs/claude/*.md` holds the
+none of the three mechanisms this group's own design assumed already existed actually did), and
+**Phase 5's documents → draft model pipeline** (FR-CORE-14…18 — a real async job:
+`POST /import/documents` uploads a PDF, real text extraction + deterministic segmentation + a real
+Ollama-drafted Requirement per candidate, landing as a `document-import`-origin proposal
+`mode_b.rs::accept_proposal` now genuinely materializes — see impl v5 §15; no OCR, no `llm-gateway`
+second-caller abstraction) are all built and verified. Still unbuilt within Phase 5: Interaction
+view + Swimlane mode (blocked on a real `Allocate` `EdgeKind` gap found during scoping, and
+ADR-009). Phase 6 (test-scenario authoring) is also still open. `docs/claude/*.md` holds the
 original amendment/analysis docs Phase 0 merged, kept for history.
 
 ## What this is

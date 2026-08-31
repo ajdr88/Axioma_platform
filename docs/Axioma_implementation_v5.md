@@ -1002,3 +1002,97 @@ report template variant — none has a concrete spec to build against, the same 
   computes) and confirming that existing test itself is unaffected by the `build_risk_register`
   refactor.
 - Live Playwright verification of the "Export PNG" button (§14.2) — not just passing tests.
+
+---
+
+## 15. Phase 5 continued: Documents → Draft Model Pipeline (FR-CORE-14..18) **[REV-D]**
+
+The third of Phase 5's deferred verticals the user asked to work through in sequence (after Export
+& Reporting), and the biggest/most novel one — a real async job pipeline turning an uploaded PDF
+into reviewable draft Requirements.
+
+### 15.1 What was found before designing anything
+
+- **Mode A's Ollama-calling pattern is directly reusable** — a plain `reqwest` call to
+  `{OLLAMA_URL}/api/generate` (model `qwen2.5:1.5b`), `modelVersion` from `/api/tags`'s digest
+  field, `promptTemplateHash` = SHA-256 of the fixed template. `packages/llm-gateway` is still "Not
+  started" — Mode A already set the precedent of hard-wiring Ollama directly rather than building
+  the abstraction for its first caller; this pipeline does the same for its second, deliberately
+  duplicating the ~30-line request/response shape rather than sharing it (two callers doesn't
+  justify extraction, same reasoning already applied to `fuml_client`/`archspace_client`).
+- **No async-job infrastructure existed anywhere in this codebase** — no jobs table, no
+  background-worker loop, no polling-by-id pattern (confirmed via search).
+- **No PDF/OCR crate existed.** Added `pdf-extract` 0.12 (MIT), verified directly against docs.rs
+  before adding: `extract_text_from_mem_by_pages(&[u8]) -> Result<Vec<String>, OutputError>` — real
+  per-page text extraction from in-memory bytes, exactly what FR-CORE-15's page-number citation
+  needs. Text-layer extraction only — **no OCR is attempted this pass**; an all-pages-empty
+  extraction is detected and fails the job with a precise reason.
+- **`create_proposal`'s schema (`store/versioning.rs`) is shaped entirely around Mode B's "propose
+  one subsystem candidate" concept.** Reqs v5 §5.6's own amendment explicitly allows "individual or
+  **consolidated-batch** accept/reject" for `document-import`, so one proposal per completed job —
+  `candidate` holding the full drafted-requirements array — is spec-conformant, not a workaround.
+  `subsystem_id` is repurposed to hold the job id (documented, not renamed).
+- **A more consequential finding**: `mode_b.rs::accept_proposal` unconditionally deserialized
+  `proposal.candidate` as Mode B's `Candidate` struct — this would hard-fail on a document-import
+  proposal's real candidate shape (an array of drafted requirements). Reqs v5's "reused unchanged"
+  claim for `GET/POST /cem/proposals/*` is true at the routing/HTTP-shape level, but the *internal
+  accept-time materialization* needed to branch on `proposal.origin` — a real, necessary extension,
+  documented directly in `accept_proposal`'s own updated doc comment.
+- **`mode_b.rs::propose`'s established branch-without-commit pattern is followed identically**: a
+  proposal's branch never actually receives a `commit()` — content lives entirely in
+  `proposals.candidate`, materialized only at accept time. Impl v5 §5.14 stage 5's prose says
+  "lands as a Git branch/commit," but the already-shipped mechanism doesn't literally commit
+  either; diverging from it for one origin would be inconsistent, not more correct.
+
+### 15.2 What was built
+
+`apps/api/src/document_import.rs` (new) implements all five stages and four endpoints:
+
+- **`POST /import/documents`** — multipart PDF upload, inserts the job row (`status: Extracting`),
+  `tokio::spawn`s the pipeline against a cloned `AppState`, returns `{jobId}` before the spawned
+  task necessarily finishes — real asynchrony, confirmed live (status observed `Extracting` →
+  `AwaitingReview` across real HTTP requests, not just internally).
+- **Extraction** → all-pages-empty is `Failed` ("no extractable text layer -- OCR not
+  implemented"). **Segmentation** (deterministic — no LLM call, per reqs' own explicit "not an LLM
+  call" text): any sentence containing "shall" is a candidate, tagged with its page index; a
+  length heuristic flags low confidence, never dropped (FR-CORE-18). Zero candidates → `Failed`
+  ("no candidate requirement statements found") — FR-CORE-18's "reported failure state, not an
+  empty successful import," implemented literally. **Structuring**: one Ollama call per candidate,
+  drafting `{name, shallText, category}`; a parse failure falls back to the raw candidate text
+  rather than dropping it. **Grounding & Provenance**: citation/confidence/`ImportProvenance`
+  stamped per candidate. **Validation**: an internal invariant check (should never trigger, given
+  the same code stamps these fields unconditionally) before `AwaitingReview`.
+- **FR-CORE-17 suggestions**: a simple heuristic (consecutive Title-Case word runs), explicitly
+  documented as not real NLP, computed alongside segmentation and stored separately.
+- **`GET /import/documents/:jobId`** (status+error), **`GET .../candidates`**,
+  **`GET .../suggestions`**, **`POST .../proposal`** (only from `AwaitingReview`; creates one branch
+  + one `document-import`-origin proposal batching every drafted candidate).
+- **`mode_b.rs::accept_proposal`** now branches on `proposal.origin`: `document-import` calls the
+  new `document_import::materialize_proposal` (creates one real `:Requirement` per drafted
+  candidate — name, `shallText`/citation/confidence/provenance as body properties, `Origin::
+  AiSuggested`, one commit for the batch) instead of `apply_candidate_to_main`.
+
+### 15.3 Verification
+
+- A hand-built minimal PDF (byte offsets computed programmatically, not a static literal with
+  manually-counted offsets — no test fixture ships with `pdf-extract`'s crates.io package) drives
+  three new integration tests: the full pipeline end-to-end through accept (drafted candidate's
+  citation/confidence checked, then a real `:Requirement` element confirmed after accept); the
+  no-extractable-text `Failed` case; the no-"shall"-sentences `Failed` case. All passed on the
+  first real run, including the live Ollama call (full suite run: 55/55 passing, was 52 going in).
+- **Live HTTP verification beyond the tests** (which call handlers directly, not through the real
+  router): a real `curl` multipart upload against a running dev server, end-to-end through accept.
+  The model drafted a genuinely sensible title ("Manual Curl Verification") from the raw candidate
+  sentence, correct citation (`page: 1`), correct provenance, and a real `Origin::AiSuggested`
+  `:Requirement` element existed in the graph afterward. This left one real proposal/branch/element
+  in the live "Turbofan Reference" project — same no-cleanup precedent as every other manual
+  verification pass this session (T-P1.4-05, Mode A, the Autonomy panel's own P2.2 pass); no
+  delete-project/proposal endpoint exists to clean it up with anyway.
+- `cargo build/clippy/fmt --workspace` clean.
+
+### 15.4 Explicitly not attempted this pass
+
+OCR (§15.1); `llm-gateway` (Mode A's own precedent stands — no second-caller abstraction yet);
+parallelizing the per-candidate LLM calls (sequential is fine for a background job); a real
+NLP-based structural-noun extractor; any rename of `create_proposal`'s columns (repurposed, not
+renamed, to avoid touching every Mode-B call site).

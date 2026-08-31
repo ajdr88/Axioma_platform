@@ -18,6 +18,12 @@
 //! override, auto-merging what it can and filing everything else as an individually
 //! accept/reject-able `proposals` row; `list_proposals`/`accept_proposal`/`reject_proposal` are
 //! the review side of that; `set_autonomy_level`/`get_autonomy_level` own the L0–L4 config itself.
+//!
+//! `accept_proposal` (docs/IMPLEMENTATION_KICKOFF.md Phase 5) is also the one shared accept
+//! endpoint for `document-import`-origin proposals (`document_import.rs`) — it dispatches to that
+//! module's own materialization, never calling an LLM itself (the drafting LLM call already ran
+//! earlier, during that pipeline's own async Structuring stage, well before any human accept
+//! decision) — the "no LLM in the decision path" invariant above stays structurally true.
 
 use anyhow::Context;
 use axum::{
@@ -30,8 +36,8 @@ use cem_core::{Candidate, Constraints, Targets};
 use sysml_core::{Edge, EdgeKind, ElementBody, Origin};
 
 use crate::{
-    autonomy, import::BadRequest, record_commit, store::versioning::Proposal, ApiError, AppState,
-    DiffEntry, MAIN_BRANCH,
+    autonomy, document_import, import::BadRequest, record_commit, store::versioning::Proposal,
+    ApiError, AppState, DiffEntry, MAIN_BRANCH,
 };
 
 /// The four subsystems `cem_core`'s grid actually varies — `accept`/`interface_contract` only
@@ -441,9 +447,15 @@ fn proposal_not_found(proposal_id: &str) -> Response {
         .into_response()
 }
 
-/// `POST /api/v0/projects/:projectId/cem/proposals/:proposalId/accept` — applies exactly that
-/// one subsystem's stored candidate to `main` via the same `apply_candidate_to_main` helper
-/// `accept`/`propose`'s auto-merge path use, then marks the row `accepted`.
+/// `POST /api/v0/projects/:projectId/cem/proposals/:proposalId/accept` — the routing/endpoint
+/// shape reqs v5 §5.6 calls "reused unchanged" across all three proposal origins, but the
+/// materialization it dispatches to is origin-specific: `cem-generated`/`human-authored` (not yet
+/// a real producer) apply a Mode B `Candidate` to one subsystem via `apply_candidate_to_main`
+/// (`accept`/`propose`'s own auto-merge path reuses the same helper); `document-import`
+/// (docs/IMPLEMENTATION_KICKOFF.md Phase 5, FR-CORE-16) creates a batch of new `:Requirement`
+/// elements via `document_import::materialize_proposal` instead — a `Candidate` deserialize would
+/// simply fail against that origin's real candidate shape (an array of drafted requirements, not a
+/// Mode B parameter set), so this dispatch is necessary, not optional.
 pub async fn accept_proposal(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -464,17 +476,23 @@ pub async fn accept_proposal(
         .into());
     }
 
-    let candidate: Candidate =
-        serde_json::from_value(proposal.candidate).context("parsing stored proposal candidate")?;
-    apply_candidate_to_main(
-        &state,
-        &project_id,
-        &state.auth.resolve_actor(&headers)?,
-        &candidate,
-        &proposal.top_level_requirement_ids,
-        &[proposal.subsystem_id.as_str()],
-    )
-    .await?;
+    let actor = state.auth.resolve_actor(&headers)?;
+    if proposal.origin == "document-import" {
+        document_import::materialize_proposal(&state, &project_id, &actor, &proposal.candidate)
+            .await?;
+    } else {
+        let candidate: Candidate = serde_json::from_value(proposal.candidate)
+            .context("parsing stored proposal candidate")?;
+        apply_candidate_to_main(
+            &state,
+            &project_id,
+            &actor,
+            &candidate,
+            &proposal.top_level_requirement_ids,
+            &[proposal.subsystem_id.as_str()],
+        )
+        .await?;
+    }
     state
         .versioning
         .set_proposal_status(&project_id, &proposal_id, "accepted")
