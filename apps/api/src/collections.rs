@@ -147,6 +147,7 @@ pub(crate) async fn freeze_collection(
                     source: collection_id.clone(),
                     target: member_id.clone(),
                     kind: EdgeKind::Member,
+                    metadata: None,
                 },
             )
             .await?;

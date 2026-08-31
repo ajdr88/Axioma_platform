@@ -3,7 +3,7 @@
 import { UNALLOCATED_LANE_ID } from "@axioma/diagram-engine";
 import type { Element as ApiElement } from "@axioma/shared-types";
 import { Button, Panel } from "@axioma/ui-components";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 interface PropertyRow {
   key: string;
@@ -84,7 +84,9 @@ export function ElementInspector({
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [allocating, setAllocating] = useState(false);
-  const [memberNames, setMemberNames] = useState<string[]>([]);
+  const [members, setMembers] = useState<{ id: string; name: string }[]>([]);
+  const [addingMemberId, setAddingMemberId] = useState("");
+  const [memberActionError, setMemberActionError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentMeta[]>([]);
   const [uploading, setUploading] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -181,30 +183,69 @@ export function ElementInspector({
   // FR-CORE-11 — a Collection's members are `Member` edges (source=collection), not `Contains`.
   // No source-filtered edges endpoint exists, so this fetches every `Member` edge in the project
   // and filters locally, the same pattern `InteractionPanel` already uses for `Contains`.
-  useEffect(() => {
+  const loadMembers = useCallback(async () => {
     if (elementKind !== "Collection") {
-      setMemberNames([]);
+      setMembers([]);
       return;
     }
-    let cancelled = false;
-    async function loadMembers() {
-      const res = await fetch(`/api/projects/${projectId}/edges?kind=Member`);
-      if (!res.ok || cancelled) {
-        return;
-      }
-      const edges: { source: string; target: string }[] = await res.json();
-      const names = edges
-        .filter((e) => e.source === elementId)
-        .map((e) => elements.find((el) => el.id === e.target)?.name ?? e.target);
-      if (!cancelled) {
-        setMemberNames(names);
-      }
+    const res = await fetch(`/api/projects/${projectId}/edges?kind=Member`);
+    if (!res.ok) {
+      return;
     }
-    loadMembers();
-    return () => {
-      cancelled = true;
-    };
+    const edges: { source: string; target: string }[] = await res.json();
+    setMembers(
+      edges
+        .filter((e) => e.source === elementId)
+        .map((e) => ({
+          id: e.target,
+          name: elements.find((el) => el.id === e.target)?.name ?? e.target,
+        })),
+    );
   }, [elementId, elementKind, projectId, elements]);
+
+  useEffect(() => {
+    loadMembers();
+    setMemberActionError(null);
+    setAddingMemberId("");
+  }, [loadMembers]);
+
+  /** Manual membership editing (FR-CORE-11's "add/remove members by hand" half). No dedicated
+   * backend endpoint needed — `EdgeKind::Member`'s only real rule is `source == Collection`
+   * (target unconstrained), already enforced by the existing generic edge endpoint, the same
+   * one `page.tsx::handleAllocate` already uses for `Allocate` edges. */
+  async function handleAddMember(memberId: string) {
+    if (!memberId) {
+      return;
+    }
+    setMemberActionError(null);
+    const res = await fetch(`/api/projects/${projectId}/edges`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: elementId, target: memberId, kind: "Member" }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      setMemberActionError(err?.error ?? `add failed with status ${res.status}`);
+      return;
+    }
+    setAddingMemberId("");
+    await loadMembers();
+  }
+
+  async function handleRemoveMember(memberId: string) {
+    setMemberActionError(null);
+    const res = await fetch(`/api/projects/${projectId}/edges`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: elementId, target: memberId, kind: "Member" }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      setMemberActionError(err?.error ?? `remove failed with status ${res.status}`);
+      return;
+    }
+    await loadMembers();
+  }
 
   const loadAttachments = async () => {
     const res = await fetch(`/api/projects/${projectId}/elements/${elementId}/attachments`);
@@ -418,16 +459,53 @@ export function ElementInspector({
               <p className="mb-1.5 text-[10px] uppercase tracking-widest text-white/40">
                 Members (FR-CORE-11)
               </p>
-              {memberNames.length === 0 && <p className="text-xs text-white/40">No members.</p>}
-              {memberNames.length > 0 && (
+              {memberActionError && (
+                <p className="mb-1.5 text-xs text-alert">{memberActionError}</p>
+              )}
+              {members.length === 0 && <p className="text-xs text-white/40">No members.</p>}
+              {members.length > 0 && (
                 <ul className="mb-2 space-y-0.5">
-                  {memberNames.map((name) => (
-                    <li key={name} className="truncate text-xs text-white/80">
-                      {name}
+                  {members.map((member) => (
+                    <li
+                      key={member.id}
+                      className="flex items-center justify-between gap-2 text-xs text-white/80"
+                    >
+                      <span className="truncate">{member.name}</span>
+                      <Button
+                        variant="ghost"
+                        onClick={() => handleRemoveMember(member.id)}
+                        className="!px-1.5 !py-0 text-xs"
+                      >
+                        &times;
+                      </Button>
                     </li>
                   ))}
                 </ul>
               )}
+              <div className="mb-2 flex gap-1.5">
+                <select
+                  value={addingMemberId}
+                  onChange={(event) => setAddingMemberId(event.target.value)}
+                  className="flex-1 rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
+                >
+                  <option value="">add member…</option>
+                  {elements
+                    .filter((e) => e.id !== elementId && !members.some((m) => m.id === e.id))
+                    .map((e) => (
+                      <option key={e.id} value={e.id}>
+                        {e.name}
+                      </option>
+                    ))}
+                </select>
+                <Button
+                  variant="ghost"
+                  onClick={() => handleAddMember(addingMemberId)}
+                  disabled={!addingMemberId}
+                  className="!px-2 !py-1 text-xs"
+                >
+                  Add
+                </Button>
+              </div>
               <a
                 href={`/api/projects/${projectId}/export/table?collectionId=${elementId}`}
                 className="block w-full rounded border border-white/10 px-2 py-1 text-center text-xs text-white/70 hover:bg-white/5"

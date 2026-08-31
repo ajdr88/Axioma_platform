@@ -190,7 +190,13 @@ pub enum EdgeKind {
     IncompatibleWith,
     /// Phase 1 — a Linked/Permutations/Unordered [non-]replacing combination rule across ≥2
     /// architecture choices (FR-ARCH-04, reqs v5 §5.17; mirrors `adsg_core.ChoiceConstraintType`,
-    /// confirmed during the Phase 2 spike). Kind-unconstrained, same reasoning as `ArchDerives`.
+    /// confirmed during the Phase 2 spike — the real enum, read directly from
+    /// `packages/cem-archspace/.venv/.../adsg_core/graph/choice_constraints.py`, is
+    /// `{LINKED, PERMUTATION, UNORDERED, UNORDERED_NOREPL}`). Kind-unconstrained, same reasoning
+    /// as `ArchDerives`. **The constraint's own type is real, persisted data** — see `Edge::metadata`
+    /// — not just a claim in this comment (a real gap this scope-downs pass closed; the seed
+    /// content's own `ChoiceConstraint` edges now set
+    /// `metadata: {"choiceConstraintType": "Linked"}`).
     ChoiceConstraint,
     /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12, reqs v5 §5.11) — the swimlane-partition
     /// allocation reqs v5 §5.11 itself calls "the existing `Allocate` dependency stereotype
@@ -290,6 +296,14 @@ pub struct Edge {
     pub source: ElementId,
     pub target: ElementId,
     pub kind: EdgeKind,
+    /// A generic JSON tag for edge-kind-specific data too small to warrant a dedicated field per
+    /// kind — matches `ElementBody.properties`'s own generic-bag precedent. Only `ChoiceConstraint`
+    /// populates it today (`{"choiceConstraintType": "Linked"|"Permutation"|"Unordered"|
+    /// "UnorderedNorepl"}`, mirroring `adsg_core.ChoiceConstraintType` exactly) — no other kind has
+    /// a documented, real need yet, so none are touched. `#[serde(default)]` so edges serialized
+    /// before this field existed still deserialize; omitted from output entirely when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// A single semantic-validation failure. The real layer (impl §4.2) also checks parametric
@@ -661,6 +675,7 @@ mod tests {
             source: parent.to_string(),
             target: child.to_string(),
             kind: EdgeKind::Contains,
+            metadata: None,
         }
     }
 
@@ -736,6 +751,7 @@ mod tests {
                 source: "Turbine".to_string(),
                 target: "REQ-THRUST".to_string(),
                 kind: EdgeKind::Satisfy,
+                metadata: None,
             })
             .unwrap();
 
@@ -743,6 +759,7 @@ mod tests {
             source: "REQ-THRUST".to_string(),
             target: "Turbine".to_string(),
             kind: EdgeKind::Refine,
+            metadata: None,
         });
 
         assert!(result.is_ok());
@@ -760,6 +777,7 @@ mod tests {
             source: "Combustor".to_string(),
             target: "Turbine".to_string(),
             kind: EdgeKind::Satisfy,
+            metadata: None,
         });
 
         assert_eq!(
@@ -790,6 +808,7 @@ mod tests {
             source: "Turbine".to_string(),
             target: "REQ-THRUST".to_string(),
             kind: EdgeKind::Satisfy,
+            metadata: None,
         });
 
         assert!(result.is_ok());

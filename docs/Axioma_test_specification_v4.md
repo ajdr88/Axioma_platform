@@ -5,7 +5,7 @@
 **Supersedes:** Axioma_test_specification_v3.md
 **Companion documents:** Axioma_requirements_v5.md, Axioma_implementation_v5.md
 **Scope:** One acceptance-level test per implementation step, expressed against a single running example — the **turbofan engine** SoI and its five reference subsystems (Fan & LP Compression, Core/HP Compressor, Combustor, Turbine HP&LP, Control/FADEC). Each test states a concrete setup, the action, and **binary PASS/FAIL criteria** with numeric thresholds where the source NFR defines one.
-**Change basis (v4):** Renamed from v3 per `docs/IMPLEMENTATION_KICKOFF.md` Phase 0's own recommendation ("candidate for a v4 rename... given the volume of additions"). All v3 tests carried forward unchanged; new tests appended for every FR group merged into `Axioma_requirements_v5.md` that already specifies concrete test scenarios (`FR-PARAM`, `FR-INFO`, `FR-INTX`, `FR-EXPORT`, `FR-CORE-10/11/12/13`, the amended `FR-CORE-03`, `FR-CORE-14…18`). **`FR-COMP-01…06` and `FR-ARCH-01…08` have no test rows yet** — the amendment that introduced them didn't specify test scenarios the way the others did; authoring those is `IMPLEMENTATION_KICKOFF.md` Phase 6 work, not done in this pass.
+**Change basis (v4):** Renamed from v3 per `docs/IMPLEMENTATION_KICKOFF.md` Phase 0's own recommendation ("candidate for a v4 rename... given the volume of additions"). All v3 tests carried forward unchanged; new tests appended for every FR group merged into `Axioma_requirements_v5.md` that already specifies concrete test scenarios (`FR-PARAM`, `FR-INFO`, `FR-INTX`, `FR-EXPORT`, `FR-CORE-10/11/12/13`, the amended `FR-CORE-03`, `FR-CORE-14…18`). **`FR-COMP-01…06` and `FR-ARCH-01…08` (§§ below) were authored in the scope-downs pass that followed Phase 6** — each row checked against what's actually built (several already covered by existing tests never tagged with a `T-*` id; a few genuinely not built, flagged rather than invented around) rather than the idealized full scope.
 
 ---
 
@@ -284,12 +284,210 @@
 **PASS:** Pipeline completes successfully — confirms FR-CORE-07 has no hidden Product-2 dependency.
 **FAIL:** Pipeline fails or silently calls a CEM-tier service.
 
-### T-DOCIMPORT-07 — Scanned PDF / OCR **[REV-D]**
+### T-DOCIMPORT-07 — Scanned PDF / OCR **[REV-D, built — scope-downs pass]**
 **Verifies:** FR-CORE-14
-**Setup:** A scanned (image-only) PDF of requirements.
+**Setup:** A scanned (image-only) PDF of requirements — no text layer, only a rasterized image
+per page.
 **Action:** Upload; run extraction.
-**PASS:** OCR runs automatically; extraction proceeds without a separate user action.
+**PASS:** OCR runs automatically (`pdfium-render` rasterizes each page, real Tesseract OCR via
+`leptess` reads it); extraction proceeds without a separate user action.
 **FAIL:** Job fails or requires a manual OCR step outside the platform.
+**Landed status:** built and feature-gated (`apps/api`'s `ocr` Cargo feature, default OFF — see
+`docs/Axioma_implementation_v5.md` §18/19 for why: `leptess` needs Tesseract/Leptonica headers at
+*compile* time, which this dev workspace's default build must not require on every contributor's
+machine). The default (non-`ocr`) build keeps the prior, honest FAIL-gracefully behavior for a
+scanned PDF; PASS is exercised by building/running `apps/api`'s new Docker image
+(`docker compose build api` — the first containerized build of this crate) with `--features ocr`,
+not by the host-run `cargo test -p api -- --ignored` suite.
+
+---
+
+## FR-COMP-01…06 — Compressor Requirements **[REV-D, authored — scope-downs pass]**
+
+Authored against what's *actually built* on `Turbofan-Ref` today, not the idealized full scope —
+checked against the real seed code and test suite before writing anything, matching this whole
+document's own evidence-based discipline. Several of these six were already exercised, just never
+tagged with a `T-COMP-*` id; three are genuinely not built yet, flagged rather than invented
+around.
+
+### T-COMP-01 — Design-point specification, real structured content
+**Verifies:** FR-COMP-01
+**Setup:** `Turbofan-Ref`'s seeded `FanLpCompression`/`CoreHpCompressor` subsystems.
+**Action:** Read the subsystem's body via `GET .../elements/:id/body`.
+**PASS:** All nine FR-COMP-01 fields present (weight flow, overall pressure ratio, equivalent
+speed, target efficiency, high-efficiency operating range, inlet/outlet diameters, max outlet
+velocity, length/weight targets, inlet distortion tolerance) with real, non-placeholder values.
+**FAIL:** Any field missing or a placeholder/zero value with no `sourceNote`.
+**Landed status:** built and covered — `seed_turbofan_ref_lands_fr_comp_content_for_both_
+compressor_subsystems` (`apps/api/src/main.rs`) already asserts this real content.
+
+### T-COMP-02 — Off-design performance map, real evaluation
+**Verifies:** FR-COMP-02
+**Setup:** The seeded `FanPerformanceMapConstraint`/`CorePerformanceMapConstraint` (real
+`sampledPointsAtDesignSpeed` tabulated curves).
+**Action:** `POST /parametrics/evaluate` at a real weight-flow input within the tabulated range.
+**PASS:** A real, deterministic linear-interpolated pressure ratio comes back — not a placeholder,
+not the design point re-echoed regardless of input.
+**FAIL:** A constant/placeholder value, or evaluation silently extrapolates outside the tabulated
+range instead of returning a typed "not evaluable" reason.
+**Landed status:** built and covered —
+`parametrics_evaluate_interpolates_fan_performance_map_and_rejects_out_of_range` asserts a real
+interpolated value (`~1.325` at a known input) and the out-of-range typed-error path.
+
+### T-COMP-03 — Blade-loading & Mach validation
+**Verifies:** FR-COMP-03
+**Setup:** A compressor-subsystem configuration whose diffusion factor exceeds 0.4 or relative
+Mach number exceeds 1.2, no override flag set.
+**Action:** Attempt to save/create that configuration via the real HTTP element-creation path.
+**PASS:** Rejected (or flagged) by the semantic-validation layer without an explicit
+human-acknowledged override.
+**FAIL:** Accepted silently.
+**Landed status:** **validated-but-unwired, not built at the HTTP layer** — a real
+`check_compressor_blade_loading` rule exists and is unit-tested inside `sysml-core` itself, but
+nothing in `apps/api`'s element-creation/validation path actually calls it yet. This PASS
+criterion is not currently achievable through the real HTTP API — flagged here, not invented
+around; wiring it in belongs to a future pass, not silently claimed done.
+
+### T-COMP-04 — Stage-count consistency (compressor ↔ driving turbine)
+**Verifies:** FR-COMP-04
+**Setup:** `Turbofan-Ref`'s seeded `FanLpStagesParam`/`TurbineLpStagesParam` and
+`CoreHpStagesParam`/`TurbineHpStagesParam` Parameter pairs.
+**Action:** `GET .../edges?kind=ChoiceConstraint` between each pair.
+**PASS:** A real `ChoiceConstraint` edge exists for each pair, and (scope-downs pass) its
+`metadata.choiceConstraintType` is `"Linked"` — mirroring `adsg_core.ChoiceConstraintType.LINKED`
+("to make all choices have the same option index," exactly "stage counts must match")
+**FAIL:** No edge, or an edge with no persisted constraint type (the type living only in a code
+comment, not the graph — a real gap this scope-downs pass closed, see impl v5 §18/19).
+**Landed status:** built and covered —
+`seed_turbofan_ref_lands_fr_arch_system_model_across_all_five_subsystems` asserts the edges exist;
+`choice_constraint_edge_metadata_round_trips_through_create_and_list` asserts the persisted type.
+
+### T-COMP-05 — Gas-generator matching interface
+**Verifies:** FR-COMP-05
+**Setup:** `Turbofan-Ref`'s seeded compressor-subsystem inlet/exit Ports.
+**Action:** Read each Port's body.
+**PASS:** Equivalent weight flow, equivalent speed, and (Core (HP) Compressor) the station-number
+convention are all present as real values, matching §5.16's own numbering.
+**FAIL:** Missing fields or placeholder station numbers.
+**Landed status:** built and covered — the same seeded fixture T-COMP-01 checks; ports carry this
+data as part of `seed_fr_comp_content`'s own inlet/exit port seeding.
+
+### T-COMP-06 — Negotiable-specification flagging
+**Verifies:** FR-COMP-06
+**Setup:** A compressor subsystem whose FR-COMP-01 fields are mutually incompatible (e.g. a
+pressure ratio unreachable within the stated length/weight budget at the stated stage count).
+**Action:** Inspect the subsystem's `flagged`/`negotiable` body fields after that configuration is
+saved.
+**PASS:** `flagged: true`, surfaced for human review, not silently adjusted or accepted.
+**FAIL:** Silently adjusted, or `flagged` stays `false` for a genuinely incompatible spec.
+**Landed status:** **not built** — `negotiable`/`flagged` are real, seeded boolean fields (the
+storage FR-COMP-06 needs), but nothing computes or sets them from an actual mutual-incompatibility
+check; the seeded values (`negotiable: true, flagged: false`) are static, not derived. Flagged
+here, not invented around.
+
+---
+
+## FR-ARCH-01…08 — Mode B Architecture Design-Space **[REV-D, authored — scope-downs pass]**
+
+Same evidence-based discipline as FR-COMP above — checked against the real seed code, the real
+`cem-archspace` sidecar spike (ADR-011, impl v5 §10), and the real test suite before writing
+anything.
+
+### T-ARCH-01 — Function-to-form modeling
+**Verifies:** FR-ARCH-01
+**Setup:** `Turbofan-Ref`'s seeded `:Function`/`:SelectionChoice`/`:ConnectionChoice` system model.
+**Action:** `GET .../elements` scoped to those kinds, across all five subsystems.
+**PASS:** Real Function/SelectionChoice/ConnectionChoice elements exist for all five subsystems,
+distinct from fUML Actions (FR-CORE-04) — no kind confusion.
+**FAIL:** Missing kinds, or Functions/Actions conflated.
+**Landed status:** built and covered —
+`seed_turbofan_ref_lands_fr_arch_system_model_across_all_five_subsystems`.
+
+### T-ARCH-02 — Selection choice modeling, including cyclic derivation
+**Verifies:** FR-ARCH-02
+**Setup:** `Turbofan-Ref`'s seeded `SelectionChoice` nodes and their `ArchDerives` edges.
+**Action:** `GET .../edges?kind=ArchDerives`; inspect for a genuine cyclic mutually-dependent
+derivation graph (e.g. Compressor/Combustor/Turbine existence depending on each other).
+**PASS:** Selection choices exist with derivation edges, including at least one real cycle.
+**FAIL:** No cyclic derivation representable at all.
+**Landed status:** **partially built** — `SelectionChoice` nodes and `ArchDerives` edges are real
+and tested (same test as T-ARCH-01), but the seeded `ArchDerives` edges are plain "this choice is
+scoped to its owning subsystem" links, not a genuine cyclic mutual-dependency graph — the seed
+code's own comment says a real DSG's option-derivation graph is "out of scope for this static
+seed." `ArchDerives` is cycle-permitted by schema (confirmed in `sysml-core`), so a real cyclic
+example is representable whenever real Mode B design-space content needs one — just not
+constructed by today's fixture.
+
+### T-ARCH-03 — Connection choice modeling, cardinality rules
+**Verifies:** FR-ARCH-03
+**Setup:** `Turbofan-Ref`'s seeded `ConnectionChoice` nodes.
+**Action:** Read a `ConnectionChoice`'s body; attempt a connection that violates its stated
+cardinality.
+**PASS:** Cardinality (list/range/lower-bound-only) is a real, enforced rule — a violating
+connection is rejected.
+**FAIL:** Cardinality accepted as a descriptive label only, never checked.
+**Landed status:** **not built** — `ConnectionChoice` nodes are real and seeded, and each carries a
+`cardinality` field, but it's confirmed (by direct code reading — no `cardinality` reference exists
+outside that one descriptive seed string anywhere in `sysml-core`/`apps/api`) to be plain
+descriptive text, never a computed/enforced rule. Flagged here, not invented around.
+
+### T-ARCH-04 — Incompatibility & choice constraints
+**Verifies:** FR-ARCH-04
+**Setup:** `Turbofan-Ref`'s seeded `IncompatibleWith` and `ChoiceConstraint` edges.
+**Action:** `GET .../edges?kind=IncompatibleWith` and `?kind=ChoiceConstraint`.
+**PASS:** Both edge kinds exist with real endpoints; a `ChoiceConstraint` edge's real type
+(scope-downs pass: `Edge.metadata.choiceConstraintType`) is persisted and retrievable, not just a
+claim in a comment.
+**FAIL:** Edges absent, or a `ChoiceConstraint`'s type unpersisted/undistinguishable from a bare
+edge with no type at all.
+**Landed status:** built and covered — same fixture/tests as T-COMP-04 above (the `ChoiceConstraint`
+metadata fix in this pass closes what was previously a real, flagged gap here too).
+
+### T-ARCH-05 — Design vector encode/decode
+**Verifies:** FR-ARCH-05
+**Setup:** The real `cem-archspace` sidecar (ADR-011), a defined design space.
+**Action:** Encode a resolved architecture into a design vector; decode it back into a graph
+instance, over the real gRPC boundary.
+**PASS:** Round-trips correctly — decode produces a real, structurally valid instance.
+**FAIL:** Round-trip loses information or the sidecar isn't actually exercised (a mocked result).
+**Landed status:** built and covered — `archspace_design_space_round_trips_through_the_sidecar`
+(`#[ignore]`d, requires the `cem-archspace` sidecar running) exercises this over the real gRPC
+wire against the Dockerized service, not a mock.
+
+### T-ARCH-06 — Design-space health metrics
+**Verifies:** FR-ARCH-06
+**Setup:** The same defined design space as T-ARCH-05.
+**Action:** Request Imputation Ratio, Correction Ratio, Correction Fraction, Max Rate Diversity
+before launching an optimization run.
+**PASS:** Real, non-placeholder metric values come back (e.g. a real Imputation Ratio, not `1.0`
+or `0.0` as a stub).
+**FAIL:** Placeholder/stub values, or metrics only available after a full optimization run
+completes (defeating their "before an expensive run" purpose).
+**Landed status:** built and covered — same test as T-ARCH-05; a real Imputation Ratio (`1.333` on
+the spike's own test problem, per impl v5 §10) comes back from the real sidecar.
+
+### T-ARCH-07 — Architecture instance generation & comparison
+**Verifies:** FR-ARCH-07
+**Setup:** A completed Mode B run producing multiple candidate architecture instances.
+**Action:** Browse/compare candidates via the existing `/cem/proposals/*` review-gate flow.
+**PASS:** Candidates are browsable/comparable, each with FR-CEM-04/05 provenance, entered into the
+same proposal/review-gate flow every other AI-generated element uses — not a separate approval
+mechanism.
+**FAIL:** No browsable candidate set, or a second, divergent review mechanism.
+**Landed status:** **not built** — this is exactly what "FR-ARCH-01…06 real build-out" (wiring
+`cem-archspace` into a real `apps/api` HTTP surface + `cem-core`'s own encode/decode logic) exists
+to build in a later pass; the sidecar spike (T-ARCH-05/06) proved the underlying mechanism works,
+it isn't wired into a user-facing generation/comparison flow yet.
+
+### T-ARCH-08 — Non-convergent evaluation handling
+**Verifies:** FR-ARCH-08
+**Setup:** A candidate architecture whose evaluation does not converge.
+**Action:** Run evaluation via Mode B.
+**PASS:** A typed, non-fatal outcome (e.g. a Probability-of-Viability signal) usable by the
+optimizer, reusing the existing solver-result-state pattern (FR-CEM-13) — not a hard failure.
+**FAIL:** A hard failure/crash, or a second, divergent result-state taxonomy invented for this case.
+**Landed status:** **not built** — same reason as T-ARCH-07; belongs to the same future real
+build-out pass, not this one.
 
 ---
 
@@ -637,8 +835,8 @@
 | **FR-INFO-01…04** | T-INFO-01, T-INFO-02 |
 | **FR-INTX-01…04** | T-INTX-01, T-INTX-02 |
 | **FR-EXPORT-01…04** | T-EXPORT-01, T-EXPORT-02, T-EXPORT-03 |
-| **FR-COMP-01…06** | *none yet — Phase 6* |
-| **FR-ARCH-01…08** | *none yet — Phase 6* |
+| **FR-COMP-01…06** | T-COMP-01, T-COMP-02, T-COMP-03, T-COMP-04, T-COMP-05, T-COMP-06 |
+| **FR-ARCH-01…08** | T-ARCH-01, T-ARCH-02, T-ARCH-03, T-ARCH-04, T-ARCH-05, T-ARCH-06, T-ARCH-07, T-ARCH-08 |
 | FR-SAFE-01 | T-P1.2-04 |
 | FR-SAFE-02 | T-P1.2-04 |
 | FR-SAFE-03 | T-P1.2-07 |
@@ -672,7 +870,7 @@
 | NFR-COMP-01/02/03/05 | T-X-07 |
 | NFR-COMP-04 | T-P1.1-05 |
 
-**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` is verified by at least one test above, **except FR-COMP-01…06 and FR-ARCH-01…08**, which have no test-spec rows yet (see this document's header — Phase 6 work, not part of this doc-consolidation pass). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
+**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` now has at least one test-spec row, including FR-COMP-01…06 and FR-ARCH-01…08 (authored in the scope-downs pass, §§ above) — though several of those rows document a genuinely **not-built** PASS criterion rather than a passing test (T-COMP-03/06, T-ARCH-02/03/07/08 each say so explicitly in their own "Landed status" line; not silently marked green). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
 
 ## Phase 6 landed status **[REV-D]**
 

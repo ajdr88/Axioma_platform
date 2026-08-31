@@ -6,10 +6,12 @@
 //! - **FR-EXPORT-04 (attachments)**: a real read+write pointer mechanism, built for the first
 //!   time — `ObjectStore::get_object` (the missing read half) plus a new `attachments` metadata
 //!   table.
-//! - **FR-EXPORT-02 (tabular)**: CSV only (no XLSX crate is justified for this pass), scoped over
-//!   either a `NodeKind` filter or a frozen `/collections/dynamic` result's membership — the
-//!   latter reuses Phase 5's own Collections feature as the "saved scope" concept, rather than
-//!   inventing a second one to stand in for the nonexistent Generic Table view.
+//! - **FR-EXPORT-02 (tabular)**: CSV or XLSX (`?format=csv|xlsx`, default `csv` — scope-downs
+//!   pass, `rust_xlsxwriter`), scoped over either a `NodeKind` filter or a frozen
+//!   `/collections/dynamic` result's membership — the latter reuses Phase 5's own Collections
+//!   feature as the "saved scope" concept, rather than inventing a second one to stand in for the
+//!   nonexistent Generic Table view. Still no column-selection parameter — no Generic Table view
+//!   exists to select columns from either way.
 //! - **FR-EXPORT-03 (report)**: a real, minimal template mechanism — `build_risk_register`
 //!   (`traceability.rs`) is now shared by both the existing JSON risk-register endpoint and this
 //!   module's HTML report path, per reqs v5's own "no new parallel pipeline" instruction. Exactly
@@ -132,19 +134,31 @@ pub(crate) async fn download_attachment(
     Ok(response)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ExportTableFormat {
+    #[default]
+    Csv,
+    Xlsx,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct ExportTableQuery {
     pub(crate) kind: Option<NodeKind>,
     #[serde(rename = "collectionId")]
     pub(crate) collection_id: Option<String>,
+    #[serde(default)]
+    pub(crate) format: ExportTableFormat,
 }
 
-/// `GET /api/v0/projects/:projectId/export/table` (FR-EXPORT-02) — CSV, scoped by `?kind=X` (every
-/// element of one `NodeKind`) or `?collectionId=Y` (a frozen `/collections/{id}/freeze` result's
-/// real membership, reusing Phase 5's own Collections feature rather than inventing a second
-/// "scope" concept to stand in for the Generic Table view that doesn't exist). Fixed baseline
-/// columns (id/name/kind/origin/active) — no column-selection parameter, since there's no Generic
-/// Table view's own column set to mirror.
+const EXPORT_TABLE_COLUMNS: [&str; 5] = ["id", "name", "kind", "origin", "active"];
+
+/// `GET /api/v0/projects/:projectId/export/table` (FR-EXPORT-02) — CSV or XLSX (`?format=`,
+/// default `csv`), scoped by `?kind=X` (every element of one `NodeKind`) or `?collectionId=Y` (a
+/// frozen `/collections/{id}/freeze` result's real membership, reusing Phase 5's own Collections
+/// feature rather than inventing a second "scope" concept to stand in for the Generic Table view
+/// that doesn't exist). Fixed baseline columns (id/name/kind/origin/active) in both formats — no
+/// column-selection parameter, since there's no Generic Table view's own column set to mirror.
 pub(crate) async fn export_table(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
@@ -173,25 +187,73 @@ pub(crate) async fn export_table(
         );
     };
 
-    let mut csv = String::from("id,name,kind,origin,active\n");
-    for e in elements {
-        csv.push_str(&csv_row(&[
-            &e.id,
-            &e.name,
-            e.kind.as_label(),
-            e.origin.as_str(),
-            if e.active { "true" } else { "false" },
-        ]));
-    }
-    let mut response = csv.into_response();
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"));
-    response.headers_mut().insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("attachment; filename=\"export-{project_id}.csv\""))
-            .map_err(anyhow::Error::from)?,
-    );
+    let response = match params.format {
+        ExportTableFormat::Csv => {
+            let mut csv = String::from("id,name,kind,origin,active\n");
+            for e in &elements {
+                csv.push_str(&csv_row(&[
+                    &e.id,
+                    &e.name,
+                    e.kind.as_label(),
+                    e.origin.as_str(),
+                    if e.active { "true" } else { "false" },
+                ]));
+            }
+            let mut response = csv.into_response();
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"));
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!("attachment; filename=\"export-{project_id}.csv\""))
+                    .map_err(anyhow::Error::from)?,
+            );
+            response
+        }
+        ExportTableFormat::Xlsx => {
+            let mut workbook = rust_xlsxwriter::Workbook::new();
+            let sheet = workbook.add_worksheet();
+            for (col, header_label) in EXPORT_TABLE_COLUMNS.iter().enumerate() {
+                sheet
+                    .write_string(0, col as u16, *header_label)
+                    .map_err(anyhow::Error::from)?;
+            }
+            for (row, e) in elements.iter().enumerate() {
+                let row = (row + 1) as u32;
+                sheet
+                    .write_string(row, 0, &e.id)
+                    .map_err(anyhow::Error::from)?;
+                sheet
+                    .write_string(row, 1, &e.name)
+                    .map_err(anyhow::Error::from)?;
+                sheet
+                    .write_string(row, 2, e.kind.as_label())
+                    .map_err(anyhow::Error::from)?;
+                sheet
+                    .write_string(row, 3, e.origin.as_str())
+                    .map_err(anyhow::Error::from)?;
+                sheet
+                    .write_boolean(row, 4, e.active)
+                    .map_err(anyhow::Error::from)?;
+            }
+            let bytes = workbook.save_to_buffer().map_err(anyhow::Error::from)?;
+            let mut response = bytes.into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+            );
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!(
+                    "attachment; filename=\"export-{project_id}.xlsx\""
+                ))
+                .map_err(anyhow::Error::from)?,
+            );
+            response
+        }
+    };
     Ok(response)
 }
 

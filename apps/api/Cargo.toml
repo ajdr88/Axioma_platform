@@ -63,6 +63,26 @@ prost = "0.13"
 # directly against docs.rs before adding). Text-layer extraction only, no OCR (see
 # `document_import.rs`'s own doc comment for the deliberate scope-down).
 pdf-extract = "0.12"
+# Scope-downs pass (FR-EXPORT-02, XLSX) — verified directly against docs.rs before adding: pure
+# Rust by default (its only default dependency is `zip`; a C toolchain is only pulled in by the
+# optional `zlib` perf feature, which this workspace does not enable).
+rust_xlsxwriter = "0.99"
+
+# Scope-downs pass (FR-CORE-14, OCR) — real, `optional = true`, gated behind the `ocr` feature
+# (default off). `leptess` (Tesseract binding) needs `libtesseract-dev`/`libleptonica-dev`/
+# `clang` present at COMPILE time (a real `-sys` crate) — this dev machine is Windows, and the
+# default workspace build must keep working here and for every other contributor without those
+# installed. `pdfium-render` itself only *dynamically* binds a Pdfium `.so` at runtime
+# (`Pdfium::bind_to_library`, verified against its own docs — ships no binary itself), but is
+# gated the same way for consistency, since it's only ever used alongside `leptess`. See
+# `apps/api/Dockerfile` for the one place `--features ocr` is actually built, and
+# `document_import.rs`'s own doc comment for the `#[cfg(feature = "ocr")]` split.
+pdfium-render = { version = "0.9", optional = true }
+leptess = { version = "0.14", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+
+[features]
+ocr = ["dep:pdfium-render", "dep:leptess", "dep:image"]
 
 [build-dependencies]
 tonic-build = "0.12"

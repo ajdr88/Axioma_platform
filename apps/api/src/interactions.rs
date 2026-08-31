@@ -285,6 +285,7 @@ pub(crate) async fn add_fragment(
                 source: interaction_id.clone(),
                 target: fragment.id.clone(),
                 kind: EdgeKind::Contains,
+                metadata: None,
             },
         )
         .await?;

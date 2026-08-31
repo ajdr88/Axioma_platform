@@ -1,9 +1,16 @@
 //! docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-14..18) — the async "documents → draft model"
-//! pipeline (reqs v5 §5.14). Two deliberate scope-downs, flagged rather than silently guessed:
+//! pipeline (reqs v5 §5.14). One deliberate scope-down, flagged rather than silently guessed:
 //!
-//! - **No OCR.** `pdf_extract` reads only existing text layers. A scanned/image-only PDF (every
-//!   page's extracted text is empty/whitespace) fails the job with a precise reason, not silent
-//!   garbage or a crash.
+//! - **OCR is feature-gated (`ocr`, default OFF), not always available.** `pdf_extract` reads
+//!   only existing text layers; for a scanned/image-only PDF, `ocr_pages` below rasterizes each
+//!   page (`pdfium-render`, dynamically binds a Pdfium `.so` at runtime — no binary shipped, see
+//!   `apps/api/Dockerfile`) and runs real Tesseract OCR on it (`leptess`, needs
+//!   `libtesseract-dev`/`libleptonica-dev`/`clang` at **compile** time — a real `-sys` crate).
+//!   Gated behind a Cargo feature because this dev workspace's default build must keep working on
+//!   every contributor's machine, Windows included, without those installed — see
+//!   `apps/api/Cargo.toml`'s own comment on the `ocr` feature. The default (non-`ocr`) build keeps
+//!   the exact prior behavior: a scanned/image-only PDF fails the job with a precise reason, not
+//!   silent garbage or a crash.
 //! - **No `llm-gateway`.** `packages/llm-gateway/README.md` is still "Not started" — Mode A
 //!   (`mode_a.rs`) already set the precedent of hard-wiring a direct Ollama call rather than
 //!   building the pluggable-provider abstraction for its first caller; this pipeline does the
@@ -299,6 +306,62 @@ pub(crate) struct DraftedRequirement {
 }
 
 // ---------------------------------------------------------------------------
+// OCR fallback (FR-CORE-14, T-DOCIMPORT-07) — feature-gated, see this module's own doc comment.
+// ---------------------------------------------------------------------------
+
+/// Rasterizes every page of a PDF and runs real Tesseract OCR on each — only called once
+/// `pdf_extract`'s text-layer extraction has already come back empty for every page. A page's
+/// rasterization/OCR failure doesn't abort the whole document: it becomes an empty string for
+/// that page (surfaced downstream as "still no text" if every page fails the same way), not a
+/// hard error for one bad page in an otherwise-scannable document.
+#[cfg(feature = "ocr")]
+fn ocr_pages(pdf_bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let bindings = pdfium_render::prelude::Pdfium::bind_to_library(
+        std::env::var("PDFIUM_LIB_PATH").unwrap_or_else(|_| "libpdfium.so".to_string()),
+    )
+    .or_else(|_| pdfium_render::prelude::Pdfium::bind_to_system_library())
+    .map_err(|e| anyhow::anyhow!("binding to Pdfium library: {e}"))?;
+    let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
+    let document = pdfium
+        .load_pdf_from_byte_slice(pdf_bytes, None)
+        .map_err(|e| anyhow::anyhow!("loading PDF for OCR: {e}"))?;
+
+    let render_config = pdfium_render::prelude::PdfRenderConfig::new()
+        .set_target_width(2000)
+        .set_maximum_height(2000);
+
+    let mut pages = Vec::new();
+    for page in document.pages().iter() {
+        let text = (|| -> anyhow::Result<String> {
+            let image = page
+                .render_with_config(&render_config)
+                .map_err(|e| anyhow::anyhow!("rendering page for OCR: {e}"))?
+                .as_image()
+                .map_err(|e| {
+                    anyhow::anyhow!("converting rendered page to an image for OCR: {e}")
+                })?;
+            let mut png_bytes = Vec::new();
+            image.write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )?;
+            let mut ocr = leptess::LepTess::new(None, "eng")
+                .map_err(|e| anyhow::anyhow!("initializing Tesseract: {e}"))?;
+            ocr.set_image_from_mem(&png_bytes)
+                .map_err(|e| anyhow::anyhow!("loading rasterized page into Tesseract: {e}"))?;
+            Ok(ocr.get_utf8_text().unwrap_or_default())
+        })();
+        pages.push(text.unwrap_or_default());
+    }
+    Ok(pages)
+}
+
+#[cfg(not(feature = "ocr"))]
+fn ocr_pages(_pdf_bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    anyhow::bail!("OCR not implemented in this build (compiled without the `ocr` feature)")
+}
+
+// ---------------------------------------------------------------------------
 // The pipeline itself.
 // ---------------------------------------------------------------------------
 
@@ -309,20 +372,50 @@ async fn run_pipeline_inner(
     pdf_bytes: &[u8],
 ) -> anyhow::Result<()> {
     // Extraction.
-    let pages = pdf_extract::extract_text_from_mem_by_pages(pdf_bytes)
+    let text_layer_pages = pdf_extract::extract_text_from_mem_by_pages(pdf_bytes)
         .map_err(|e| anyhow::anyhow!("PDF extraction failed: {e}"))?;
-    if pages.iter().all(|p| p.trim().is_empty()) {
-        state
-            .postgres
-            .update_import_job_status(
-                project_id,
-                job_id,
-                "Failed",
-                Some("no extractable text layer -- OCR not implemented"),
-            )
-            .await?;
-        return Ok(());
-    }
+    let pages = if text_layer_pages.iter().all(|p| p.trim().is_empty()) {
+        // No text layer at all — the scanned-PDF case OCR exists for. Real, CPU-bound work
+        // (image rendering + Tesseract), run via `spawn_blocking` so it doesn't stall the async
+        // runtime's worker thread — this already runs inside `run_pipeline`'s own `tokio::spawn`,
+        // not on any request-handling path, but that doesn't exempt it from this rule.
+        let pdf_bytes_owned = pdf_bytes.to_vec();
+        let ocr_result = tokio::task::spawn_blocking(move || ocr_pages(&pdf_bytes_owned)).await;
+        match ocr_result {
+            Ok(Ok(ocr_pages)) if !ocr_pages.iter().all(|p| p.trim().is_empty()) => ocr_pages,
+            Ok(Ok(_)) => {
+                state
+                    .postgres
+                    .update_import_job_status(
+                        project_id,
+                        job_id,
+                        "Failed",
+                        Some("no extractable text layer -- OCR ran but found no text either"),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            Ok(Err(ocr_error)) => {
+                state
+                    .postgres
+                    .update_import_job_status(
+                        project_id,
+                        job_id,
+                        "Failed",
+                        Some(&format!(
+                            "no extractable text layer -- OCR failed: {ocr_error}"
+                        )),
+                    )
+                    .await?;
+                return Ok(());
+            }
+            Err(join_error) => {
+                return Err(anyhow::anyhow!("OCR task panicked: {join_error}"));
+            }
+        }
+    } else {
+        text_layer_pages
+    };
 
     // Segmentation.
     state

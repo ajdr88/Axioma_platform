@@ -46,10 +46,35 @@ file uploads — see impl v5 §17. **Phase 6** (test coverage — landing the `T
 done — see impl v5 §18: of 19 IDs, 7 had a real gap and got 5 new tests (62/62 passing overall),
 most were already covered by earlier passes' own tests (confirmed by reading the suite first, not
 assumed), and several describe capabilities this session already, honestly scoped out (no general
-algebraic Parametrics, no XLSX export, no server-side full-diagram render, no orphan-Action
-rejection, no OCR) — flagged, not built just to make a spec sentence pass. **This closes out every
-phase in `docs/IMPLEMENTATION_KICKOFF.md`.**
-`docs/claude/*.md` holds the original amendment/analysis docs Phase 0
+algebraic Parametrics, no orphan-Action rejection) — flagged, not built just to make a spec
+sentence pass. **This closes out every phase in `docs/IMPLEMENTATION_KICKOFF.md`.**
+
+**Post-kickoff scope-downs pass** then closed several of those remaining flagged gaps for real —
+see impl v5 §19: XLSX export (`?format=xlsx` on `/export/table`, `rust_xlsxwriter`), the
+server-side full-diagram headless render (FR-EXPORT-01's other half — a new internal `/export/
+full-diagram/:projectId` route driven by a real `playwright` dependency, not the dev-only on-demand
+fetch earlier passes used), OCR for document-import (FR-CORE-14/T-DOCIMPORT-07 — `pdfium-render` +
+Tesseract via `leptess`, gated behind a new default-OFF `ocr` Cargo feature on `apps/api` so the
+default build stays Windows-host-friendly, built via a real, first-ever `apps/api/Dockerfile`),
+native drag-and-drop Swimlane reallocation (FR-CORE-12, alongside the existing click-to-allocate
+dropdown, not replacing it), manual Collection membership add/remove (FR-CORE-11, no new backend
+endpoint needed — the existing generic edge endpoint already covers it), and FR-COMP-01…06/
+FR-ARCH-01…08 test-spec authoring (14 new rows in `docs/Axioma_test_specification_v4.md`, each
+honestly flagging what's actually built vs. still open). Also fixed, per explicit direction: a
+real, previously-flagged schema gap where `ChoiceConstraint`'s own claimed type
+(Linked/Permutations/Unordered[-NoRepl]) was never actually persisted — `Edge` gained a generic
+`metadata` field for this. Still open, flagged not built: FR-COMP-03's HTTP-layer wiring,
+FR-COMP-06's mutual-incompatibility detection, FR-ARCH-02's genuine cyclic derivation,
+FR-ARCH-03's cardinality enforcement, and FR-ARCH-07/08 — the last four belong to the next
+requested passes (FR-ARCH-01…06 and FR-COMP-01…06's real build-out). This pass is now fully
+closed and live-verified (impl v5 §19.9): the OCR container was actually built (five real bugs
+found and fixed along the way, not assumed away — two Docker-infra, three code-level, all detailed
+in §19.4/§19.9) and run, with a hand-built scanned PDF proven end to end through Tesseract OCR,
+Ollama drafting, and proposal acceptance into a real `:Requirement` element; live browser
+verification of drag-and-drop Swimlane reallocation caught a real bug (dragging never actually
+moved anything — a stale layout recompute fought React Flow's own drag position on every render)
+that no static check had caught, now fixed and reverified. `apps/api --ignored` stayed at 63/63
+throughout, zero regressions. `docs/claude/*.md` holds the original amendment/analysis docs Phase 0
 merged, kept for history.
 
 ## What this is
@@ -132,7 +157,12 @@ global acyclicity.
   above; see `packages/sysml-core/src/lib.rs::EdgeKind::ArchDerives`'s doc comment),
   `IncompatibleWith`, `ChoiceConstraint`; plus (v5, Phase 5) `Allocate` (Swimlane allocation,
   FR-CORE-12 — kind-unconstrained on both ends, same discipline as `ArchDerives` above). Edges
-  carry metadata (stereotype, multiplicity, provenance).
+  carry metadata (stereotype, multiplicity, provenance) via `Edge::metadata: Option<serde_json::
+  Value>` (post-kickoff scope-downs pass, impl v5 §19.1) — a generic JSON tag stored as a Neo4j
+  relationship string property (JSON-serialized; Neo4j properties can't hold nested JSON
+  natively). Only `ChoiceConstraint` populates it today (its real Linked/Permutations/Unordered
+  type, mirroring `adsg_core.ChoiceConstraintType`) — no other kind has a documented, real need
+  yet, so "stereotype"/"provenance" stay aspirational for every other edge kind.
 
 All of the above are real `NodeKind`/`EdgeKind` variants in `packages/sysml-core/src/lib.rs` today
 (with `sysml-textual`'s keyword mapping and `packages/shared-types` kept in sync) — not aspirational.

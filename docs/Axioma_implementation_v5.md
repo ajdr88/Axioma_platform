@@ -1434,3 +1434,281 @@ construction instead (§18.1).
   the new tests against the real stack before considering them done, not just by getting them to
   compile.
 - No frontend changes this pass — no `tsc`/Biome/`next build` needed.
+
+---
+
+## 19. Scope-Downs Pass: XLSX, Server-Side Diagram Render, OCR, Swimlane Drag-and-Drop, Manual
+## Collection Membership, FR-COMP/FR-ARCH Test-Spec Authoring **[REV-D]**
+
+With every phase in `docs/IMPLEMENTATION_KICKOFF.md` closed (§18), the user asked to work through
+the smaller scope-downs flagged across this whole session before moving on to FR-ARCH-01…06's real
+build-out. Six items; two (server-side render, OCR) turned out to be substantial standalone
+efforts, not polish — confirmed with the user up front, who chose to include both, with OCR as the
+"full stack" (`pdfium-render` + Tesseract, a real `apps/api` Dockerfile).
+
+### 19.1 A real schema gap closed first, per explicit direction
+
+While reviewing the draft plan, the user asked for `EdgeKind::ChoiceConstraint`'s own
+long-standing flagged gap to be fixed for real, not documented again: its doc comment claimed a
+Linked/Permutations/Unordered[-NoRepl] type (mirroring `adsg_core.ChoiceConstraintType`, confirmed
+during the Phase 2 spike) that `Edge` (`{source, target, kind}` only) had no field to persist.
+
+- **`Edge` gains one new field: `metadata: Option<serde_json::Value>`** — a generic JSON tag
+  (mirrors `ElementBody.properties`'s own generic-bag precedent), not a `ChoiceConstraint`-specific
+  field. Only `ChoiceConstraint` populates it today; no other edge kind has a documented, real need
+  yet.
+- **Neo4j storage**: relationship properties can't hold arbitrary nested JSON (only primitives/
+  arrays-of-primitives) — `Neo4jStore::create_edge` serializes `metadata` to a compact JSON string
+  property; `edges_of_kind` deserializes it back. `SET r.metadata = null` (the `None` case)
+  genuinely removes the property per Neo4j's own semantics, confirmed via `neo4rs`'s real
+  `Option<T> -> BoltType` conversion (`None` → `BoltType::Null`) before relying on it.
+- The real enum was confirmed, not guessed, by reading the actual Python source the Phase 2 spike
+  vendored (`packages/cem-archspace/.venv/.../adsg_core/graph/choice_constraints.py`):
+  `{LINKED, PERMUTATION, UNORDERED, UNORDERED_NOREPL}`. The seed code's two `ChoiceConstraint`
+  edges (pairing compressor/turbine stage-count Parameters, FR-COMP-04) are objectively `LINKED`
+  per adsg-core's own definition ("to make all choices have the same option index" — exactly
+  "stage counts must match") — now set for real, not just claimed in a comment.
+- Threaded through `CreateEdgeRequest`, the generic `create_edge` handler, and
+  `packages/shared-types/src/index.ts`'s `Edge` interface.
+- Adding the field broke every existing `Edge { ... }` struct-literal construction in the
+  workspace (58 call sites, `sysml-core`/`sysml-textual`/`apps/api` combined) — fixed
+  systematically (most via a small Python script matching the compiler's own reported line
+  numbers, three by hand where the call site was `CreateEdgeRequest`/needed real metadata, not
+  `None`), verified by driving the error count to zero across `cargo build --workspace`,
+  `cargo test -p api --no-run`, and `cargo clippy --workspace --all-targets` in turn.
+- New test: `choice_constraint_edge_metadata_round_trips_through_create_and_list` — a
+  `ChoiceConstraint` edge with real metadata round-trips intact; a `ChoiceConstraint` edge with no
+  metadata round-trips as `None`, not an empty object or an error.
+
+### 19.2 XLSX export (FR-EXPORT-02)
+
+`rust_xlsxwriter` (verified via crates.io/docs.rs before adding, alongside two disqualified
+alternatives: `xlsxwriter`/`xlsxwriter-rs` wraps libxlsxwriter via FFI — a real C dependency;
+`simple_excel_writer` has been unmaintained since March 2022) — pure Rust by default, confirmed:
+its only default dependency is `zip`, a C toolchain is only pulled in by the optional `zlib` perf
+feature, not enabled here.
+
+`export_table` gains `?format=csv|xlsx` (default `csv`, every existing caller/test unaffected).
+Same fixed 5-column baseline (id/name/kind/origin/active) in both formats — still no
+column-selection parameter, since there's still no Generic Table view to select columns from.
+Frontend: a format `<select>` next to the existing kind `<select>` in the main toolbar, appending
+`&format=` to the existing "Export Table" link — no new proxy route needed, `export/table/
+route.ts` already forwards the full query string. New test asserts a real ZIP/XLSX container
+(`PK\x03\x04` magic bytes, non-trivial size) — full spreadsheet parsing is left to live browser
+verification, not duplicated as a Rust-side dependency.
+
+### 19.3 Server-side full-diagram headless render (FR-EXPORT-01, the other half)
+
+Confirmed before designing anything: no `playwright` dependency existed anywhere in this repo
+(only fetched on demand for live *verification* in earlier passes); no headless/print render mode
+existed in `diagram-engine`; `computeClusteredNodes` is viewport-driven with no "render everything"
+bypass.
+
+- New internal route, `apps/web/src/app/export/full-diagram/[projectId]/page.tsx` — a minimal,
+  toolbar-less canvas that fetches real elements/edges, lays them out via the existing
+  `computeElkLayout` (no clustering at all — every element renders regardless of count, the whole
+  point of this route versus the existing client-side viewport-only "Export PNG"), and signals
+  `data-diagram-ready="true"` once ready.
+- New `apps/web/scripts/render-full-diagram.mjs` — launches headless Chromium via a real (not
+  dev-only) `playwright` dependency, navigates to that internal route, waits for the readiness
+  signal, screenshots, writes PNG bytes to stdout. Invoked by a new
+  `apps/web/src/app/api/projects/[projectId]/export/full-diagram/route.ts` via `execFile`, keeping
+  the heavy Playwright/Chromium runtime isolated to a child process rather than loaded into the
+  main Next.js server on every request.
+- **A real bug found and fixed via live verification, not assumed away**: the first version used
+  the declarative `<ReactFlow fitView>` prop, which only fits once, on ReactFlow's own initial
+  mount — which happens immediately with an empty `nodes` array (the fetch/layout data hasn't
+  loaded yet), fitting an empty view that never re-fits once real nodes arrive. Confirmed via a
+  live `curl` against the real endpoint: the first screenshot had nodes clipped at both left and
+  right edges. Fixed exactly the way Swimlane View's own identical `fitView` timing bug was fixed
+  earlier this session — split into an outer state-owning component + an inner component calling
+  `useReactFlow()` (required to be a `ReactFlowProvider` descendant), with an imperative
+  `reactFlowInstance.fitView()` call in a `useEffect` keyed on the real node count. Also added
+  `minZoom={0.01}` (React Flow's own default `minZoom` of 0.5 would otherwise cap how far a large
+  diagram can zoom out to fit — the same real constraint already fixed for the main canvas's own
+  clustering feature). Re-verified live: the full `Turbofan-Ref` tree now renders with every node
+  visible, none clipped.
+- **Real, flagged operational cost, not hidden**: bundling Playwright + a real Chromium binary
+  into the Next.js server materially increases its deployment footprint.
+
+### 19.4 OCR for document-import (FR-CORE-14, T-DOCIMPORT-07)
+
+Confirmed before designing anything: no rasterizer existed (`pdf-extract`/`lopdf` are text-only).
+Two real, verified crate candidates: `pdfium-render` (dynamically binds a Pdfium `.so` at
+**runtime** via `Pdfium::bind_to_library` — confirmed via its own docs, ships no binary itself,
+real prebuilt Linux binaries at `github.com/bblanchon/pdfium-binaries/releases`, verified by
+downloading a real release and confirming `lib/libpdfium.so`'s exact internal path before writing
+the Dockerfile's extraction step) and `leptess` (Tesseract binding — `LepTess::new`,
+`set_image_from_mem(&[u8])`, `get_utf8_text()`, all confirmed via direct docs.rs fetches before
+writing any code — needs `libtesseract-dev`/`libleptonica-dev`/`clang` at **compile** time, a real
+`-sys` crate).
+
+- **The load-bearing design decision, found during planning, not in the original research**: this
+  dev machine is Windows, and `leptess`'s build script needs those headers present at `cargo
+  build` time. Adding it as a plain dependency would break `cargo build --workspace` on this host
+  (and any future non-Linux contributor) the moment it's added. Fixed by gating OCR behind a new,
+  default-OFF Cargo feature (`ocr`) on the `api` crate — `pdfium-render`/`leptess`/`image` are
+  `optional = true`, enabled only by that feature. Confirmed the default build is completely
+  unaffected: `cargo build --workspace`/`cargo clippy --workspace --all-targets` both stayed green
+  throughout, and the existing document-import test suite (5 tests) kept passing unchanged against
+  the default (non-`ocr`) build.
+- `document_import.rs`'s extraction stage: when `pdf_extract`'s text-layer extraction comes back
+  empty for every page, `ocr_pages` (feature-gated; `#[cfg(not(feature = "ocr"))]` keeps the exact
+  prior "OCR not implemented" behavior) rasterizes each page via `pdfium-render`, PNG-encodes it
+  via the `image` crate, and runs real Tesseract OCR via `leptess`. Run inside `tokio::
+  spawn_blocking` — real, CPU-bound work (image rendering + Tesseract), which must not stall the
+  async runtime's worker thread even though it already runs inside `run_pipeline`'s own
+  `tokio::spawn`, off any request-handling path.
+- New `apps/api/Dockerfile` (multi-stage, mirroring `packages/fuml-runtime/Dockerfile`'s own
+  build/runtime-stage split) — the first-ever containerized build of `apps/api`. Build stage
+  installs the compile-time Tesseract/Leptonica/clang packages plus fetches the pinned pdfium
+  binary; builds with `cargo build --release --features ocr`. Runtime stage installs just the
+  Tesseract runtime + language data, copies the binary and `libpdfium.so`. New `docker-compose.yml`
+  `api` service (not started by a bare `docker compose up -d` — built/run explicitly), pointing at
+  every other service by its compose network hostname (`neo4j`/`postgres`/`minio`/`ollama`/
+  `fuml-runtime`/`cem-archspace`), not `localhost`.
+- New checked-in binary test fixture, `apps/api/tests/fixtures/scanned-requirement.jpg` — a real
+  rendered-text image (generated once via Pillow against a real system font, not synthesized pixel
+  noise), matching this codebase's existing fixture convention (`tests/fixtures/sample*.reqif`
+  etc., loaded via `include_bytes!`/`include_str!`). Embedded (also via Pillow, `Image.save(...,
+  "PDF")`) into a genuinely image-only PDF, `apps/api/tests/fixtures/scanned-requirement.pdf` — a
+  real `/Filter /DCTDecode` XObject wrapping the JPEG bytes directly, confirmed by grepping the
+  raw file for zero `Tj`/`TJ` text-showing operators, for a real end-to-end OCR integration test.
+- **Verification runs inside the new container, not the Windows host** — sidesteps the
+  Windows/Tesseract-native-binding fragility entirely. Confirmed with a real, running
+  `docker compose up -d api` (alongside `neo4j`/`postgres`/`minio`/`ollama`, pointed at the same
+  dev Postgres/Neo4j the host uses): a live multipart `curl` upload of
+  `scanned-requirement.pdf` to `POST /import/documents` reached `AwaitingReview`, with Tesseract
+  correctly reading "The turbofan control system shall achieve rated thrust." off the rendered
+  JPEG and Ollama (`qwen2.5:1.5b`) drafting it into a real candidate
+  (`{"name":"Turbofan Control System Performance","shallText":"The turbofan control system shall
+  achieve rated thrust.",...}`, full provenance attached). Creating and accepting the resulting
+  `document-import` proposal materialized a real `:Requirement` element in the graph
+  (`origin: AiSuggested`) — the whole pipeline, OCR included, proven end to end, not just compiled.
+- **Two real bugs found and fixed via actual failed builds, not assumed away** (beyond the
+  `.dockerignore`/`protobuf-compiler` pair already covered in the Dockerfile's own comments):
+  (1) `pdfium-render` 0.9's `.as_image()` returns `Result<DynamicImage, PdfiumError>`, not a bare
+  `DynamicImage` — `ocr_pages` was missing the `?`/`map_err`, caught by the container's own
+  compiler once the build finally got past the `protoc` bug and reached `api`'s own code; (2) the
+  Dockerfile's build stage extracts the pinned pdfium release with `tar --strip-components=1` on
+  member `lib/libpdfium.so`, which lands the file at `/opt/pdfium/libpdfium.so` (the `lib/` prefix
+  is exactly what got stripped) — the runtime stage's `COPY` was still written for
+  `/opt/pdfium/lib/libpdfium.so` and failed with a checksum/"not found" error. Both fixed, and the
+  final image size is 323MB (86.1MB compressed).
+
+### 19.5 Native drag-and-drop Swimlane allocation (FR-CORE-12)
+
+Confirmed real, documented `@xyflow/react` APIs before designing (not guessed):
+`useReactFlow()`'s `getIntersectingNodes`/`isNodeIntersecting` instance methods, and the
+already-wired `onNodeDragStop` callback.
+
+Member nodes' `draggable` (hardcoded `false` in Swimlane View before this pass) is now `true`
+while `showSwimlaneView` is active; `nodesDraggable` on `<ReactFlow>` becomes `editMode ||
+showSwimlaneView` (loosens dragging specifically for swimlane nodes regardless of Edit Mode —
+matching the click-to-allocate dropdown's own always-available behavior — without loosening
+dragging on the normal canvas, since `showSwimlaneView` being true already means `nodes` is
+`swimlaneNodes`, not `displayNodes`). `onNodeDragStop`, when in Swimlane View, calls
+`reactFlowInstance.getIntersectingNodes(node)`, filters to `type === "swimlaneLane"`, and calls the
+exact same `handleAllocate(elementId, laneId)` the dropdown already uses on a match. No
+intersecting lane (dropped in the gap between lanes) is a no-op, not a silent reallocation to
+Unallocated — the dropdown remains the precise way to explicitly unallocate. The dropdown itself
+stays in `ElementInspector` as an additional, precise/accessible affordance — drag is additive,
+not a replacement.
+
+**A real bug found via live browser verification, not caught by any static check**: the first
+version compiled clean and passed `tsc`/Biome/`next build`, but dragging a member node never
+actually moved it on screen and never reallocated anything — every drop landed back in the node's
+own original lane regardless of where it was dropped. Root cause: `swimlaneNodes` recomputes every
+member's `position` from `computeSwimlaneLayout(...).memberPositions.get(node.id)` on *every*
+render, and that map always has an entry for every element (unallocated elements land in a
+catch-all lane), so the `position ? {...} : node.position` fallback never actually took the live
+`node.position` branch. Every drag mousemove fires `onNodesChange` → re-render →
+`swimlaneNodes` snaps the node straight back to its static per-lane grid slot, cancelling out React
+Flow's own live drag-tracked position — so `onNodeDragStop`'s `getIntersectingNodes(node)` always
+evaluated a frozen, never-moved position and always found the node's own current lane. **Fixed** by
+adding a `draggingNodeId` state (set in a new `onNodeDragStart`, cleared at the top of
+`onNodeDragStop`) and skipping the layout override — falling back to the live `node.position`
+instead — for whichever node id is actively being dragged. Live-reverified afterward (both
+directions, with a real `page.reload()` in between, not just a client-side re-render): the node's
+bounding box now visibly tracks the cursor mid-drag, settles into the dropped-on lane's grid slot,
+and the reallocation is confirmed via `GET /edges?kind=Allocate` and survives a real page reload.
+
+### 19.6 Manual Collection membership editing (FR-CORE-11)
+
+Confirmed before designing: `EdgeKind::Member`'s only real endpoint rule is `source_kind ==
+NodeKind::Collection` (target unconstrained) — the existing generic `POST/DELETE /api/v0/
+projects/:projectId/edges` already enforces exactly that. **No new backend endpoint needed at
+all.** `ElementInspector.tsx`'s previously read-only "Members" section gained a "×" remove button
+per member and an "add member" `<select>` (populated from already-loaded `elements`, excluding
+existing members and the Collection itself) + Add button, both calling the generic edge endpoint —
+the exact pattern `page.tsx::handleAllocate` already established for `Allocate` edges. The member
+list's fetch was refactored into a callable `loadMembers()` (mirroring the Attachments section's
+own `loadAttachments` pattern already in this file) so add/remove can re-trigger it.
+
+### 19.7 FR-COMP-01…06 / FR-ARCH-01…08 test-spec authoring
+
+Full literal FR text read from `docs/Axioma_requirements_v5.md` §5.15–17 before drafting anything.
+Checked real seed content and the real test suite first — several of the 14 requirements turned
+out to already be substantially covered, confirmed by reading the seed code directly rather than
+assumed: FR-COMP-01/02/05 and FR-ARCH-01/05/06 by existing tests never tagged with a `T-*` id;
+FR-COMP-04/FR-ARCH-04 newly closed by §19.1's `ChoiceConstraint` metadata fix. Four are genuinely
+not built and flagged as such rather than invented around: FR-COMP-03 (validated-but-unwired — a
+real `check_compressor_blade_loading` unit test exists in `sysml-core`, never called from the HTTP
+validation layer), FR-COMP-06 (the `negotiable`/`flagged` fields are real but static, no computed
+detection logic), FR-ARCH-02's genuine *cyclic* derivation (the seeded `ArchDerives` edges are
+plain subsystem-scoping links, not a real mutual-dependency graph — the seed code's own comment
+already said this is out of scope for a static seed), FR-ARCH-03's cardinality *enforcement* (a
+real, seeded, but purely descriptive string field, never a computed rule), and FR-ARCH-07/08 (the
+proposal/review-gate wiring and non-convergent-evaluation typed outcome — exactly what the user's
+next requested pass, FR-ARCH-01…06's real build-out, exists to build). 14 new rows
+(`T-COMP-01…06`/`T-ARCH-01…08`) added to `docs/Axioma_test_specification_v4.md` in the doc's own
+existing format, each with a "Landed status" line naming its real disposition; the FR-coverage
+table and the doc's own header/coverage notes updated to match.
+
+### 19.8 Explicitly not attempted this pass
+
+Wiring `check_compressor_blade_loading` into the real HTTP validation layer (FR-COMP-03); any
+computed mutual-incompatibility detection for FR-COMP-06; a genuine cyclic `ArchDerives`
+derivation graph or enforced `ConnectionChoice` cardinality rules (FR-ARCH-02/03); FR-ARCH-07/08's
+proposal/review-gate wiring — all four belong to the user's next requested passes (FR-ARCH-01…06,
+FR-COMP-01…06 real build-out), not this one. Installing Tesseract/Pdfium on the Windows dev host
+directly (the `ocr` feature gate avoids ever needing to). Layer-cache optimization for the new
+`apps/api/Dockerfile` (a plain `COPY . .`, no dependency-only pre-build layer) — a real, accepted
+simplicity tradeoff for a first version.
+
+### 19.9 Verification
+
+- `cargo build/clippy/fmt --workspace` (default, no `ocr` feature): clean throughout, re-verified
+  after every edit in this pass, not just once at the end, and once more after the final `cargo
+  fmt --all` pass this section's own edits required.
+- `docker compose build api` (real, `--features ocr` build): succeeded on the fifth attempt, after
+  five real, sequential bugs found and fixed via actual failed builds, not guessed around — two
+  infra-level (37GB build context from no `.dockerignore`; a Windows `protoc.exe` executed inside
+  the Linux container) documented in the Dockerfile/`.dockerignore`'s own comments, and three
+  code-level (the `Edge::metadata` compile fix wasn't a build bug but is the reason `cargo build`
+  had to stay green throughout; `.as_image()`'s real `Result` return type; the pdfium
+  `--strip-components=1` extraction path mismatch) documented in §19.4 above. Final image: 323MB
+  (86.1MB compressed).
+- Full `apps/api --ignored` suite (default, non-`ocr` features), run on the host: **63/63
+  passing**, zero regressions from this whole pass — re-run twice, once immediately after the
+  schema fix and once as this section's own final check, both clean.
+- `pnpm --filter @axioma/web exec tsc --noEmit` / Biome (`biome check src`, 54 files) / a real
+  `next build`: all clean, including the new `playwright` production dependency and the two new
+  routes/scripts.
+- Live verification against the real running dev server and the real running container:
+  - **OCR, end to end, via the container**: `docker compose up -d api` (alongside its real
+    dependencies) + a live multipart `curl` upload of the hand-built
+    `scanned-requirement.pdf` fixture to the running container's `POST /import/documents` —
+    reached `AwaitingReview` with a real OCR-derived, Ollama-drafted candidate, and accepting the
+    resulting proposal materialized a real `:Requirement` graph element. Full transcript in §19.4.
+  - **XLSX export, Collection membership editing, drag-and-drop Swimlane reallocation**: live
+    Playwright verification against the host dev server (`pnpm --filter @axioma/web dev` +
+    `cargo run -p api --bin api`), Turbofan-Ref project (`86699a51-394d-4555-ae86-efe768ce4c07`).
+    XLSX and membership editing passed on the first pass — real ZIP/XLSX bytes fetched from the
+    toolbar's own export link; a Collection's member add/remove round-tripped live with no page
+    reload. Drag-and-drop failed on the first pass (the real bug documented in §19.5) and passed
+    on the second, after the fix — both directions, mid-drag movement, correct settled lane, and
+    survival across a real full-page reload all independently confirmed.
+- Final re-checks after the §19.5 fix: `tsc --noEmit`, `biome check src` (after one `biome check
+  --write` formatting fix the edit itself needed), and `next build` all re-run clean; `cargo build
+  --workspace` re-run clean (frontend-only change, but checked regardless).

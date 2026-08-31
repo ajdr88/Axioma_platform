@@ -990,6 +990,7 @@ async fn create_contains_edge(
         source: payload.parent,
         target: payload.child,
         kind: EdgeKind::Contains,
+        metadata: None,
     };
     state.neo4j.create_edge(&project_id, &edge).await?;
     record_commit(
@@ -1019,6 +1020,7 @@ async fn delete_contains_edge(
         source: payload.parent,
         target: payload.child,
         kind: EdgeKind::Contains,
+        metadata: None,
     };
     state.neo4j.delete_edge(&project_id, &edge).await?;
     record_commit(
@@ -1046,6 +1048,10 @@ struct CreateEdgeRequest {
     source: String,
     target: String,
     kind: EdgeKind,
+    /// Only meaningful on create — see `Edge::metadata`'s own doc comment. `#[serde(default)]`
+    /// so every existing caller (which never sends this field) keeps working unchanged.
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
 }
 
 /// Generic edge listing for every kind besides `Contains` (which keeps its own
@@ -1074,6 +1080,7 @@ async fn create_edge(
         source: payload.source,
         target: payload.target,
         kind: payload.kind,
+        metadata: payload.metadata,
     };
     state.neo4j.create_edge(&project_id, &edge).await?;
     record_commit(
@@ -1102,6 +1109,7 @@ async fn delete_edge(
         source: payload.source,
         target: payload.target,
         kind: payload.kind,
+        metadata: None,
     };
     state.neo4j.delete_edge(&project_id, &edge).await?;
     record_commit(
@@ -1429,6 +1437,7 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
                     source: "Engine".to_string(),
                     target: id.to_string(),
                     kind: EdgeKind::Contains,
+                    metadata: None,
                 },
             )
             .await?;
@@ -1736,6 +1745,7 @@ async fn seed_fr_comp_content(
                     source: seed.subsystem_id.to_string(),
                     target: seed.spec_req_id.to_string(),
                     kind: EdgeKind::Satisfy,
+                    metadata: None,
                 },
             )
             .await?;
@@ -1829,6 +1839,7 @@ async fn seed_fr_comp_content(
                         source: param_id.to_string(),
                         target: seed.subsystem_id.to_string(),
                         kind: EdgeKind::Bound,
+                        metadata: None,
                     },
                 )
                 .await?;
@@ -1876,6 +1887,7 @@ async fn seed_fr_comp_content(
                         source: seed.subsystem_id.to_string(),
                         target: port_id.to_string(),
                         kind: EdgeKind::Contains,
+                        metadata: None,
                     },
                 )
                 .await?;
@@ -1960,12 +1972,10 @@ async fn seed_fr_comp_content(
 /// Combustor, Turbine (HP & LP) — Control (FADEC/EEC) is not gas-path). The diagram is treated as
 /// authoritative here.
 ///
-/// **A real, confirmed schema gap, flagged not invented around**: `EdgeKind::ChoiceConstraint`'s
-/// own doc comment says it "carries a Linked/Permutations/Unordered [non-]replacing type," but
-/// `Edge` (`packages/sysml-core/src/lib.rs`) is `{source, target, kind}` only — no properties
-/// field exists to persist that type anywhere. The two `ChoiceConstraint` edges below are real
-/// (FR-COMP-04, unblocked now that Turbine-side stage-count Parameters exist), but their "Linked"
-/// type lives only in this comment and the docs write-up, not in the graph.
+/// The two `ChoiceConstraint` edges below are real (FR-COMP-04, unblocked now that Turbine-side
+/// stage-count Parameters exist) and carry a real, persisted `LINKED` type via `Edge::metadata`
+/// — a real, previously-flagged schema gap (the type used to live only in a comment, not the
+/// graph) closed in the same pass that added `Edge::metadata` itself.
 async fn seed_fr_arch_system_model(
     state: &AppState,
     project_id: &str,
@@ -2106,6 +2116,7 @@ async fn seed_fr_arch_system_model(
                     source: p.subsystem_id.to_string(),
                     target: p.id.to_string(),
                     kind: EdgeKind::Contains,
+                    metadata: None,
                 },
             )
             .await?;
@@ -2211,6 +2222,7 @@ async fn seed_fr_arch_system_model(
                     source: sc.id.to_string(),
                     target: sc.subsystem_id.to_string(),
                     kind: EdgeKind::ArchDerives,
+                    metadata: None,
                 },
             )
             .await?;
@@ -2385,6 +2397,7 @@ async fn seed_fr_arch_system_model(
                         source: f.id.to_string(),
                         target: target.to_string(),
                         kind: EdgeKind::ArchDerives,
+                        metadata: None,
                     },
                 )
                 .await?;
@@ -2406,6 +2419,7 @@ async fn seed_fr_arch_system_model(
                 source: "MixedNozzle".to_string(),
                 target: "FanBypassDuctExitPort".to_string(),
                 kind: EdgeKind::IncompatibleWith,
+                metadata: None,
             },
         )
         .await?;
@@ -2563,6 +2577,7 @@ async fn seed_fr_arch_system_model(
                     source: p.id.to_string(),
                     target: p.subsystem_id.to_string(),
                     kind: EdgeKind::Bound,
+                    metadata: None,
                 },
             )
             .await?;
@@ -2585,6 +2600,10 @@ async fn seed_fr_arch_system_model(
                     source: a.to_string(),
                     target: b.to_string(),
                     kind: EdgeKind::ChoiceConstraint,
+                    // LINKED, not guessed: adsg-core's own definition is "to make all choices
+                    // have the same option index" — exactly "the compressor and its driving
+                    // turbine must have the same stage count" (FR-COMP-04).
+                    metadata: Some(serde_json::json!({ "choiceConstraintType": "Linked" })),
                 },
             )
             .await?;
@@ -2613,6 +2632,7 @@ async fn seed_fr_arch_system_model(
                     source: subsystem_id.to_string(),
                     target: "REQ-THRUST".to_string(),
                     kind: EdgeKind::Satisfy,
+                    metadata: None,
                 },
             )
             .await?;
@@ -2793,6 +2813,7 @@ mod tests {
                     source: engine.id.clone(),
                     target: turbine.id.clone(),
                     kind: EdgeKind::Contains,
+                    metadata: None,
                 },
             )
             .await
@@ -2805,6 +2826,7 @@ mod tests {
                     source: turbine.id.clone(),
                     target: engine.id.clone(),
                     kind: EdgeKind::Contains,
+                    metadata: None,
                 },
             )
             .await;
@@ -2844,6 +2866,7 @@ mod tests {
                     source: combustor.id.clone(),
                     target: turbine.id.clone(),
                     kind: EdgeKind::Satisfy,
+                    metadata: None,
                 },
             )
             .await;
@@ -2889,6 +2912,7 @@ mod tests {
                     source: engine.id.clone(),
                     target: "IntegrationTestDoesNotExist".to_string(),
                     kind: EdgeKind::Contains,
+                    metadata: None,
                 },
             )
             .await;
@@ -3871,6 +3895,7 @@ mod tests {
                     source: "TurbineHpLp".to_string(),
                     target: "HAZ-OVERSPEED".to_string(),
                     kind: EdgeKind::Causes,
+                    metadata: None,
                 },
             )
             .await
@@ -4269,6 +4294,7 @@ mod tests {
                     source: "A".to_string(),
                     target: "B".to_string(),
                     kind: EdgeKind::Refine,
+                    metadata: None,
                 },
             )
             .await
@@ -4318,6 +4344,7 @@ mod tests {
                     source: "S1".to_string(),
                     target: "S2".to_string(),
                     kind: EdgeKind::Refine,
+                    metadata: None,
                 },
             )
             .await
@@ -4330,6 +4357,7 @@ mod tests {
                     source: "S2".to_string(),
                     target: "S3".to_string(),
                     kind: EdgeKind::Refine,
+                    metadata: None,
                 },
             )
             .await
@@ -4512,6 +4540,7 @@ mod tests {
                         source: id,
                         target: "Hub".to_string(),
                         kind: EdgeKind::Refine,
+                        metadata: None,
                     },
                 )
                 .await
@@ -4553,6 +4582,7 @@ mod tests {
                         source: id.clone(),
                         target: "Hub".to_string(),
                         kind: EdgeKind::Refine,
+                        metadata: None,
                     },
                 )
                 .await
@@ -4662,6 +4692,7 @@ mod tests {
                         source: id.to_string(),
                         target: "Hub".to_string(),
                         kind: EdgeKind::Satisfy,
+                        metadata: None,
                     },
                 )
                 .await
@@ -4778,6 +4809,7 @@ mod tests {
                     source: "Turbine".to_string(),
                     target: "HAZ-OVERSPEED".to_string(),
                     kind: EdgeKind::Causes,
+                    metadata: None,
                 },
             )
             .await
@@ -4817,6 +4849,7 @@ mod tests {
                     source: "HAZ-OVERSPEED".to_string(),
                     target: "Governor".to_string(),
                     kind: EdgeKind::MitigatedBy,
+                    metadata: None,
                 },
             )
             .await
@@ -4888,6 +4921,7 @@ mod tests {
                     source: "SH1".to_string(),
                     target: "M1".to_string(),
                     kind: EdgeKind::Concerns,
+                    metadata: None,
                 },
             )
             .await
@@ -4900,6 +4934,7 @@ mod tests {
                     source: "SH1".to_string(),
                     target: "R1".to_string(),
                     kind: EdgeKind::Concerns,
+                    metadata: None,
                 },
             )
             .await
@@ -4967,6 +5002,7 @@ mod tests {
                     source: "Combustor".to_string(),
                     target: "REQ-THRUST".to_string(),
                     kind: EdgeKind::Satisfy,
+                    metadata: None,
                 },
             )
             .await
@@ -6045,6 +6081,7 @@ mod tests {
             Query(export::ExportTableQuery {
                 kind: Some(NodeKind::Structure),
                 collection_id: None,
+                format: export::ExportTableFormat::Csv,
             }),
         )
         .await
@@ -6060,6 +6097,40 @@ mod tests {
         assert!(csv.starts_with("id,name,kind,origin,active\n"));
         assert!(csv.contains("Alpha,Alpha,Structure,Human,true"));
         assert!(csv.contains("Beta,Beta,Structure,Human,true"));
+
+        // Scope-downs pass (FR-EXPORT-02, XLSX) — a real workbook, not just a 200. XLSX is a ZIP
+        // container, so its own magic bytes (`PK\x03\x04`) plus a non-trivial size are a real,
+        // deterministic Rust-side check; parsing it back as an actual spreadsheet is covered by
+        // this pass's live browser verification, not duplicated here.
+        let by_kind_xlsx = export::export_table(
+            State(state.clone()),
+            Path(project.id.clone()),
+            Query(export::ExportTableQuery {
+                kind: Some(NodeKind::Structure),
+                collection_id: None,
+                format: export::ExportTableFormat::Xlsx,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            by_kind_xlsx
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        let xlsx_bytes = axum::body::to_bytes(by_kind_xlsx.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            xlsx_bytes.starts_with(b"PK\x03\x04"),
+            "not a real ZIP/XLSX container"
+        );
+        assert!(
+            xlsx_bytes.len() > 1000,
+            "suspiciously small for a real workbook"
+        );
 
         let saved = collections::save_dynamic_collection(
             State(state.clone()),
@@ -6093,7 +6164,8 @@ mod tests {
             Path(project.id.clone()),
             Query(export::ExportTableQuery {
                 kind: None,
-                collection_id: Some(frozen.collection_id),
+                collection_id: Some(frozen.collection_id.clone()),
+                format: export::ExportTableFormat::Csv,
             }),
         )
         .await
@@ -6111,6 +6183,7 @@ mod tests {
             Query(export::ExportTableQuery {
                 kind: None,
                 collection_id: None,
+                format: export::ExportTableFormat::Csv,
             }),
         )
         .await;
@@ -6579,6 +6652,7 @@ mod tests {
                 source: "SomeAction".to_string(),
                 target: "OwningLane".to_string(),
                 kind: EdgeKind::Allocate,
+                metadata: None,
             }),
         )
         .await
@@ -6592,6 +6666,70 @@ mod tests {
         assert!(allocate_edges
             .iter()
             .any(|e| e.source == "SomeAction" && e.target == "OwningLane"));
+    }
+
+    /// Scope-downs pass — closes the `ChoiceConstraint` schema gap `seed_fr_arch_system_model`'s
+    /// own doc comment used to flag: a `ChoiceConstraint` edge's `metadata` (its real
+    /// `choiceConstraintType`, mirroring `adsg_core.ChoiceConstraintType`) now actually persists
+    /// through `create_edge`/`edges_of_kind`, not just in a comment. Also confirms an edge with no
+    /// `metadata` (every other kind) round-trips as `None`, not an empty object or an error.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn choice_constraint_edge_metadata_round_trips_through_create_and_list() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "choice-constraint-metadata").await;
+        make_structure(&state.neo4j, &project.id, "ChoiceA").await;
+        make_structure(&state.neo4j, &project.id, "ChoiceB").await;
+        make_structure(&state.neo4j, &project.id, "PlainSource").await;
+        make_structure(&state.neo4j, &project.id, "PlainTarget").await;
+
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "ChoiceA".to_string(),
+                    target: "ChoiceB".to_string(),
+                    kind: EdgeKind::ChoiceConstraint,
+                    metadata: Some(serde_json::json!({ "choiceConstraintType": "Linked" })),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "PlainSource".to_string(),
+                    target: "PlainTarget".to_string(),
+                    kind: EdgeKind::ChoiceConstraint,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::ChoiceConstraint)
+            .await
+            .unwrap();
+
+        let with_metadata = edges
+            .iter()
+            .find(|e| e.source == "ChoiceA")
+            .expect("ChoiceA -> ChoiceB should round-trip");
+        assert_eq!(
+            with_metadata.metadata,
+            Some(serde_json::json!({ "choiceConstraintType": "Linked" }))
+        );
+
+        let without_metadata = edges
+            .iter()
+            .find(|e| e.source == "PlainSource")
+            .expect("PlainSource -> PlainTarget should round-trip");
+        assert_eq!(without_metadata.metadata, None);
     }
 
     /// docs/IMPLEMENTATION_KICKOFF.md Phase 6 (T-PARAM-01) — `EdgeKind::Bound`'s real endpoint
@@ -6628,6 +6766,7 @@ mod tests {
                     source: "NotAParameter".to_string(),
                     target: "BoundTarget".to_string(),
                     kind: EdgeKind::Bound,
+                    metadata: None,
                 },
             )
             .await;
@@ -6643,6 +6782,7 @@ mod tests {
                     source: "RealParameter".to_string(),
                     target: "BoundTarget".to_string(),
                     kind: EdgeKind::Bound,
+                    metadata: None,
                 },
             )
             .await
@@ -6670,6 +6810,7 @@ mod tests {
                     source: "Root".to_string(),
                     target: "FirstChild".to_string(),
                     kind: EdgeKind::Refine,
+                    metadata: None,
                 },
             )
             .await
@@ -6715,6 +6856,7 @@ mod tests {
                     source: "Root".to_string(),
                     target: "SecondChild".to_string(),
                     kind: EdgeKind::Refine,
+                    metadata: None,
                 },
             )
             .await
@@ -6777,6 +6919,7 @@ mod tests {
                     source: "ReqLow".to_string(),
                     target: "ReqHigh".to_string(),
                     kind: EdgeKind::Derive,
+                    metadata: None,
                 },
             )
             .await
@@ -6789,6 +6932,7 @@ mod tests {
                     source: "ReqLowCopy".to_string(),
                     target: "ReqLow".to_string(),
                     kind: EdgeKind::Copy,
+                    metadata: None,
                 },
             )
             .await

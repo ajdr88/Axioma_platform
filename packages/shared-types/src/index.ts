@@ -66,6 +66,11 @@ export interface Edge {
   source: string;
   target: string;
   kind: EdgeKind;
+  /** A generic JSON tag for edge-kind-specific data too small to warrant a dedicated field per
+   * kind — mirrors `packages/sysml-core/src/lib.rs::Edge::metadata` exactly. Only `ChoiceConstraint`
+   * populates it today: `{ choiceConstraintType: "Linked" | "Permutation" | "Unordered" |
+   * "UnorderedNorepl" }`, mirroring `adsg_core.ChoiceConstraintType`. Absent for every other kind. */
+  metadata?: unknown;
 }
 
 /** Git-backed model versioning (roadmap: P1.1, T-P1.1-05) — mirrors `store::versioning::Branch`.

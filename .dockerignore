@@ -1,0 +1,18 @@
+# Scope-downs pass (apps/api/Dockerfile's first-ever build) — without this, `COPY . .` sends the
+# entire repo root as build context, including `target/` (a real, measured 37GB of host Rust
+# build artifacts) and `node_modules/` (637MB) — the actual cause of a build that spent 32+
+# minutes just transferring context before failing outright. Real, not theoretical.
+target/
+node_modules/
+.git/
+.next/
+**/node_modules/
+**/target/
+# A real, second bug found via a live build (not theoretical): apps/api/build.rs looks for a
+# local `protoc.exe`/`protoc` in this exact directory before falling back to a system `protoc`,
+# preferring it if present. That directory holds a WINDOWS-only `protoc.exe` fetched for local
+# host dev (gitignored, never meant to leave this machine) — copying it into a Linux build
+# context makes build.rs try to exec a Windows PE binary inside Linux, which fails with a bizarre
+# WSL interop error, not a clean "not found". Excluded so build.rs's own fallback (a real
+# `protobuf-compiler` apt package installed in the Docker build stage) is what actually runs.
+packages/fuml-runtime/tools/

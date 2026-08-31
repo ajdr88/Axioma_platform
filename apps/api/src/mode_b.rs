@@ -199,6 +199,7 @@ async fn apply_candidate_to_main(
                 source: subsystem_id.to_string(),
                 target: requirement_id.clone(),
                 kind: EdgeKind::Satisfy,
+                metadata: None,
             };
             state.neo4j.create_edge(project_id, &edge).await?;
             diff_entries.push(DiffEntry::EdgeCreated {

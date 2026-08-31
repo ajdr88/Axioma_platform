@@ -241,6 +241,8 @@ export default function Home() {
   >("Conceptual");
   /** FR-EXPORT-02 — the `NodeKind` scope for the toolbar's "Export Table" link. */
   const [exportTableKind, setExportTableKind] = useState<NodeKind>("Structure");
+  /** Scope-downs pass — CSV or XLSX for the same "Export Table" link. */
+  const [exportTableFormat, setExportTableFormat] = useState<"csv" | "xlsx">("csv");
   /** FR-CORE-10/11 — lifted here (not local to `TraceabilityPanel`) since that panel unmounts on
    * close; see `TraceabilityPanel`'s own prop doc comment for why. No LIST endpoint exists, so
    * this is still lost on a full page reload — a real, accepted gap. */
@@ -845,6 +847,8 @@ export default function Home() {
         setNewInfoAbstractionLevel={setNewInfoAbstractionLevel}
         exportTableKind={exportTableKind}
         setExportTableKind={setExportTableKind}
+        exportTableFormat={exportTableFormat}
+        setExportTableFormat={setExportTableFormat}
         savedCollections={savedCollections}
         handleSaveDynamicCollection={handleSaveDynamicCollection}
         handleFreezeCollection={handleFreezeCollection}
@@ -919,6 +923,8 @@ interface CanvasProps {
   >;
   exportTableKind: NodeKind;
   setExportTableKind: React.Dispatch<React.SetStateAction<NodeKind>>;
+  exportTableFormat: "csv" | "xlsx";
+  setExportTableFormat: React.Dispatch<React.SetStateAction<"csv" | "xlsx">>;
   savedCollections: { id: string; name: string }[];
   handleSaveDynamicCollection: (params: {
     name: string;
@@ -999,6 +1005,8 @@ function Canvas({
   setNewInfoAbstractionLevel,
   exportTableKind,
   setExportTableKind,
+  exportTableFormat,
+  setExportTableFormat,
   savedCollections,
   handleSaveDynamicCollection,
   handleFreezeCollection,
@@ -1174,6 +1182,16 @@ function Canvas({
       },
     }));
 
+  // Scope-downs pass — drag-and-drop reallocation bug found via live browser verification: without
+  // this, `swimlaneNodes` below recomputes every member's position from `computeSwimlaneLayout` on
+  // every render (including the renders `onNodesChange` fires on every drag mousemove), which
+  // always has an entry for every element (unallocated elements land in a catch-all lane) and so
+  // always overrides React Flow's own live drag position — the node visually snaps back to its grid
+  // slot mid-drag, and `onNodeDragStop` then reads that frozen, never-moved position, so a drop
+  // never intersects any lane but the one the node was already in. Tracking the actively-dragged
+  // node id and falling back to its real (drag-tracked) `node.position` while dragging fixes it.
+  const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
+
   // docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12) — replaces the normal ELK/clustering
   // layout entirely while active (see `showSwimlaneView`'s own doc comment for why the two
   // aren't combined this pass). Built from `visibleNodes` (already origin-filtered), not the
@@ -1191,15 +1209,21 @@ function Canvas({
     ? [
         ...swimlaneLayout.laneNodes,
         ...visibleNodes.map((node) => {
-          const position = swimlaneLayout.memberPositions.get(node.id);
+          // While this node is actively being dragged, skip the layout-computed position entirely
+          // (see `draggingNodeId`'s own comment above) so React Flow's live drag position — already
+          // tracked into `node.position` via `onNodesChange`/`setNodes` — is what actually renders.
+          const position =
+            node.id === draggingNodeId ? undefined : swimlaneLayout.memberPositions.get(node.id);
           return {
             ...node,
             parentId: position?.parentId,
             extent: position ? ("parent" as const) : undefined,
             position: position ? { x: position.x, y: position.y } : node.position,
-            // Position is layout-managed here, not free-form — dragging would fight the grid
-            // computed above every time `allocateEdges`/`elements` changes.
-            draggable: false,
+            // Scope-downs pass — real drag-and-drop-to-reallocate (`onNodeDragStop` below). A
+            // successful drop calls `handleAllocate`, whose `reloadModel()` re-render then snaps
+            // the node to `computeSwimlaneLayout`'s freshly-computed position anyway, so free
+            // dragging here doesn't fight the grid the way it would without that reallocate step.
+            draggable: true,
             data: {
               ...node.data,
               editable: false,
@@ -1252,13 +1276,36 @@ function Canvas({
           // to click to navigate back to it, breaking `SubsystemClusterNode`'s click-to-expand.
           // `computeClusteredNodes` is the real render-count lever for NFR-PERF-01 (shrinks the
           // array itself, not just what's painted from it) — sufficient on its own.
-          nodesDraggable={editMode}
+          // Swimlane View's own drag-to-allocate (below) needs to work independent of Edit
+          // Mode — the click-to-allocate dropdown in `ElementInspector` already does, and the
+          // two should behave consistently. `showSwimlaneView` being true already means `nodes`
+          // is `swimlaneNodes`, not the normal canvas's `displayNodes`, so this doesn't loosen
+          // dragging on the normal canvas at all.
+          nodesDraggable={editMode || showSwimlaneView}
           nodesConnectable={editMode}
           edgesReconnectable={editMode}
           connectionRadius={40} // more forgiving than the 20px default — see the plan's Context.
           deleteKeyCode={null} // Node delete is out of scope — disconnect uses the edge's own button.
+          onNodeDragStart={(_event, node) => setDraggingNodeId(node.id)}
           onNodeDragStop={(_event, node) => {
+            setDraggingNodeId(null);
             if (!projectId) {
+              return;
+            }
+            // Scope-downs pass — real drag-and-drop Swimlane reallocation (FR-CORE-12). Real
+            // React Flow instance methods, not guessed:`getIntersectingNodes` reports every node
+            // whose rect overlaps the dragged node's final rect; filtered to lane nodes so a drop
+            // anywhere over a lane (not just its header) reallocates. No intersecting lane (e.g.
+            // dropped in the gap between lanes) is a no-op, not a silent reallocation to
+            // Unallocated — the dropdown remains the precise way to explicitly unallocate.
+            if (showSwimlaneView) {
+              const intersectingLane = reactFlowInstance
+                .getIntersectingNodes(node)
+                .find((n) => n.type === "swimlaneLane");
+              if (intersectingLane) {
+                const laneId = intersectingLane.id.replace(/^swimlane-lane-/, "");
+                handleAllocate(node.id, laneId);
+              }
               return;
             }
             fetch(apiPath(projectId, `/elements/${node.id}/position`), {
@@ -1624,6 +1671,12 @@ function Canvas({
               >
                 {exportingPng ? "Exporting…" : "Export PNG"}
               </Button>
+              <a
+                href={projectId ? `/api/projects/${projectId}/export/full-diagram` : "#"}
+                className="inline-flex items-center rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-xs text-white/80 hover:bg-white/10"
+              >
+                Export Full Diagram (PNG)
+              </a>
               <select
                 value={exportTableKind}
                 onChange={(event) => setExportTableKind(event.target.value as NodeKind)}
@@ -1635,10 +1688,18 @@ function Canvas({
                   </option>
                 ))}
               </select>
+              <select
+                value={exportTableFormat}
+                onChange={(event) => setExportTableFormat(event.target.value as "csv" | "xlsx")}
+                className="rounded border border-white/10 bg-obsidian/60 px-1 py-1 text-xs text-white/80"
+              >
+                <option value="csv">CSV</option>
+                <option value="xlsx">XLSX</option>
+              </select>
               <a
                 href={
                   projectId
-                    ? `${apiPath(projectId, "/export/table")}?kind=${encodeURIComponent(exportTableKind)}`
+                    ? `${apiPath(projectId, "/export/table")}?kind=${encodeURIComponent(exportTableKind)}&format=${exportTableFormat}`
                     : "#"
                 }
                 className="inline-flex items-center rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-xs text-white/80 hover:bg-white/10"

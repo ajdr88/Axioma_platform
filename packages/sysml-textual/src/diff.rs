@@ -209,6 +209,7 @@ mod tests {
             source: parent.to_string(),
             target: child.to_string(),
             kind: EdgeKind::Contains,
+            metadata: None,
         }
     }
 

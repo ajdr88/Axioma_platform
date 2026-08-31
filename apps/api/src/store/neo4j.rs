@@ -275,8 +275,9 @@ impl Neo4jStore {
     pub async fn edges_of_kind(&self, project_id: &str, kind: EdgeKind) -> Result<Vec<Edge>> {
         let rel_type = kind.as_rel_type();
         let cypher = format!(
-            "MATCH (a:Element {{project_id: $project_id}})-[:{rel_type}]->\
-             (b:Element {{project_id: $project_id}}) RETURN a.id AS source, b.id AS target"
+            "MATCH (a:Element {{project_id: $project_id}})-[r:{rel_type}]->\
+             (b:Element {{project_id: $project_id}}) \
+             RETURN a.id AS source, b.id AS target, r.metadata AS metadata"
         );
         let mut result = self
             .conn
@@ -286,10 +287,17 @@ impl Neo4jStore {
 
         let mut edges = Vec::new();
         while let Some(row) = result.next().await.context("reading edge row")? {
+            // `r.metadata` is a Neo4j string property (see `create_edge`'s own comment for why
+            // this is JSON-serialized to a string rather than stored as a native property) — `None`
+            // for every edge kind besides `ChoiceConstraint` and for edges created before this
+            // field existed, never treated as an error.
+            let metadata_json: Option<String> = row.get("metadata").ok().flatten();
+            let metadata = metadata_json.and_then(|s| serde_json::from_str(&s).ok());
             edges.push(Edge {
                 source: row.get("source").context("missing source")?,
                 target: row.get("target").context("missing target")?,
                 kind,
+                metadata,
             });
         }
         Ok(edges)
@@ -341,16 +349,30 @@ impl Neo4jStore {
         }
 
         let rel_type = edge.kind.as_rel_type();
+        // Neo4j relationship properties can't hold arbitrary nested JSON (only primitives/
+        // arrays-of-primitives) — `metadata` is JSON-serialized to a single string property.
+        // `SET r.metadata = null` (the `None` case, via neo4rs's real `Option<T> -> BoltType`
+        // conversion, confirmed in its own source: `None` becomes `BoltType::Null`) removes the
+        // property entirely per Neo4j's own `SET`-to-null-removes semantics — matching
+        // `edges_of_kind`'s read side treating an absent property as `None`, not an empty string.
+        let metadata_json: Option<String> = edge
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serializing edge metadata")?;
         let cypher = format!(
             "MATCH (a:Element {{id: $source, project_id: $project_id}}), \
-             (b:Element {{id: $target, project_id: $project_id}}) MERGE (a)-[:{rel_type}]->(b)"
+             (b:Element {{id: $target, project_id: $project_id}}) \
+             MERGE (a)-[r:{rel_type}]->(b) SET r.metadata = $metadata"
         );
         self.conn
             .run(
                 query(&cypher)
                     .param("source", edge.source.clone())
                     .param("target", edge.target.clone())
-                    .param("project_id", project_id.to_string()),
+                    .param("project_id", project_id.to_string())
+                    .param("metadata", metadata_json),
             )
             .await
             .with_context(|| {
@@ -600,6 +622,7 @@ impl Neo4jStore {
                 source: parent.clone(),
                 target: child.clone(),
                 kind: EdgeKind::Contains,
+                metadata: None,
             });
         }
 
