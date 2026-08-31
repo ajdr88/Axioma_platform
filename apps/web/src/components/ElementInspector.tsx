@@ -1,5 +1,6 @@
 "use client";
 
+import { UNALLOCATED_LANE_ID } from "@axioma/diagram-engine";
 import { Button, Panel } from "@axioma/ui-components";
 import { useEffect, useState } from "react";
 
@@ -35,6 +36,15 @@ interface ElementInspectorProps {
    * delete, since removing a node isn't one of the local-state updates any existing handler
    * already knows how to do (every other mutation edits a node in place; this removes one). */
   reloadModel: () => Promise<void>;
+  /** docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12) — gates the lane-assignment dropdown
+   * below. A real, working allocation action (click-to-allocate), not the drag-to-allocate
+   * FR-CORE-12's own text describes — see `swimlane.ts`'s doc comment for the scope-down. */
+  swimlaneView?: boolean;
+  /** Every Structure this element could be allocated to (the panel's own element excluded). */
+  laneOptions?: { id: string; name: string }[];
+  /** The lane (Structure id) this element is currently allocated to, or `null` for unallocated. */
+  currentLaneId?: string | null;
+  onAllocate?: (laneId: string) => Promise<void>;
 }
 
 /**
@@ -51,12 +61,29 @@ export function ElementInspector({
   editMode,
   onClose,
   reloadModel,
+  swimlaneView,
+  laneOptions,
+  currentLaneId,
+  onAllocate,
 }: ElementInspectorProps) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [rationale, setRationale] = useState("");
   const [rows, setRows] = useState<PropertyRow[]>([]);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [allocating, setAllocating] = useState(false);
+
+  async function handleAllocateChange(laneId: string) {
+    if (!onAllocate) {
+      return;
+    }
+    setAllocating(true);
+    try {
+      await onAllocate(laneId);
+    } finally {
+      setAllocating(false);
+    }
+  }
   const [breach, setBreach] = useState<{ message: string; dependents: BreachDependent[] } | null>(
     null,
   );
@@ -275,6 +302,31 @@ export function ElementInspector({
           <Button onClick={handleSave} disabled={saving} className="w-full justify-center">
             {saving ? "Saving…" : "Save"}
           </Button>
+
+          {swimlaneView && (
+            <div className="border-t border-white/10 pt-3">
+              <label
+                htmlFor="element-lane"
+                className="mb-1 block text-[10px] uppercase tracking-widest text-white/40"
+              >
+                Swimlane
+              </label>
+              <select
+                id="element-lane"
+                value={currentLaneId ?? UNALLOCATED_LANE_ID}
+                disabled={allocating}
+                onChange={(event) => handleAllocateChange(event.target.value)}
+                className="w-full rounded border border-white/10 bg-obsidian/60 p-1.5 text-xs text-white/80 outline-none focus-visible:ring-1 focus-visible:ring-cobalt-glow"
+              >
+                <option value={UNALLOCATED_LANE_ID}>Unallocated</option>
+                {(laneOptions ?? []).map((lane) => (
+                  <option key={lane.id} value={lane.id}>
+                    {lane.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           {elementKind === "Requirement" && (
             <div className="border-t border-white/10 pt-3">

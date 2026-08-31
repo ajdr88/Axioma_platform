@@ -45,7 +45,9 @@ export type EdgeKind =
   | "Member"
   | "ArchDerives"
   | "IncompatibleWith"
-  | "ChoiceConstraint";
+  | "ChoiceConstraint"
+  // Phase 5 (FR-CORE-12) — mirrors packages/sysml-core/src/lib.rs's EdgeKind::Allocate exactly.
+  | "Allocate";
 
 /** FR-CORE-08 provenance origin — who/what created an element. */
 export type Origin = "Human" | "AiSuggested" | "AiAutoMerged";

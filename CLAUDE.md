@@ -27,10 +27,17 @@ none of the three mechanisms this group's own design assumed already existed act
 `POST /import/documents` uploads a PDF, real text extraction + deterministic segmentation + a real
 Ollama-drafted Requirement per candidate, landing as a `document-import`-origin proposal
 `mode_b.rs::accept_proposal` now genuinely materializes — see impl v5 §15; no OCR, no `llm-gateway`
-second-caller abstraction) are all built and verified. Still unbuilt within Phase 5: Interaction
-view + Swimlane mode (blocked on a real `Allocate` `EdgeKind` gap found during scoping, and
-ADR-009). Phase 6 (test-scenario authoring) is also still open. `docs/claude/*.md` holds the
-original amendment/analysis docs Phase 0 merged, kept for history.
+second-caller abstraction), and **Phase 5's Interaction view + Swimlane mode** (`/interactions/*`,
+a real Lifeline/Message diagram in `InteractionPanel.tsx`, ADR-009 ratified — messages/fragments
+as plain content on the existing `:Interaction`/`:InteractionFragment` elements, not a new
+`NodeKind`; Swimlane View as a manual-grid React Flow layout keyed on the newly-added `Allocate`
+`EdgeKind`, click-to-allocate rather than drag-to-allocate this pass — see impl v5 §16; live
+browser verification also found and fixed a missing `fitView` call, and separately found that
+`/parametrics/evaluate`, `/information/elements`, `/collections/*`, and `/export/*` all still lack
+a Next.js proxy route — real but not yet blocking, since none has a frontend caller yet, see impl
+v5 §16.4) are all built and verified. This closes out Phase 5 entirely. Phase 6 (test-scenario
+authoring) is still open. `docs/claude/*.md` holds the original amendment/analysis docs Phase 0
+merged, kept for history.
 
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2
@@ -101,7 +108,8 @@ global acyclicity.
 - **Node labels:** `:Element` (base), `:Structure`, `:Requirement`, `:Port`, `:Hazard`,
   `:Control`, `:Mission`, `:Stakeholder`, `:SimulationRun`; plus (v5, `docs/IMPLEMENTATION_KICKOFF.md`
   Phase 1) `:Constraint`/`:Parameter` (Parametrics), `:InformationElement` (Info/Data
-  Architecture), `:Interaction`/`:InteractionFragment` (pending ADR-009 on the SysML v2 mapping),
+  Architecture), `:Interaction`/`:InteractionFragment` (ADR-009 ratified — see impl v5 §16.1;
+  messages/fragments are plain content on these elements, not further node types),
   `:Collection` (Dynamic/Static element collections), `:CandidateStructureSuggestion`
   (proposal-scoped only, document-import), `:Function`/`:SelectionChoice`/`:ConnectionChoice`
   (Mode B architecture design-space, FR-ARCH).
@@ -109,15 +117,17 @@ global acyclicity.
   `validatedBy`, `Suspect`; plus (v5, Phase 1) `Bound`, `Derive`, `Copy`, `Member`, `ArchDerives`
   (cycles permitted — **renamed from the spec's own `derives`**, which collided with `Derive`
   above; see `packages/sysml-core/src/lib.rs::EdgeKind::ArchDerives`'s doc comment),
-  `IncompatibleWith`, `ChoiceConstraint`. Edges carry metadata (stereotype, multiplicity,
-  provenance).
+  `IncompatibleWith`, `ChoiceConstraint`; plus (v5, Phase 5) `Allocate` (Swimlane allocation,
+  FR-CORE-12 — kind-unconstrained on both ends, same discipline as `ArchDerives` above). Edges
+  carry metadata (stereotype, multiplicity, provenance).
 
 All of the above are real `NodeKind`/`EdgeKind` variants in `packages/sysml-core/src/lib.rs` today
 (with `sysml-textual`'s keyword mapping and `packages/shared-types` kept in sync) — not aspirational.
 Full detail, including which of the new edges got a real endpoint-legality rule vs. stayed
 deliberately kind-unconstrained, in `docs/Axioma_implementation_v5.md` §2.3. **Not yet done**:
-FR-CORE-12/13 (orphan-Action rejection) — blocked on an Action/Activity `NodeKind` decision no
-merged doc makes yet, flagged there rather than guessed.
+FR-CORE-13 (orphan-Action rejection) — blocked on an Action/Activity `NodeKind` decision no
+merged doc makes yet, flagged there rather than guessed. (FR-CORE-12, Swimlane allocation, is
+built — see impl v5 §16.3 — and was never blocked on that same decision.)
 
 ## Non-negotiable architectural rules
 1. **Convergence ≠ validity.** The CRDT layer only guarantees clients converge to the same
@@ -181,14 +191,16 @@ test-validated — corner badge), **Staleness** (current / `Suspect` — red pul
    `Derive`/`Copy` edges — pure data-model additions.*
 2. **P1.2 IDE Experience (Mo 3–4):** Monaco + LSP; canvas with viewport virtualization;
    Hazard/Risk panel; Mission timeline; provenance visual language scaffolding. *Also here (v5):
-   Dynamic/Static Collections (FR-CORE-10/11), Swimlane allocation + orphan-Action validation
-   (FR-CORE-12/13).*
+   Dynamic/Static Collections (FR-CORE-10/11), Swimlane allocation (FR-CORE-12, built — see
+   impl v5 §16.3) + orphan-Action validation (FR-CORE-13, still blocked on an Action/Activity
+   `NodeKind` decision no merged doc makes yet).*
 3. **P1.3 Digital Thread (Mo 5):** budgeted traceability + change-impact; standards-aligned
    safety reporting (ARP4761 / MIL-STD-882 / ISO 26262). *Also here (v5): diagram/table export
    (FR-EXPORT-01/02), the full documents→draft-model pipeline (FR-CORE-14…18).*
 4. **P1.4 Behavioral Simulation + Pilot (Mo 6):** `fuml-runtime` execution via gRPC;
    `alf-lite` for the pilot's behaviors; 1M-element load fixture in CI. *Also here (v5):
-   Interaction/timing modeling (FR-INTX, pending ADR-009), Parametrics evaluation (FR-PARAM).*
+   Interaction/timing modeling (FR-INTX, ADR-009 ratified — built, see impl v5 §16.1),
+   Parametrics evaluation (FR-PARAM).*
 
 **Mode A fast-follow** (after P1 stable): grounded copilot, part search, requirement linting.
 *Also here (v5): report generation + file attachments (FR-EXPORT-03/04) — no hard phase

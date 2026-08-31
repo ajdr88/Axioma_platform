@@ -134,7 +134,7 @@ A **directed property graph** — *not* a DAG **[REV-B §B2]**. Acyclicity is en
 * **Node labels — [REV-D, implemented `docs/IMPLEMENTATION_KICKOFF.md` Phase 1]:** `packages/sysml-core/src/lib.rs`'s `NodeKind` enum, `apps/api/src/store/neo4j.rs`'s `ALL_LABELS` (indexing), `packages/sysml-textual`'s keyword mapping (a real compiler-caught spot the Phase 1 plan itself didn't enumerate — found only by rebuilding the workspace after the enum changed, not predicted in advance), and `packages/shared-types/src/index.ts` all now carry these ten:
   - `:Constraint`, `:Parameter` — Parametrics (FR-PARAM, reqs §5.9). Body (equation text) in the document store; graph holds topology only (NFR-DATA-01).
   - `:InformationElement` — Information/Data Architecture (FR-INFO, reqs §5.10). Participates in existing containment/traceability rules unchanged.
-  - `:Interaction`, `:InteractionFragment` — Interaction/timing modeling (FR-INTX, reqs §5.11). Underlying SysML v2 mapping pending ADR-009.
+  - `:Interaction`, `:InteractionFragment` — Interaction/timing modeling (FR-INTX, reqs §5.11). Underlying SysML v2 mapping: ADR-009, ratified — see §16.1.
   - `:Collection` — Dynamic/Static Element Collections (FR-CORE-10/11, reqs §5.13).
   - `:CandidateStructureSuggestion` — Document-import pipeline (FR-CORE-17, reqs §5.14). **Proposal-scoped only** — never promoted automatically to `:Structure`; discarded once a human converts a suggestion into a real Block.
   - `:Function`, `:SelectionChoice`, `:ConnectionChoice` — Mode B architecture design-space (FR-ARCH, reqs §5.17). `:Function` is distinct from an executable fUML Action (FR-CORE-04). Choice nodes carry a resolution-state property (unresolved/partial/resolved).
@@ -182,7 +182,7 @@ This log is the **single source of truth for technology choices**; any conflicti
 | **ADR-006** | Graph is a directed property graph, not a DAG; acyclicity scoped to containment only. | Accepted |
 | **ADR-007** | External-solver validation with typed result states + plausibility gate; no blind trust. | Accepted |
 | **ADR-008** | **gRPC** is the standard transport for external-tool/process boundaries — the Java fUML sidecar (§9.5), the `cem-connectors` solver adapters, and **[REV-D]** the proposed `cem-archspace` sidecar (ADR-011) all use it; no mixing with bespoke REST. | Accepted |
-| **ADR-009** **[REV-D]** | SysML v2 metaclass mapping for Interaction/timing modeling (FR-INTX group, reqs §5.11). Recommendation: treat the Lifeline/Message *view* as a `diagram-engine` concern, decoupled from the underlying SysML v2 storage representation (option 2 of two evaluated). | Proposed |
+| **ADR-009** **[REV-D]** | SysML v2 metaclass mapping for Interaction/timing modeling (FR-INTX group, reqs §5.11). Option 2 (Lifeline/Message *view* as a pure `diagram-engine` concern, decoupled from storage) ratified: messages/fragments are plain content on the existing `:Interaction`/`:InteractionFragment` elements; the Lifeline diagram is a new, storage-agnostic `InteractionPanel` renderer. | **Ratified — built, see §16.1** |
 | **ADR-010** **[REV-D]** | Report-template mechanism for FR-EXPORT-03 (reqs §5.12) — generalize FR-SAFE-05's existing safety-register template pipeline rather than building a second one, mirroring the FR-PM-05/FR-CORE-16 "one mechanism, multiple origins" precedent. | Proposed |
 | **ADR-011** **[REV-D]** | Mode B design-space representation (FR-ARCH group, reqs §5.17): **ADOPT `adsg-core` + `SBArchOpt`** (both MIT-licensed) behind a Python gRPC sidecar (`cem-archspace`, §2.1) as the encoder/optimizer foundation, mirroring the `fuml-runtime` sidecar pattern — rather than a ground-up Rust reimplementation. Spike (§10) confirmed both libraries compose end-to-end over the real gRPC boundary: all four design-space primitives (selection choice, connection choice, incompatibility constraint, `LINKED` choice constraint) round-trip correctly, a real Imputation Ratio (1.333 on the spike's test problem) comes back, and SBArchOpt's NSGA-II genuinely drives an adsg-core-built evaluation loop to a real optimized result. | **Ratified — spike complete, see §10** |
 | **ADR-012** **[REV-D]** | Confirm `llm-gateway` as a Product-1-tier shared dependency (not CEM-exclusive, §2.1), and confirm local-Ollama-by-default satisfies a CEM-absent, Product-1-only deployment's need for the documents→draft-model pipeline (reqs §5.14). | Proposed |
@@ -300,7 +300,7 @@ Every write — human CRUD, CRDT-converged change, or AI proposal — passes the
 * Monaco + LSP; ELK auto-layout; canvas virtualization (only viewport + margin live, off-screen subsystems clustered).
 * Hazard/Risk matrix panel (Severity × Likelihood, filterable); Mission timeline (Concept→Disposal).
 * Custom nodes for Blocks/Ports/Requirements/Hazards/Missions; provenance chrome per §6.3.
-* **[REV-D]** New canvas capabilities per §4.1's P1.2 annotation: Dynamic/Static Collections pinned into the Browser/navigation tree (FR-CORE-10/11); Swimlane/Partition allocation mode for Activity-equivalent diagrams (FR-CORE-12), a new React Flow layout mode (vertical/horizontal partitions, drag-to-allocate headers) — no backend data-model change beyond the existing `Allocate` dependency stereotype.
+* **[REV-D]** New canvas capabilities per §4.1's P1.2 annotation: Dynamic/Static Collections pinned into the Browser/navigation tree (FR-CORE-10/11); Swimlane/Partition allocation mode for Activity-equivalent diagrams (FR-CORE-12), a new React Flow layout mode (vertical/horizontal partitions) — no backend data-model change beyond the existing `Allocate` dependency stereotype. **Built, see impl v5 §16.3** — allocation ships as a click-to-allocate dropdown this pass, not the "drag-to-allocate headers" named here; native drag-and-drop is a separate, larger effort, not yet attempted.
 * **Testing:** round-trip text↔diagram consistency (single transaction); auto-layout < 500 ms at 500 blocks; 60 FPS at 10k *visible* elements *with* virtualization active.
 
 ### 4.4 Digital Thread & Import (P1.3)
@@ -314,7 +314,7 @@ Every write — human CRUD, CRDT-converged change, or AI proposal — passes the
 
 * Discrete-event State Machine / Activity simulation. **Engine per ADR-005:** fUML execution is *adopted* (`fuml-runtime`, Java RI as a gRPC sidecar); Alf *authoring* is *built in-house* as `alf-lite` — a minimal, clean-room Alf-subset compiler targeting the same fUML (§9.6), scoped to the pilot's constructs and grown only on demand **[REV-B §D3]**.
 * Interactive player, debugger, dashboards (time-series store).
-* **[REV-D]** Interaction/timing modeling (FR-INTX, pending ADR-009) and Parametrics evaluation (FR-PARAM, reqs §5.9) — the latter is a **pure synchronous computation**, must never dispatch to `cem-core`/`cem-connectors`/`scheduler` (verified via trace: zero spans from those services on a Parametric evaluation call).
+* **[REV-D]** Interaction/timing modeling (FR-INTX, ADR-009 ratified — built, see impl v5 §16.1) and Parametrics evaluation (FR-PARAM, reqs §5.9) — the latter is a **pure synchronous computation**, must never dispatch to `cem-core`/`cem-connectors`/`scheduler` (verified via trace: zero spans from those services on a Parametric evaluation call).
 * **Testing:** deterministic replay (100 identical runs identical); 1M-element load fixture green in CI.
 
 ### 4.6 Mode C + Connector Framework (P2.3)
@@ -924,9 +924,10 @@ verification happened to surface again.
 `/parametrics/constraints`/`/parametrics/bindings`/`/information/data-types` (already covered by the
 generic endpoints, §13.1). The document-import async job pipeline (§1.1a — needs an LLM-structuring
 capability that doesn't exist). `/export/*` **was subsequently built — see §14**.
-`/interactions/*` and its `diagram-engine` counterpart remain unbuilt (ADR-009 unresolved).
-Swimlane mode (FR-CORE-12) — its own spec text assumes an `Allocate` `EdgeKind` that Phase 1 never
-actually created, a real gap flagged here rather than silently invented around. The choice-
+`/interactions/*` and its `diagram-engine` counterpart, and Swimlane mode (FR-CORE-12) — the
+latter's own spec text assumes an `Allocate` `EdgeKind` that Phase 1 never actually created, a real
+gap flagged here rather than silently invented around — **were subsequently built, ADR-009
+ratified — see §16**. The choice-
 resolution click-to-resolve interaction and design-space stats sidebar from the turbofan amendment
 §3.5 — both depend on the still-unbuilt Mode B design-space HTTP surface (§1.2a).
 
@@ -1096,3 +1097,118 @@ OCR (§15.1); `llm-gateway` (Mode A's own precedent stands — no second-caller 
 parallelizing the per-candidate LLM calls (sequential is fine for a background job); a real
 NLP-based structural-noun extractor; any rename of `create_proposal`'s columns (repurposed, not
 renamed, to avoid touching every Mode-B call site).
+
+---
+
+## 16. Phase 5 continued: Interaction View + Swimlane Mode (FR-INTX-01..04, FR-CORE-12) —
+## ADR-009 Ratified **[REV-D]**
+
+The last of Phase 5's three deferred verticals. Two known blockers going in: **ADR-009** (the
+SysML v2 metaclass mapping for Interactions) was still "Proposed," and FR-CORE-12's own design
+text assumed an `Allocate` `EdgeKind` that §2.3's real enum never actually had.
+
+### 16.1 ADR-009 ratified — option 2, as its own text recommended
+
+`:Interaction`/`:InteractionFragment` (Phase 1 placeholders) stay exactly what they were —
+`packages/sysml-core/src/lib.rs::EdgeKind`/`NodeKind` gained **nothing** for this vertical beyond
+the unrelated `Allocate` fix below. Messages live as a plain JSON array
+(`{order, from, to, text, kind, fragmentId?, refInteractionId?, timingConstraint?}`) on the
+`:Interaction` element's own body; a fragment is a real `:InteractionFragment` element,
+`Contains`-edged from its parent, with `{fragmentKind, guard?}` as its body. The Lifeline/Message
+diagram (`apps/web/src/components/InteractionPanel.tsx`) is pure rendering over that content — a
+hand-rolled SVG, not a new `diagram-engine` node/edge type — decoupled from storage exactly as
+ADR-009's recommendation said it should be. FR-INTX-02 (timing) and FR-INTX-04
+(`refInteractionId` sub-interaction reuse) are both just message fields, captured and displayed;
+no latency-analysis engine or ref-resolution UI was built — neither has spec text asking for one.
+**ADR-009 status: Ratified** (flipped in reqs v5 §7 and impl v5 §2.5's own ADR table, both below).
+
+Three endpoints, matching impl v5 §1.4's own sketch exactly: `POST .../interactions`
+(`interactions.rs::create_interaction`, validates every `participantIds` entry exists first),
+`POST .../interactions/:id/messages` (read-merge append, server-assigned `order`), `POST
+.../interactions/:id/fragments` (creates the element + `Contains` edge). No dedicated UI exists
+to *create* an Interaction with participants (`page.tsx`'s "+ Add Node" is hardcoded to
+`Structure` — unchanged this pass); one is expected to be seeded or created directly against the
+endpoint, then opened by clicking it on the canvas like any other element.
+
+### 16.2 `EdgeKind::Allocate` — a straightforward gap-closure, not a design call
+
+Unlike ADR-009, FR-CORE-12's own text already treats this as decided ("no backend data-model
+change beyond the *existing* `Allocate` dependency stereotype") — it just wasn't actually there.
+Added kind-unconstrained on both ends (Block/Actor/Interface are all plain `:Structure` today, no
+separate kind exists to constrain against — same discipline already applied to
+`ArchDerives`/`IncompatibleWith`/`ChoiceConstraint`). Reuses the existing generic `POST/GET/DELETE
+/edges` endpoints — no dedicated endpoint needed.
+
+### 16.3 Swimlane mode — a real library primitive, previously unused
+
+`@xyflow/react` 12.11 (already pinned) ships `parentId`/`extent: "parent"` node properties for
+nested/contained children — confirmed real and shipped, and unused anywhere in this codebase
+before this pass. `packages/diagram-engine/src/swimlane.ts::computeSwimlaneLayout` groups every
+element by its outgoing `Allocate` edge target into a lane (a real `Unallocated` catch-all lane
+for anything with none — never silently hidden, since FR-CORE-12's own text never says allocation
+is mandatory); each lane is a `SwimlaneLaneNode` (a real React Flow parent node), each member gets
+`parentId`/`extent: "parent"` plus a computed relative position. **A manual grid, not ELK** — ELK's
+flat `layered` algorithm (`layout.ts`) has no partition-aware mode wired in, and building one is a
+bigger lift than FR-CORE-12's own "vertical/horizontal partitions" ask needs. `page.tsx`'s
+Swimlane View toggle swaps this layout in wholesale in place of the normal ELK/clustering path
+(mutually exclusive, not layered — Contains edges aren't drawn in this view; they'd cross lane
+boundaries in a way that fights the partitioning that's the point of the view) and calls
+`reactFlowInstance.fitView()` on entry.
+
+**Allocation is click-to-allocate, not drag-to-allocate — a real, flagged scope-down.**
+FR-CORE-12's own text says "drag-to-allocate headers." This pass ships a dropdown in
+`ElementInspector.tsx` (visible only in Swimlane View) instead: a real, working allocation action
+— removes any prior `Allocate` edge from the element first, then creates the new one (so an
+element is allocated to at most one lane, matching "each partition allocated to exactly one
+structural element") — just not the literal drag gesture. Native drag-and-drop-into-a-React-Flow-
+group is a separate, larger interaction-design effort, not attempted here.
+
+### 16.4 A real, unrelated gap found during live browser verification: the Next.js proxy layer
+
+`apps/web` has **no rewrites/catch-all config** (`next.config.mjs` only sets
+`transpilePackages`) — every backend route needs its own explicit
+`apps/web/src/app/api/.../route.ts` calling the shared `proxyRequest` helper
+(`apps/web/src/lib/api-proxy.ts`), one file per path, matching e.g. `edges/route.ts`. Live curl
+verification of `InteractionPanel` against the running dev server (not just the Rust API directly)
+found **none of the three `/interactions/*` endpoints had one** — a real 404 from the browser's
+own point of view despite the backend being fully correct and its own integration tests all
+passing. Added the three missing route files this pass (§16.1's endpoints).
+
+**This is not unique to Interactions.** The same check found `/parametrics/evaluate`,
+`/information/elements`, `/collections/dynamic`, `/collections/:id/freeze` (Phase 5's Foundation
+slice, §13), and `/export/table`, `/export/report`, `/elements/:id/attachments`,
+`/attachments/:id` (§14) are **also** missing a Next.js proxy route — real, confirmed via the same
+`find apps/web/src/app/api` sweep. None of those five have a frontend caller today (grepped for
+`fetch(` against every one of those paths in `apps/web/src`; zero hits), which is why their own
+passes' "live verification" never caught it — each curled the Rust API on port 8080 directly, not
+through the Next.js dev server. **Not fixed this pass** — there's no UI to unblock yet, and adding
+unused proxy plumbing isn't this vertical's job. Flagged here so the first PR that builds a UI for
+any of those five knows to add its `route.ts` alongside it, not discover the same 404 fresh.
+
+### 16.5 Explicitly not attempted this pass
+
+FR-CORE-13 (orphan-Action rejection) — still blocked on the separate, undecided Action/Activity
+`NodeKind` question Phase 1 already flagged, untouched by Swimlane's own "partition by `Allocate`
+target" mechanism. Native drag-and-drop lane reassignment (§16.3). A latency/timing-analysis engine
+consuming FR-INTX-02's captured constraints. ELK-aware partition layout (§16.3). A "create
+Interaction with participants" UI flow (§16.1). Proxy routes for the five unrelated already-built,
+never-yet-UI'd endpoints named in §16.4.
+
+### 16.6 Verification
+
+- `cargo build/clippy/fmt --workspace`; full `apps/api` `--ignored` suite against the live Docker
+  stack: 57/57 passing, including two new tests (`interaction_pipeline_stores_messages_and_
+  fragments_correctly`, `allocate_edge_round_trips_through_the_generic_edge_endpoint`).
+- `pnpm --filter @axioma/web exec tsc --noEmit` / `pnpm --filter @axioma/diagram-engine exec tsc
+  --noEmit` / Biome, all clean.
+- Live verification against the real running dev server (not just `cargo test`) via a headless
+  Chromium driver (`playwright`, fetched on demand — not a new repo dependency): created a real
+  Interaction with participants, two messages (one `sync`, one `reply`), and an `opt` fragment
+  through the actual browser-facing proxy path; opened it on canvas and confirmed the lifeline SVG
+  renders both messages and the participant boxes correctly. Toggled Swimlane View with three
+  seeded `Allocate` edges across an otherwise-unallocated 50-element project; confirmed three real
+  lanes render (two real + `Unallocated`), `fitView` brings them on screen, and reallocating an
+  element via `ElementInspector`'s dropdown round-trips (delete old edge → create new → reload)
+  and is reflected back in the dropdown's own next render. This pass caught and fixed one real bug
+  this way (Swimlane View not calling `fitView` on entry, leaving the lane grid off-screen behind
+  the toolbar panel) beyond what `cargo test`/`tsc` alone could have caught.

@@ -5,10 +5,12 @@ import {
   type AxiomaEdgeData,
   computeClusteredNodes,
   computeElkLayout,
+  computeSwimlaneLayout,
   edgeTypes,
   NODE_HEIGHT,
   NODE_WIDTH,
   nodeTypes,
+  UNALLOCATED_LANE_ID,
 } from "@axioma/diagram-engine";
 import type {
   Edge as ApiEdge,
@@ -41,6 +43,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AutonomyPanel } from "@/components/AutonomyPanel";
 import { ElementInspector } from "@/components/ElementInspector";
 import { HazardRiskPanel } from "@/components/HazardRiskPanel";
+import { InteractionPanel } from "@/components/InteractionPanel";
 import { MissionPlanningPanel } from "@/components/MissionPlanningPanel";
 import { PartSearchPanel } from "@/components/PartSearchPanel";
 import { StageTrackingPanel } from "@/components/StageTrackingPanel";
@@ -188,6 +191,10 @@ export default function Home() {
   const [showPartSearchPanel, setShowPartSearchPanel] = useState(false);
   const [showAutonomyPanel, setShowAutonomyPanel] = useState(false);
   const [showTraceabilityPanel, setShowTraceabilityPanel] = useState(false);
+  /** docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12) — replaces the normal ELK/clustering
+   * layout with a lane-partitioned one while active; mutually exclusive with clustering (not
+   * combined this pass — see `swimlane.ts`'s own doc comment). */
+  const [showSwimlaneView, setShowSwimlaneView] = useState(false);
   /** FR-CORE-08 / T-P1.2-06's "AI-suggested only" filter — "all" shows every origin. */
   const [originFilter, setOriginFilter] = useState<Origin | "all">("all");
 
@@ -208,6 +215,13 @@ export default function Home() {
   /** source=Stakeholder, target=Mission or Requirement (FR-MSN-02) — read by the Mission
    * Planning panel. */
   const [concernsEdges, setConcernsEdges] = useState<ApiEdge[]>([]);
+  /** docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12) — every element's swimlane assignment;
+   * an element with none lands in the `UNALLOCATED_LANE_ID` catch-all lane. */
+  const [allocateEdges, setAllocateEdges] = useState<ApiEdge[]>([]);
+  /** The raw element list `toFlowNode` builds `nodes` from — kept around (not just discarded
+   * after building nodes) for name/kind lookups the Interaction panel and Swimlane lane-option
+   * dropdown both need, without a second fetch. */
+  const [elements, setElements] = useState<ApiElement[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -267,6 +281,7 @@ export default function Home() {
         archDerivesRes,
         incompatibleWithRes,
         choiceConstraintRes,
+        allocateRes,
       ] = await Promise.all([
         fetch(apiPath(currentProjectId, "/elements")),
         fetch(apiPath(currentProjectId, "/contains")),
@@ -277,6 +292,7 @@ export default function Home() {
         fetch(apiPath(currentProjectId, "/edges?kind=ArchDerives")),
         fetch(apiPath(currentProjectId, "/edges?kind=IncompatibleWith")),
         fetch(apiPath(currentProjectId, "/edges?kind=ChoiceConstraint")),
+        fetch(apiPath(currentProjectId, "/edges?kind=Allocate")),
       ]);
       for (const res of [
         elementsRes,
@@ -288,6 +304,7 @@ export default function Home() {
         archDerivesRes,
         incompatibleWithRes,
         choiceConstraintRes,
+        allocateRes,
       ]) {
         if (!res.ok) {
           throw new Error(await readErrorMessage(res));
@@ -302,6 +319,7 @@ export default function Home() {
       const archDerives: ApiEdge[] = await archDerivesRes.json();
       const incompatibleWith: ApiEdge[] = await incompatibleWithRes.json();
       const choiceConstraint: ApiEdge[] = await choiceConstraintRes.json();
+      const allocate: ApiEdge[] = await allocateRes.json();
       if (reloadTokenRef.current !== token) {
         return;
       }
@@ -340,6 +358,8 @@ export default function Home() {
       setCausesEdges(causes);
       setMitigatedByEdges(mitigatedBy);
       setConcernsEdges(concerns);
+      setAllocateEdges(allocate);
+      setElements(elements);
       setStatus("ready");
     } catch (error) {
       if (reloadTokenRef.current === token) {
@@ -526,6 +546,42 @@ export default function Home() {
     setEdges((eds) => eds.filter((e) => !(e.source === source && e.target === target)));
   }
 
+  /** docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12) — the click-to-allocate dropdown's real
+   * action (a deliberate scope-down from "drag-to-allocate headers," flagged in the plan/docs, not
+   * silently substituted). Removes any prior `Allocate` edge from this element first — "each
+   * partition allocated to exactly one structural element" (§5.11's own text) — then creates the
+   * new one via the existing generic edge endpoints (no dedicated Allocate endpoint needed).
+   */
+  async function handleAllocate(elementId: string, laneId: string) {
+    if (!projectId) {
+      return;
+    }
+    const priorEdge = allocateEdges.find((e) => e.source === elementId);
+    if (priorEdge) {
+      await fetch(apiPath(projectId, "/edges"), {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: priorEdge.source,
+          target: priorEdge.target,
+          kind: "Allocate",
+        }),
+      });
+    }
+    if (laneId !== UNALLOCATED_LANE_ID) {
+      const res = await fetch(apiPath(projectId, "/edges"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: elementId, target: laneId, kind: "Allocate" }),
+      });
+      if (!res.ok) {
+        showNotice(await readErrorMessage(res));
+        return;
+      }
+    }
+    await reloadModel();
+  }
+
   async function handleToggleActive(node: FlowNode<AxiomaBlockData>) {
     if (!projectId) {
       return;
@@ -662,6 +718,11 @@ export default function Home() {
         setShowAutonomyPanel={setShowAutonomyPanel}
         showTraceabilityPanel={showTraceabilityPanel}
         setShowTraceabilityPanel={setShowTraceabilityPanel}
+        showSwimlaneView={showSwimlaneView}
+        setShowSwimlaneView={setShowSwimlaneView}
+        elements={elements}
+        allocateEdges={allocateEdges}
+        handleAllocate={handleAllocate}
         originFilter={originFilter}
         setOriginFilter={setOriginFilter}
         nodes={nodes}
@@ -718,6 +779,11 @@ interface CanvasProps {
   setShowAutonomyPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showTraceabilityPanel: boolean;
   setShowTraceabilityPanel: React.Dispatch<React.SetStateAction<boolean>>;
+  showSwimlaneView: boolean;
+  setShowSwimlaneView: React.Dispatch<React.SetStateAction<boolean>>;
+  elements: ApiElement[];
+  allocateEdges: ApiEdge[];
+  handleAllocate: (elementId: string, laneId: string) => Promise<void>;
   originFilter: Origin | "all";
   setOriginFilter: (filter: Origin | "all") => void;
   nodes: FlowNode<AxiomaBlockData>[];
@@ -776,6 +842,11 @@ function Canvas({
   setShowAutonomyPanel,
   showTraceabilityPanel,
   setShowTraceabilityPanel,
+  showSwimlaneView,
+  setShowSwimlaneView,
+  elements,
+  allocateEdges,
+  handleAllocate,
   originFilter,
   setOriginFilter,
   nodes,
@@ -847,6 +918,19 @@ function Canvas({
     },
     [reactFlowInstance],
   );
+
+  // Entering Swimlane View leaves whatever pan/zoom the normal ELK/clustering canvas was at,
+  // which usually shows nothing useful of the lane grid (a real gap found via live browser
+  // verification during this work — lanes rendered fully off-screen behind the toolbar panel
+  // with no fit-to-view). `setTimeout` gives the lane/member nodes one render pass to actually
+  // mount (and be measured) before `fitView` computes their bounding box.
+  useEffect(() => {
+    if (!showSwimlaneView) {
+      return;
+    }
+    const id = setTimeout(() => reactFlowInstance.fitView({ padding: 0.2, duration: 300 }), 50);
+    return () => clearTimeout(id);
+  }, [showSwimlaneView, reactFlowInstance]);
 
   const hazardCauseIds = new Set(causesEdges.map((e) => e.source));
   const realNodeIds = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes]);
@@ -935,6 +1019,42 @@ function Canvas({
       },
     }));
 
+  // docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12) — replaces the normal ELK/clustering
+  // layout entirely while active (see `showSwimlaneView`'s own doc comment for why the two
+  // aren't combined this pass). Built from `visibleNodes` (already origin-filtered), not the
+  // viewport-clustered set — lane position is computed structurally, so viewport-based
+  // clustering doesn't apply here.
+  const swimlaneLayout = useMemo(
+    () =>
+      computeSwimlaneLayout(
+        elements.map((e) => ({ id: e.id, name: e.name })),
+        allocateEdges,
+      ),
+    [elements, allocateEdges],
+  );
+  const swimlaneNodes = showSwimlaneView
+    ? [
+        ...swimlaneLayout.laneNodes,
+        ...visibleNodes.map((node) => {
+          const position = swimlaneLayout.memberPositions.get(node.id);
+          return {
+            ...node,
+            parentId: position?.parentId,
+            extent: position ? ("parent" as const) : undefined,
+            position: position ? { x: position.x, y: position.y } : node.position,
+            // Position is layout-managed here, not free-form — dragging would fight the grid
+            // computed above every time `allocateEdges`/`elements` changes.
+            draggable: false,
+            data: {
+              ...node.data,
+              editable: false,
+              hasHazard: hazardCauseIds.has(node.id),
+            },
+          };
+        }),
+      ]
+    : [];
+
   return (
     <div className="flex h-screen w-screen">
       <div className="h-full min-w-0 flex-1" ref={canvasWrapperRef}>
@@ -943,8 +1063,13 @@ function Canvas({
           // (each correctly rendered per `nodeTypes`' `type` discriminant) — React Flow's own
           // generics assume one node-data type per instance, so the two are reconciled here
           // rather than trying to force a single generic across genuinely different node shapes.
-          nodes={displayNodes as FlowNode<AxiomaBlockData>[]}
-          edges={displayEdges}
+          // Swimlane View swaps in `swimlaneNodes` (a union of SwimlaneLaneData/AxiomaBlockData)
+          // wholesale instead — see its own comment above for why it replaces rather than layers
+          // onto the ELK/clustering path. Edges are deliberately empty in Swimlane View: structural
+          // Contains edges drawn across lane boundaries would clash with the lane partitioning that
+          // is the whole point of this view, and no other edge kind is swimlane-relevant yet.
+          nodes={(showSwimlaneView ? swimlaneNodes : displayNodes) as FlowNode<AxiomaBlockData>[]}
+          edges={showSwimlaneView ? [] : displayEdges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
           // Synthetic `subsystemCluster` nodes aren't in `nodes` state — React Flow still measures
@@ -1268,6 +1393,17 @@ function Canvas({
                 Traceability
               </Button>
               <Button
+                variant={showSwimlaneView ? "primary" : "ghost"}
+                onClick={() => {
+                  setShowSwimlaneView((v) => !v);
+                  setShowTraceabilityPanel(false);
+                  setShowPartSearchPanel(false);
+                }}
+                className="!px-2 !py-1 text-xs"
+              >
+                Swimlane View
+              </Button>
+              <Button
                 variant={showTextPanel ? "primary" : "ghost"}
                 onClick={() => setShowTextPanel((v) => !v)}
                 className="!px-2 !py-1 text-xs"
@@ -1285,17 +1421,36 @@ function Canvas({
             </div>
           </GlassPanel>
 
-          {selectedNode && projectId && !showTraceabilityPanel && !showPartSearchPanel && (
-            <ElementInspector
-              elementId={selectedNode.id}
-              elementLabel={selectedNode.data.label}
-              elementKind={selectedNode.data.kind}
-              projectId={projectId}
-              editMode={editMode}
-              onClose={() => setSelectedNodeId(null)}
-              reloadModel={reloadModel}
-            />
-          )}
+          {selectedNode &&
+            projectId &&
+            !showTraceabilityPanel &&
+            !showPartSearchPanel &&
+            (selectedNode.data.kind === "Interaction" ? (
+              <InteractionPanel
+                interactionId={selectedNode.id}
+                projectId={projectId}
+                elements={elements}
+                onClose={() => setSelectedNodeId(null)}
+              />
+            ) : (
+              <ElementInspector
+                elementId={selectedNode.id}
+                elementLabel={selectedNode.data.label}
+                elementKind={selectedNode.data.kind}
+                projectId={projectId}
+                editMode={editMode}
+                onClose={() => setSelectedNodeId(null)}
+                reloadModel={reloadModel}
+                swimlaneView={showSwimlaneView}
+                laneOptions={elements
+                  .filter((e) => e.kind === "Structure" && e.id !== selectedNode.id)
+                  .map((e) => ({ id: e.id, name: e.name }))}
+                currentLaneId={
+                  allocateEdges.find((edge) => edge.source === selectedNode.id)?.target ?? null
+                }
+                onAllocate={(laneId) => handleAllocate(selectedNode.id, laneId)}
+              />
+            ))}
 
           {showTraceabilityPanel && projectId && (
             <TraceabilityPanel

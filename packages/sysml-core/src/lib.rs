@@ -192,6 +192,16 @@ pub enum EdgeKind {
     /// architecture choices (FR-ARCH-04, reqs v5 §5.17; mirrors `adsg_core.ChoiceConstraintType`,
     /// confirmed during the Phase 2 spike). Kind-unconstrained, same reasoning as `ArchDerives`.
     ChoiceConstraint,
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12, reqs v5 §5.11) — the swimlane-partition
+    /// allocation reqs v5 §5.11 itself calls "the existing `Allocate` dependency stereotype
+    /// already implied by FR-CORE-03's dependency taxonomy," but which Phase 1 never actually
+    /// added to this enum — a real gap, closed here, not a new design call (unlike ADR-009, which
+    /// this same phase separately ratifies). Kind-unconstrained on both ends: "Block/Actor/
+    /// Interface" (§5.11's own target list) are all modeled as plain `:Structure` today — no
+    /// separate Actor/Interface `NodeKind` exists either, so pinning a stricter rule now would be
+    /// guessing ahead of the spec, same discipline already applied to `ArchDerives`/
+    /// `IncompatibleWith`/`ChoiceConstraint`.
+    Allocate,
 }
 
 impl EdgeKind {
@@ -220,6 +230,7 @@ impl EdgeKind {
             EdgeKind::ArchDerives => "ARCH_DERIVES",
             EdgeKind::IncompatibleWith => "INCOMPATIBLE_WITH",
             EdgeKind::ChoiceConstraint => "CHOICE_CONSTRAINT",
+            EdgeKind::Allocate => "ALLOCATE",
         }
     }
 
@@ -243,6 +254,7 @@ impl EdgeKind {
             "ARCH_DERIVES" => Some(EdgeKind::ArchDerives),
             "INCOMPATIBLE_WITH" => Some(EdgeKind::IncompatibleWith),
             "CHOICE_CONSTRAINT" => Some(EdgeKind::ChoiceConstraint),
+            "ALLOCATE" => Some(EdgeKind::Allocate),
             _ => None,
         }
     }
@@ -483,6 +495,7 @@ pub fn check_relationship_endpoints(
         // `ChoiceConstraint` are deliberately left in the `_ => true` catch-all below: the FR-ARCH
         // spec (reqs v5 §5.17) keeps them kind-unconstrained on purpose (any DSG-participating
         // node can be either endpoint), so adding a constraint here would be guessing ahead of it.
+        // `Allocate` (Phase 5, FR-CORE-12) joins the same catch-all — see its own doc comment.
         EdgeKind::Bound => source_kind == NodeKind::Parameter,
         EdgeKind::Derive => {
             source_kind == NodeKind::Requirement && target_kind == NodeKind::Requirement
@@ -957,6 +970,7 @@ mod tests {
             EdgeKind::ArchDerives,
             EdgeKind::IncompatibleWith,
             EdgeKind::ChoiceConstraint,
+            EdgeKind::Allocate,
         ] {
             assert_eq!(EdgeKind::from_rel_type(kind.as_rel_type()), Some(kind));
         }
@@ -1072,6 +1086,20 @@ mod tests {
             )
             .is_ok());
         }
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12): `Allocate` is kind-unconstrained on
+    /// both ends — no separate Actor/Interface `NodeKind` exists to pin a stricter rule against.
+    #[test]
+    fn accepts_allocate_between_any_kinds() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Allocate,
+            "SomeElement",
+            NodeKind::Requirement,
+            "ControlFadecEec",
+            NodeKind::Structure,
+        )
+        .is_ok());
     }
 
     /// FR-COMP-03 (Phase 3): within the routine bound on both metrics — always accepted.

@@ -168,11 +168,21 @@ Full rationale, status vocabularies, and open-decision flags for this group are 
 | **FR-INFO-03** | Conceptual → Logical Refinement | Information elements support an explicit abstraction-level tag (Conceptual / Logical / Physical, or equivalent) and a `Refine`/`Specialize` relationship between levels, so a Conceptual entity's Logical realizations are traceable — mirroring CDM→LDM→PDM without mandating the exact three-tier vocabulary. | §5.10 | impl §5 |
 | **FR-INFO-04** | Information Flow Typing | Object/Item Flows between behavioral elements (Activities, Ports) are typed by an Information Element or Data Type defined per FR-INFO-01/02, so flow content is traceable back to the information model rather than left as an untyped label. | §5.10, §5.11 | impl §5 |
 
-**[REV-D, implemented `docs/IMPLEMENTATION_KICKOFF.md` Phase 5 — see impl v5 §13]:** FR-INFO-01/03 are built as `POST /information/elements` (`{name, abstractionLevel}` — a real `:InformationElement` with its tier set in one call/commit). FR-INFO-02 (`/information/data-types`) isn't built separately — no `:DataType` `NodeKind` exists; a Data Type is itself just an `:InformationElement`, already covered by the same endpoint. FR-INFO-04 remains unbuilt (needs Interaction/Object-Flow modeling, ADR-009-blocked, deferred with Interactions).
+**[REV-D, implemented `docs/IMPLEMENTATION_KICKOFF.md` Phase 5 — see impl v5 §13]:** FR-INFO-01/03 are built as `POST /information/elements` (`{name, abstractionLevel}` — a real `:InformationElement` with its tier set in one call/commit). FR-INFO-02 (`/information/data-types`) isn't built separately — no `:DataType` `NodeKind` exists; a Data Type is itself just an `:InformationElement`, already covered by the same endpoint. FR-INFO-04 remains unbuilt (needs Object-Flow typing on top of the now-built Interaction modeling — not attempted alongside FR-INTX, see below).
 
 ### 2.8 Interaction / Cross-Element Timing Behavior (Product 1) **[REV-D, new group FR-INTX]**
 
-**Open ADR (ADR-009):** the concrete SysML v2 metaclass(es) backing FR-INTX-01…04 are not yet chosen — see §5.11 and §7.
+**ADR-009: Ratified** — see §5.11 and §7. Messages/fragments are plain content on the existing
+`:Interaction`/`:InteractionFragment` elements (Phase 1 placeholders); the Lifeline/Message diagram
+is a pure `diagram-engine`/`apps/web` rendering concern, decoupled from storage.
+
+**[REV-D, implemented `docs/IMPLEMENTATION_KICKOFF.md` Phase 5 — see impl v5 §16]:** FR-INTX-01
+(`POST /interactions` + `.../messages`) and FR-INTX-03 (`.../fragments`, `alt`/`opt`/`par`/`loop`)
+are fully built, including a real rendered Lifeline/Message diagram
+(`apps/web/src/components/InteractionPanel.tsx`). FR-INTX-02 (timing constraints) and FR-INTX-04
+(`refInteractionId` sub-interaction reuse) are both captured as message fields and displayed, but
+no latency-analysis engine or ref-resolution UI was built — neither has spec text asking for one
+yet.
 
 | ID | Requirement Name | Description | Design | Test |
 | :--- | :--- | :--- | :--- | :--- |
@@ -402,14 +412,16 @@ Information Elements (FR-INFO-01) get a new node label, `:InformationElement`, a
 
 ### 5.11 Interaction / Timing Modeling, and Swimlane Allocation **[REV-D]**
 
-**Open decision, not resolved here (ADR-009):** the concrete SysML v2 metaclass(es) backing FR-INTX-01…04 need an ADR — SysML v2 does not have a direct "Sequence Diagram" element, and OMG's approach to interaction/occurrence modeling in v2 is still maturing. Two shapes are plausible:
+**ADR-009: Ratified, option 2** — `docs/IMPLEMENTATION_KICKOFF.md` Phase 5, see impl v5 §16.1. SysML
+v2 does not have a direct "Sequence Diagram" element, and OMG's approach to interaction/occurrence
+modeling in v2 is still maturing; two shapes were evaluated:
 
 1. **Native SysML v2 Occurrences** — model the interaction as a graph of Occurrence usages connected by succession/message links, closer to how SysML v2 actually represents behavior, at the cost of not looking like a classic Sequence Diagram to a Cameo-trained user.
 2. **A dedicated Interaction diagram type in `diagram-engine`** that renders as a Lifeline/Message diagram (visually familiar) backed by whatever SysML v2 metaclass is chosen — i.e., treat "looks like a Sequence Diagram" as a **view concern**, independent of the underlying graph representation.
 
-**Recommendation for the ADR: option 2.** It decouples "what SysML v2 actually stores" from "what a systems engineer expects to draw," consistent with how Mode B is already treated as "a live, optimizing implementation of the Parametric Diagram concept, not a new artifact type" (§5.5).
+**Option 2 was chosen and built.** It decouples "what SysML v2 actually stores" from "what a systems engineer expects to draw," consistent with how Mode B is already treated as "a live, optimizing implementation of the Parametric Diagram concept, not a new artifact type" (§5.5). Messages/fragments are plain content on the existing `:Interaction`/`:InteractionFragment` elements (no new `NodeKind`s); the Lifeline/Message diagram is `apps/web/src/components/InteractionPanel.tsx`, a hand-rolled SVG renderer with no knowledge of how the content is stored.
 
-**FR-CORE-12 (Swimlane allocation)** lives here rather than under Parametrics/Data because it's the same "behavior-to-structure linkage" problem as Activity Partitions, just expressed as a canvas capability rather than a data-model one. It requires a new React Flow layout mode in `diagram-engine` (vertical/horizontal partitions with drag-to-allocate headers) — no backend data-model change beyond the existing `Allocate` dependency stereotype already implied by FR-CORE-03's dependency taxonomy.
+**FR-CORE-12 (Swimlane allocation)** lives here rather than under Parametrics/Data because it's the same "behavior-to-structure linkage" problem as Activity Partitions, just expressed as a canvas capability rather than a data-model one. **Built** (impl v5 §16.3): a new React Flow layout mode in `diagram-engine` (vertical/horizontal partitions) — no backend data-model change beyond the existing `Allocate` dependency stereotype already implied by FR-CORE-03's dependency taxonomy, which itself needed adding as a real `EdgeKind` (a straightforward gap-closure, not a design call — impl v5 §16.2). Allocation ships as a click-to-allocate dropdown, not "drag-to-allocate headers" as originally worded here — native drag-and-drop is a separate, larger effort, not yet attempted.
 
 ### 5.12 Export & Reporting Pipeline **[REV-D]**
 
@@ -593,7 +605,7 @@ The three original open decisions are resolved (§5.4, §5.5, §5.6). The archit
 1. **Behavioral-simulation engine: build vs. adopt [REV-B §D3] — survey complete, see impl §9.** Resolution: **adopt** the Java fUML Reference Implementation (CPL/Apache) as a JVM sidecar for *execution*, driven over gRPC (ADR-008); **build** a minimal, clean-room in-house Alf-subset compiler (`alf-lite`, FR-CORE-09) for *authoring*, compiling to the same fUML; **decline to link** the GPL-v3 Alf RI. Tracked as ADR-005 (recommended; spike to ratify the subset and sidecar latency).
 2. **Persistence topology confirmation [REV-B §C2].** The polyglot split (§4 NFR-DATA) is adopted in principle; the specific document/relational store and object store are ADR-003.
 3. **LLM provider strategy [REV-B §D4].** Local-first (Ollama) for privacy vs. hosted for capability, behind one interface — ADR-004.
-4. **[REV-D] Interaction/timing SysML v2 mapping — ADR-009, Proposed.** See §5.11. Recommendation: a dedicated `diagram-engine` Interaction/Lifeline view as a pure view-layer concern, decoupled from the underlying chosen SysML v2 storage representation.
+4. **[REV-D] Interaction/timing SysML v2 mapping — ADR-009, Ratified.** See §5.11 and `Axioma_implementation_v5.md` §16.1. A dedicated `diagram-engine`/`apps/web` Interaction/Lifeline view (`InteractionPanel.tsx`) as a pure view-layer concern, decoupled from the underlying SysML v2 storage representation (messages/fragments as plain content on the existing `:Interaction`/`:InteractionFragment` elements) — built and verified end-to-end against a live dev server, not just recommended on paper.
 5. **[REV-D] Report-template mechanism — ADR-010, Proposed.** See §5.12 (FR-EXPORT-03). Recommendation: generalize FR-SAFE-05's existing safety-register template pipeline rather than building a second one.
 6. **[REV-D] Mode B design-space representation — ADR-011, Ratified (spike complete).** See §5.17 (FR-ARCH) and `Axioma_implementation_v5.md` §10 for the spike's real findings. Adopts `adsg-core` + `SBArchOpt` (both MIT) behind a Python gRPC sidecar (`cem-archspace`), mirroring the `fuml-runtime` pattern — confirmed working end-to-end against a synthetic test problem (all four design-space primitives, a real Imputation Ratio, and a real SBArchOpt-optimized result), not just recommended on paper. **This ADR number was independently proposed by two different amendments for two unrelated decisions during this revision's source material; this is the one that keeps the number — see the collision note at the top of this document.**
 7. **[REV-D] `llm-gateway` as a Product-1-tier shared dependency — ADR-012, Proposed.** See §5.14. Confirms local-Ollama-by-default satisfies a CEM-absent, Product-1-only deployment's need for the documents→draft-model path. **Renumbered from this revision's source material's original ADR-011 proposal to resolve the collision with #6 above.**

@@ -18,6 +18,7 @@ mod export;
 mod fuml_client;
 mod import;
 mod information;
+mod interactions;
 mod mode_a;
 mod mode_b;
 mod parametrics;
@@ -360,6 +361,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/import/documents/:jobId/proposal",
             post(document_import::create_import_proposal),
+        )
+        .route(
+            "/api/v0/projects/:projectId/interactions",
+            post(interactions::create_interaction),
+        )
+        .route(
+            "/api/v0/projects/:projectId/interactions/:id/messages",
+            post(interactions::add_message),
+        )
+        .route(
+            "/api/v0/projects/:projectId/interactions/:id/fragments",
+            post(interactions::add_fragment),
         )
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -6403,6 +6416,182 @@ mod tests {
         let job = wait_for_import_job_terminal(&state, &project.id, &created.job_id).await;
         assert_eq!(job.status, "Failed");
         assert!(job.error.unwrap().to_lowercase().contains("no candidate"));
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-INTX-01..04, ADR-009 ratification) — a real
+    /// `:Interaction` with participants, a plain message, a fragment-nested message, and a
+    /// `refInteractionId` message, confirming the stored shape end to end.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn interaction_pipeline_stores_messages_and_fragments_correctly() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "interactions").await;
+        make_structure(&state.neo4j, &project.id, "Sender").await;
+        make_structure(&state.neo4j, &project.id, "Receiver").await;
+
+        let interaction = interactions::create_interaction(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(interactions::CreateInteractionRequest {
+                name: "Startup Handshake".to_string(),
+                participant_ids: vec!["Sender".to_string(), "Receiver".to_string()],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(interaction.kind, NodeKind::Interaction);
+
+        // Rejects a participant that doesn't exist, rather than silently creating a Lifeline
+        // with nothing behind it.
+        let rejected = interactions::create_interaction(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(interactions::CreateInteractionRequest {
+                name: "Bad Interaction".to_string(),
+                participant_ids: vec!["DoesNotExist".to_string()],
+            }),
+        )
+        .await;
+        assert!(rejected.is_err());
+
+        let first_message = interactions::add_message(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), interaction.id.clone())),
+            Json(interactions::AddMessageRequest {
+                from: "Sender".to_string(),
+                to: "Receiver".to_string(),
+                text: "Hello".to_string(),
+                kind: "sync".to_string(),
+                fragment_id: None,
+                ref_interaction_id: None,
+                timing_constraint: Some(interactions::TimingConstraint {
+                    min_ms: Some(0.0),
+                    max_ms: Some(50.0),
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(first_message["order"], 0);
+
+        let fragment = interactions::add_fragment(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), interaction.id.clone())),
+            Json(interactions::AddFragmentRequest {
+                fragment_kind: "alt".to_string(),
+                guard: Some("connected".to_string()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(fragment.kind, NodeKind::InteractionFragment);
+        let contains_edges = state.neo4j.contains_edges(&project.id).await.unwrap();
+        assert!(contains_edges
+            .iter()
+            .any(|e| e.source == interaction.id && e.target == fragment.id));
+
+        let second_message = interactions::add_message(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), interaction.id.clone())),
+            Json(interactions::AddMessageRequest {
+                from: "Receiver".to_string(),
+                to: "Sender".to_string(),
+                text: "Ack".to_string(),
+                kind: "reply".to_string(),
+                fragment_id: Some(fragment.id.clone()),
+                ref_interaction_id: None,
+                timing_constraint: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(second_message["order"], 1);
+        assert_eq!(second_message["fragmentId"], fragment.id);
+
+        // A reusable sub-interaction reference (FR-INTX-04).
+        let sub_interaction = interactions::create_interaction(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(interactions::CreateInteractionRequest {
+                name: "Retry Logic".to_string(),
+                participant_ids: vec!["Sender".to_string(), "Receiver".to_string()],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let ref_message = interactions::add_message(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), interaction.id.clone())),
+            Json(interactions::AddMessageRequest {
+                from: "Sender".to_string(),
+                to: "Receiver".to_string(),
+                text: "ref Retry Logic".to_string(),
+                kind: "sync".to_string(),
+                fragment_id: None,
+                ref_interaction_id: Some(sub_interaction.id.clone()),
+                timing_constraint: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(ref_message["refInteractionId"], sub_interaction.id);
+
+        let body = state
+            .postgres
+            .get_body(&project.id, &interaction.id)
+            .await
+            .unwrap()
+            .expect("interaction should have a body");
+        let messages = body["properties"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["timingConstraint"]["maxMs"], 50.0);
+    }
+
+    /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12) — `Allocate` goes through the existing
+    /// generic edge endpoint (`create_edge`, `main.rs`), confirming no dedicated endpoint was
+    /// needed for it, matching this phase's own design decision.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn allocate_edge_round_trips_through_the_generic_edge_endpoint() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "allocate-edge").await;
+        make_structure(&state.neo4j, &project.id, "SomeAction").await;
+        make_structure(&state.neo4j, &project.id, "OwningLane").await;
+
+        let _ = create_edge(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(CreateEdgeRequest {
+                source: "SomeAction".to_string(),
+                target: "OwningLane".to_string(),
+                kind: EdgeKind::Allocate,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let allocate_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::Allocate)
+            .await
+            .unwrap();
+        assert!(allocate_edges
+            .iter()
+            .any(|e| e.source == "SomeAction" && e.target == "OwningLane"));
     }
 
     /// Compiles `control_sim::golden_alf_transitions` (the pilot's Idle->Armed->Running->Shutdown
