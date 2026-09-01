@@ -60,6 +60,18 @@ pub struct ChoiceConstraintInput {
     pub node_names: Vec<String>,
 }
 
+/// FR-ARCH-08 needs every real design space to have *some* objective for
+/// `EvaluateViability`/`RunOptimization` to evaluate against (both RPCs return
+/// `FAILED_PRECONDITION` for a space with none) -- `encode_design_space` always sets one whenever
+/// it encodes anything at all, mirroring the sidecar's own spike fixture convention exactly
+/// (`archspace_client::spike_compressor_design_space`'s `Objective { direction: -1, .. }` —
+/// minimize, matching that same precedent, not re-derived).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectiveInput {
+    pub name: String,
+    pub direction: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DesignSpaceDefinitionInput {
     pub root_name: String,
@@ -69,6 +81,7 @@ pub struct DesignSpaceDefinitionInput {
     pub connection_choices: Vec<ConnectionChoiceInput>,
     pub incompatibility_constraints: Vec<IncompatibilityConstraintInput>,
     pub choice_constraints: Vec<ChoiceConstraintInput>,
+    pub objective: Option<ObjectiveInput>,
 }
 
 // --- Inputs: already-fetched graph content, plain data only ---------------------------------
@@ -295,6 +308,12 @@ pub fn encode_design_space(
         }
     }
 
+    let has_any_content = !design_variables.is_empty() || !selection_choice_inputs.is_empty();
+    let objective = has_any_content.then(|| ObjectiveInput {
+        name: format!("{root_name}Objective"),
+        direction: -1,
+    });
+
     EncodeResult {
         definition: DesignSpaceDefinitionInput {
             root_name: root_name.to_string(),
@@ -304,6 +323,7 @@ pub fn encode_design_space(
             connection_choices: connection_choice_inputs,
             incompatibility_constraints,
             choice_constraints: choice_constraint_inputs,
+            objective,
         },
         skipped,
     }
@@ -454,6 +474,16 @@ mod tests {
             result.definition.choice_constraints[0].kind,
             ChoiceConstraintKindInput::Linked
         );
+        // FR-ARCH-08 needs every real design space to carry an objective (EvaluateViability/
+        // RunOptimization both fail without one) -- confirmed always set whenever anything real
+        // was encoded.
+        let objective = result
+            .definition
+            .objective
+            .as_ref()
+            .expect("a design space with real content should always get a real objective");
+        assert_eq!(objective.name, "CoreHpCompressorObjective");
+        assert_eq!(objective.direction, -1);
     }
 
     #[test]
@@ -474,6 +504,9 @@ mod tests {
         assert_eq!(result.skipped.len(), 1);
         assert_eq!(result.skipped[0].element_id, "UnboundedParam");
         assert!(result.skipped[0].reason.contains("no bound"));
+        // Nothing encodable at all -- no design variables, no selection choices -- means no real
+        // objective either, not a fabricated one over an empty design space.
+        assert!(result.definition.objective.is_none());
     }
 
     #[test]

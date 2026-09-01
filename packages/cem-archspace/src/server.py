@@ -124,6 +124,67 @@ class CemArchspaceServicer(cem_archspace_pb2_grpc.CemArchspaceServicer):
             best_design_vector=[float(v) for v in best_x],
         )
 
+    def EvaluateViability(self, request, context):
+        built = self._get(request.handle_id, context)
+        if built.objective_node is None:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "design space has no objective; EvaluateViability needs one",
+            )
+
+        # Reuses the exact same evaluator/problem RunOptimization already builds -- no new
+        # evaluator, no new problem class (see this RPC's own proto doc comment).
+        objective_dv_node = next(iter(built.dv_nodes.values()), None)
+        evaluator = _PlaceholderEvaluator(built.dsg, built.objective_node, objective_dv_node)
+        problem = DSGArchOptProblem(evaluator)
+        gp = GraphProcessor(built.dsg)
+
+        # `request.seed` is accepted for API symmetry with `RunOptimization`/`DecodeInstance`, but
+        # honestly not wired to anything real here: `GraphProcessor.get_random_design_vector()`
+        # takes no seed argument (confirmed in its real source), and `sb_arch_opt`'s own
+        # `RandomForestClassifier` wrapper doesn't expose scikit-learn's `random_state` either --
+        # so training-sample generation and the classifier itself are both non-deterministic
+        # today, same as `DecodeInstance`'s own existing "empty vector = random" behavior.
+        n_samples = request.n_training_samples if request.n_training_samples > 0 else 50
+        x_train = np.array(
+            [gp.get_random_design_vector() for _ in range(n_samples)], dtype=float
+        )
+
+        # `problem._evaluate(x, out)` is the real, standalone-callable evaluation method
+        # (sb_arch_opt.problem.ArchOptProblemBase._evaluate) -- populates out['F'], no pymoo
+        # optimizer loop needed, confirmed by reading its real signature before using it this way.
+        train_out = {}
+        problem._evaluate(x_train, train_out)
+        y_train = np.asarray(train_out["F"]).reshape(n_samples, -1)
+        is_failed = ~np.all(np.isfinite(y_train), axis=1)
+        y_is_valid = (~is_failed).astype(float)
+
+        x_candidate = np.array(
+            [list(request.design_vector) or gp.get_random_design_vector()], dtype=float
+        )
+        candidate_out = {}
+        problem._evaluate(x_candidate, candidate_out)
+        candidate_f = float(np.asarray(candidate_out["F"]).reshape(-1)[0])
+        objective_computed = bool(np.isfinite(candidate_f))
+
+        # A real sb_arch_opt.algo.arch_sbo.hc_strategy.RandomForestClassifier, trained on the
+        # freshly-sampled/evaluated (x, is_valid) pairs above -- the real, standalone predictor
+        # primitives (`train`/`evaluate_probability_of_validity`), not the full ArchSBO
+        # Bayesian-optimization infill loop `PredictionHCStrategy` normally drives.
+        from sb_arch_opt.algo.arch_sbo.hc_strategy import RandomForestClassifier
+
+        predictor = RandomForestClassifier(n=100, n_dim=10)
+        predictor.initialize(problem)
+        predictor.train(x_train, y_is_valid)
+        pov = float(predictor.evaluate_probability_of_validity(x_candidate)[0])
+
+        return cem_archspace_pb2.EvaluateViabilityResult(
+            objective_computed=objective_computed,
+            objective_value=candidate_f if objective_computed else 0.0,
+            probability_of_viability=max(0.0, min(1.0, pov)),
+            training_samples_used=n_samples,
+        )
+
 
 def serve():
     port = os.environ.get("ARCHSPACE_PORT", "50052")

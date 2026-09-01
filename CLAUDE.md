@@ -77,6 +77,14 @@ that no static check had caught, now fixed and reverified. `apps/api --ignored` 
 throughout, zero regressions. `docs/claude/*.md` holds the original amendment/analysis docs Phase 0
 merged, kept for history.
 
+Three more passes then closed out the rest of the P2.1 architecture-design-space track named just
+above: **FR-ARCH-01…06's real build-out** (impl v5 §20), **FR-COMP-01…06's real build-out**
+(impl v5 §21), and **FR-ARCH-07/08's real build-out** (impl v5 §22 — FR-CEM-13's first real
+implementation, a sidecar RPC wiring SBArchOpt's own real `RandomForestClassifier`, and a
+materialize-on-accept `"archspace-instance"` proposal origin) — see the P2.1 roadmap entry below
+for the full detail. **This closes the entire FR-ARCH-01…08 group.** `apps/api --ignored` now
+stands at 72/72, zero regressions across all three passes.
+
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2
 model graph, shipped as **two independently-shippable products**:
@@ -261,27 +269,36 @@ dependency, lowest urgency of the merged groups.*
    a real resolution state machine with FR-ARCH-04 enforcement
    (`PATCH /cem/archspace/choices/:id/resolve`), and a minimal frontend panel — proven against the
    real seeded Turbofan-Ref content, not just the Phase 2 spike's synthetic fixture.
-   FR-ARCH-02/03's cyclic-derivation/cardinality-enforcement halves and FR-ARCH-07/08 remain
-   explicitly open (see impl v5 §20's own scope note). **FR-COMP-01…06 is now also fully closed** —
+   FR-ARCH-02/03's cyclic-derivation/cardinality-enforcement halves remain explicitly open (see
+   impl v5 §20's own scope note). **FR-COMP-01…06 is now also fully closed** —
    see impl v5 §21: FR-COMP-03 (`sysml_core::check_compressor_blade_loading`, previously pure/
    unit-tested only) and FR-COMP-06 (a new, real `check_compressor_spec_achievability` computed
    check — no formula existed anywhere in the docs, a self-contained continuity-equation check was
    invented and verified by hand against both real seeded subsystems) are both wired into the
    real `PUT .../elements/:id/body` endpoint, property-shape-driven rather than hardcoded to
-   specific subsystem ids, and live-verified against the running host API. FR-ARCH-07/08 (the
-   proposal/review-gate wiring named just above) is the next open item on this track — **don't
-   assume the Mo 7–9 window absorbs any of this real build-out unchanged just because the spike is
-   done** — the spike de-risked *whether* the approach works, not *how long* the real build takes.
+   specific subsystem ids, and live-verified against the running host API. **FR-ARCH-07/08 is now
+   also fully closed** — see impl v5 §22: FR-CEM-13's first real implementation
+   (`sysml_core::SolverResultState` — `Converged`/`Diverged`/`Failed`/`Timeout`/
+   `SuspectNumerical`/`LicenceUnavailable`, with `satisfies_autonomy_gate()`), a new sidecar
+   `EvaluateViability` RPC wiring SBArchOpt's own real `RandomForestClassifier` hidden-constraint
+   classifier (not a Rust-side stand-in, per explicit direction), a real `/cem/archspace/:handleId/
+   generate-instances` + `/propose` + `/evaluate` HTTP surface, and an `"archspace-instance"`-origin
+   branch on `mode_b.rs::accept_proposal` that materializes a real new `:Structure` element —
+   live-verified end to end (Playwright) against the real running dev stack. **This closes the
+   entire FR-ARCH-01…08 group** — this track's only remaining open items are FR-ARCH-02/03's
+   cyclic-derivation/cardinality-enforcement halves. **Don't assume the Mo 7–9 window absorbs any
+   of this real build-out unchanged just because the spike is done** — the spike de-risked
+   *whether* the approach works, not *how long* the real build takes.
 6. **P2.2 Contract + Autonomy + Review (Mo 9–10):** proposal/branch workflow, L0–L4 autonomy.
-   *Also here (v5): FR-ARCH-07/08 (architecture instance generation/comparison, non-convergent
-   handling) alongside the proposal/branch workflow.*
 7. **P2.3 Mode C — one subsystem (Mo 11–14, research-risk):** Fan & LP Compression casing/mounts
    (structural-only), one external FEA solver, end-to-end.
 8. **P2.4 Expand (Mo 15+):** more subsystems, increasing physics complexity.
 
-**FR-COMP/FR-ARCH have no test-spec rows yet** (unlike every other v5 addition) — authoring them
-was never part of Phase 6's own 19 named test IDs (see impl v5 §18) and remains open; a distinct,
-still-uncovered gap from the now-closed Phase 6 pass, not done as part of the Phase 0 doc merge.
+**FR-COMP/FR-ARCH test-spec rows** were authored in the post-kickoff scope-downs pass (14 new rows,
+impl v5 §19) — a distinct addition from Phase 6's own 19 named test IDs (see impl v5 §18), not part
+of the Phase 0 doc merge. T-ARCH-07/08 were since updated from "not built" to "built and covered"
+following FR-ARCH-07/08's real build-out (impl v5 §22); T-ARCH-02's cyclic-derivation half and
+T-ARCH-03's cardinality-enforcement half remain the only rows still flagged not-built.
 
 ## Working conventions
 - Check the **ADR log** (implementation doc §2.5) before making any technology decision —

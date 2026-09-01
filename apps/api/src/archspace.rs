@@ -1,17 +1,20 @@
-//! FR-ARCH-01…06's real build-out (reqs v5 §5.17) — thin HTTP wiring around
+//! FR-ARCH-01…08's real build-out (reqs v5 §5.17) — thin HTTP wiring around
 //! `cem_core::archspace`'s pure encode/decode logic and the `cem-archspace` gRPC sidecar
 //! (`archspace_client.rs`), plus the resolution state machine (FR-ARCH-02/03) and its
-//! incompatibility/choice-constraint enforcement (FR-ARCH-04) — real, new logic that doesn't
-//! touch the sidecar at all. Mirrors `mode_b.rs`'s own shape (thin HTTP wiring around a pure
+//! incompatibility/choice-constraint enforcement (FR-ARCH-04), FR-ARCH-05/06's define/decode/stats
+//! endpoints, and FR-ARCH-07/08's instance generation/comparison + typed-viability evaluation and
+//! proposal/materialization flow. Mirrors `mode_b.rs`'s own shape (thin HTTP wiring around a pure
 //! computation crate).
 //!
-//! **`define`/`decode` don't materialize anything into the graph.** A decoded architecture
-//! instance is returned as data (`design vector` + `present node names` + a per-choice summary),
-//! not written back as new persisted elements — that's FR-ARCH-07 (architecture instances
-//! entering the `/cem/proposals/*` review-gate flow), explicitly the next requested pass, not
-//! this one. Design-space handles stay process-lifetime/in-memory sidecar-side, exactly as
+//! **`define`/`decode`/`evaluate`/`generate_instances` don't materialize anything into the
+//! graph** — a decoded/evaluated architecture instance is returned as data until a caller
+//! explicitly `propose`s one specific instance, which lands a real, review-gated `proposals` row
+//! (`origin: "archspace-instance"`); only accepting that proposal (`mode_b.rs::accept_proposal`,
+//! dispatching to this module's own `materialize_proposal`) actually writes new graph elements.
+//! Design-space handles stay process-lifetime/in-memory sidecar-side, exactly as
 //! `cem_archspace.proto`'s own doc comment already scopes the spike.
 
+use anyhow::Context;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -21,9 +24,11 @@ use cem_core::archspace::{
     self as core_archspace, ChoiceConstraintEdge, ChoiceConstraintKindInput,
     ConnectionChoiceElement, IncompatibleWithEdge, ParameterInput, SelectionChoiceElement,
 };
-use sysml_core::{EdgeKind, ElementBody, NodeKind};
+use sysml_core::{Edge, EdgeKind, Element, ElementBody, NodeKind, Origin};
 
-use crate::{archspace_client, import::BadRequest, record_commit, ApiError, AppState, DiffEntry};
+use crate::{
+    archspace_client, import::BadRequest, record_commit, ApiError, AppState, DiffEntry, MAIN_BRANCH,
+};
 
 fn body_properties(body: Option<serde_json::Value>) -> serde_json::Value {
     body.and_then(|b| b.get("properties").cloned())
@@ -267,7 +272,13 @@ fn to_proto_definition(
                 node_names: cc.node_names.clone(),
             })
             .collect(),
-        objective: None,
+        objective: def
+            .objective
+            .as_ref()
+            .map(|o| archspace_client::proto::Objective {
+                name: o.name.clone(),
+                direction: o.direction,
+            }),
     }
 }
 
@@ -423,6 +434,225 @@ pub(crate) async fn decode(
             })
             .collect(),
         other_present_nodes: summary.other_present_nodes,
+    }))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ViabilityDto {
+    pub(crate) state: &'static str,
+    pub(crate) probability_of_viability: f64,
+    pub(crate) objective_value: Option<f64>,
+    pub(crate) training_samples_used: i32,
+}
+
+/// FR-ARCH-08 -- calls the real sidecar `EvaluateViability` RPC (a real
+/// `sb_arch_opt.algo.arch_sbo.hc_strategy.RandomForestClassifier`, trained fresh on freshly
+/// sampled/evaluated points from the same design space, see `archspace_client::evaluate_viability`'s
+/// own doc comment) and maps its raw signal into `sysml_core::SolverResultState` — FR-CEM-13's
+/// typed-outcome pattern, reused rather than a bespoke failure shape. `objective_computed == false`
+/// is a real, existing non-convergence signal (the sidecar's placeholder evaluator's own documented
+/// NaN case) -> `Diverged`. Otherwise, `probability_of_viability < 0.5` -> `SuspectNumerical` (the
+/// literal "plausibility check... before any graph write" NFR-REL-03 calls for, using the trained
+/// classifier's own signal as that check). Anything else -> `Converged`.
+async fn evaluate_viability_typed(
+    handle_id: &str,
+    design_vector: Vec<f64>,
+    n_training_samples: i32,
+    seed: i32,
+) -> anyhow::Result<ViabilityDto> {
+    let result =
+        archspace_client::evaluate_viability(handle_id, design_vector, n_training_samples, seed)
+            .await?;
+    let state = if !result.objective_computed {
+        sysml_core::SolverResultState::Diverged
+    } else if result.probability_of_viability < 0.5 {
+        sysml_core::SolverResultState::SuspectNumerical
+    } else {
+        sysml_core::SolverResultState::Converged
+    };
+    Ok(ViabilityDto {
+        state: state.as_str(),
+        probability_of_viability: result.probability_of_viability,
+        objective_value: result.objective_computed.then_some(result.objective_value),
+        training_samples_used: result.training_samples_used,
+    })
+}
+
+/// `POST /api/v0/projects/:projectId/cem/archspace/:handleId/evaluate` — FR-ARCH-08's own direct
+/// HTTP surface: evaluate one specific candidate's typed viability outcome.
+pub(crate) async fn evaluate(
+    State(_state): State<AppState>,
+    Path((_project_id, handle_id)): Path<(String, String)>,
+    Json(payload): Json<DecodeRequestDto>,
+) -> Result<Json<ViabilityDto>, ApiError> {
+    let viability = evaluate_viability_typed(&handle_id, payload.design_vector, 0, 0).await?;
+    Ok(Json(viability))
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeneratedInstanceDto {
+    pub(crate) design_vector: Vec<f64>,
+    pub(crate) present_node_names: Vec<String>,
+    pub(crate) choices: Vec<DecodedChoiceDto>,
+    pub(crate) viability: ViabilityDto,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GenerateInstancesRequest {
+    #[serde(default)]
+    pub(crate) count: Option<u32>,
+}
+
+/// `POST /api/v0/projects/:projectId/cem/archspace/:handleId/generate-instances` — FR-ARCH-07's
+/// "browsable, comparable set of architecture instances" half, literally: decodes `count` (default
+/// 5) random instances and evaluates each one's real FR-ARCH-08 viability, so a caller can compare
+/// them before proposing any one of them (`propose`, below).
+pub(crate) async fn generate_instances(
+    State(state): State<AppState>,
+    Path((_project_id, handle_id)): Path<(String, String)>,
+    Json(payload): Json<GenerateInstancesRequest>,
+) -> Result<Json<Vec<GeneratedInstanceDto>>, ApiError> {
+    let count = payload.count.unwrap_or(5).clamp(1, 20);
+    let definition = state
+        .archspace_definitions
+        .lock()
+        .expect("archspace_definitions mutex poisoned")
+        .get(&handle_id)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut instances = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let instance = archspace_client::decode_instance(&handle_id, vec![]).await?;
+        let summary = core_archspace::summarize_instance(
+            &definition,
+            &instance.design_vector,
+            &instance.present_node_names,
+        );
+        let viability =
+            evaluate_viability_typed(&handle_id, instance.design_vector.clone(), 0, 0).await?;
+        instances.push(GeneratedInstanceDto {
+            design_vector: instance.design_vector,
+            present_node_names: instance.present_node_names,
+            choices: summary
+                .choices
+                .into_iter()
+                .map(|c| DecodedChoiceDto {
+                    choice_id: c.choice_id,
+                    present_option: c.present_option,
+                })
+                .collect(),
+            viability,
+        });
+    }
+    Ok(Json(instances))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProposeInstanceRequest {
+    pub(crate) design_vector: Vec<f64>,
+    pub(crate) subsystem_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProposeInstanceResponse {
+    pub(crate) proposal_id: String,
+    pub(crate) branch_id: String,
+    pub(crate) viability: ViabilityDto,
+}
+
+/// `POST /api/v0/projects/:projectId/cem/archspace/:handleId/propose` — FR-ARCH-07's "enterable
+/// into the existing proposal/review-gate flow" half. Re-decodes and re-evaluates the named design
+/// vector server-side rather than trusting whatever the client last saw from `generate-instances`
+/// (same "server recomputes, never passed through" discipline as FR-COMP-06's `flagged` field).
+/// Always lands on a fresh review branch -- no auto-merge path exists for architecture instances
+/// (no autonomy-decision story for this shape anywhere in the docs, and `SolverResultState::
+/// satisfies_autonomy_gate` means a non-`Converged` state could never qualify for one anyway, per
+/// CLAUDE.md's own non-negotiable rule #3).
+pub(crate) async fn propose(
+    State(state): State<AppState>,
+    Path((project_id, handle_id)): Path<(String, String)>,
+    Json(payload): Json<ProposeInstanceRequest>,
+) -> Result<Json<ProposeInstanceResponse>, ApiError> {
+    if state
+        .neo4j
+        .get_element(&project_id, &payload.subsystem_id)
+        .await?
+        .is_none()
+    {
+        return Err(BadRequest(format!("no such subsystem {}", payload.subsystem_id)).into());
+    }
+
+    let instance =
+        archspace_client::decode_instance(&handle_id, payload.design_vector.clone()).await?;
+    let definition = state
+        .archspace_definitions
+        .lock()
+        .expect("archspace_definitions mutex poisoned")
+        .get(&handle_id)
+        .cloned()
+        .unwrap_or_default();
+    let summary = core_archspace::summarize_instance(
+        &definition,
+        &instance.design_vector,
+        &instance.present_node_names,
+    );
+    let viability =
+        evaluate_viability_typed(&handle_id, instance.design_vector.clone(), 0, 0).await?;
+
+    let candidate = serde_json::json!({
+        "subsystemId": payload.subsystem_id,
+        "handleId": handle_id,
+        "designVector": instance.design_vector,
+        "presentNodeNames": instance.present_node_names,
+        "choices": summary.choices.iter().map(|c| serde_json::json!({
+            "choiceId": c.choice_id,
+            "presentOption": c.present_option,
+        })).collect::<Vec<_>>(),
+        "viability": viability.clone(),
+    });
+    let reason = format!(
+        "Mode B architecture instance ({}) — satisfiesAutonomyGate={}",
+        viability.state,
+        viability.state == sysml_core::SolverResultState::Converged.as_str()
+    );
+
+    let main_branch = state
+        .versioning
+        .get_branch(&project_id, MAIN_BRANCH)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project has no main branch"))?;
+    let branch_name = format!("archspace-instance-{}", uuid::Uuid::new_v4());
+    let branch = state
+        .versioning
+        .create_branch(
+            &project_id,
+            &branch_name,
+            main_branch.head_commit_id.as_deref(),
+        )
+        .await?;
+    let proposal = state
+        .versioning
+        .create_proposal(
+            &project_id,
+            &branch.id,
+            &payload.subsystem_id,
+            &candidate,
+            &[],
+            &reason,
+            "archspace-instance",
+        )
+        .await?;
+
+    Ok(Json(ProposeInstanceResponse {
+        proposal_id: proposal.id,
+        branch_id: branch.id,
+        viability,
     }))
 }
 
@@ -703,4 +933,96 @@ pub(crate) async fn resolution_status(
         resolved,
         total,
     }))
+}
+
+/// FR-ARCH-07's materialization half, dispatched from `mode_b.rs::accept_proposal` for
+/// `origin: "archspace-instance"` proposals (`propose`, above) — the exact extension pattern
+/// `document_import::materialize_proposal` already established for its own origin, mirrored here.
+/// Creates one real new `:Structure` element (the literal "candidate Blocks/subgraphs" FR-ARCH-07
+/// names, matching reqs v5's own bridging note: "a candidate `:Structure` subgraph tagged
+/// `source: ai-generated`"), `Contains`-linked under the subsystem the design space was defined
+/// for, carrying real generation provenance shaped like `SimulationRun`/solver provenance (this
+/// isn't LLM-driven, so FR-CEM-05's LLM-shaped fields don't apply — its own text calls itself "the
+/// LLM analog of `SimulationRun` provenance," making the solver-shaped analog the correct one
+/// here), plus the real `viability` this candidate was proposed with.
+pub(crate) async fn materialize_proposal(
+    state: &AppState,
+    project_id: &str,
+    actor: &str,
+    candidate: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let subsystem_id = candidate
+        .get("subsystemId")
+        .and_then(|v| v.as_str())
+        .context("archspace-instance candidate missing subsystemId")?
+        .to_string();
+    let handle_id = candidate
+        .get("handleId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    let element = Element {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: NodeKind::Structure,
+        name: format!(
+            "Architecture Instance — {subsystem_id} — {}",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ),
+        active: true,
+        origin: Origin::AiSuggested,
+    };
+    state.neo4j.upsert_element(project_id, &element).await?;
+    let mut diff_entries = vec![DiffEntry::ElementCreated {
+        element_id: element.id.clone(),
+        kind: element.kind,
+        name: element.name.clone(),
+    }];
+
+    let contains_edge = Edge {
+        source: subsystem_id.clone(),
+        target: element.id.clone(),
+        kind: EdgeKind::Contains,
+        metadata: None,
+    };
+    state.neo4j.create_edge(project_id, &contains_edge).await?;
+    diff_entries.push(DiffEntry::EdgeCreated {
+        source: contains_edge.source,
+        target: contains_edge.target,
+        kind: contains_edge.kind,
+    });
+
+    state
+        .postgres
+        .upsert_body(
+            project_id,
+            &ElementBody {
+                element_id: element.id.clone(),
+                rationale: None,
+                properties: serde_json::json!({
+                    "designVector": candidate.get("designVector"),
+                    "presentNodeNames": candidate.get("presentNodeNames"),
+                    "choices": candidate.get("choices"),
+                    "viability": candidate.get("viability"),
+                    // No manual timestamp field -- the commit/audit-log `record_commit` writes
+                    // below already captures "when," same convention every other provenance shape
+                    // in this codebase already follows (confirmed: none of them embed one either).
+                    "provenance": {
+                        "tool": "cem-archspace",
+                        "adsgCoreVersion": "1.4.1",
+                        "designSpaceHandleId": handle_id,
+                    },
+                }),
+            },
+        )
+        .await?;
+
+    record_commit(
+        state,
+        project_id,
+        actor,
+        "Accept Mode B architecture instance proposal",
+        diff_entries,
+    )
+    .await?;
+    Ok(())
 }

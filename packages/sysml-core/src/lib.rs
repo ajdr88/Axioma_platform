@@ -84,6 +84,49 @@ impl Origin {
     }
 }
 
+/// FR-CEM-13 (Solver Result States, reqs v5 §3.2/§5.4) — "solver outcomes are typed (`Converged`,
+/// `Diverged`, `Failed`, `Timeout`, `Suspect-Numerical`, `LicenceUnavailable`)... only `Converged`-
+/// within-bounds may satisfy an autonomy gate; all else drops to human review." **This is FR-CEM-13's
+/// first real Rust implementation** — confirmed by searching the whole codebase before writing this:
+/// the six states were referenced only in doc comments and this project's own memory notes, never a
+/// real type, anywhere. Built here because FR-ARCH-08 explicitly says to *reuse* this pattern rather
+/// than invent a second failure taxonomy for Mode B's own non-convergent architecture evaluations —
+/// so FR-ARCH-08 (`apps/api/src/archspace.rs::evaluate`) is this type's first real consumer.
+/// **Not yet retrofitted into `trade_study.rs`/`fuml_client.rs`'s own existing ad hoc result
+/// shapes** — a real, separate follow-up, flagged here rather than silently claimed done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum SolverResultState {
+    Converged,
+    Diverged,
+    Failed,
+    Timeout,
+    SuspectNumerical,
+    LicenceUnavailable,
+}
+
+impl SolverResultState {
+    /// Same fixed-closed-set string-form convention as [`Origin::as_str`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SolverResultState::Converged => "Converged",
+            SolverResultState::Diverged => "Diverged",
+            SolverResultState::Failed => "Failed",
+            SolverResultState::Timeout => "Timeout",
+            SolverResultState::SuspectNumerical => "Suspect-Numerical",
+            SolverResultState::LicenceUnavailable => "LicenceUnavailable",
+        }
+    }
+
+    /// NFR-REL-03/CLAUDE.md's own non-negotiable rule #3: "Only `Converged`-within-bounds can
+    /// satisfy an autonomy gate — everything else drops to human review regardless of Autonomy
+    /// Level." This function is the one place that rule is encoded as real, callable logic, not
+    /// just doc prose — any future autonomy-gate caller for a solver-backed result should call
+    /// this rather than re-deriving the same check.
+    pub fn satisfies_autonomy_gate(&self) -> bool {
+        matches!(self, SolverResultState::Converged)
+    }
+}
+
 impl NodeKind {
     /// The Neo4j node label for this kind. Safe to interpolate directly into a Cypher query
     /// string — this is a fixed, closed set of variants, never user-supplied text.
@@ -1293,5 +1336,45 @@ mod tests {
         let json = serde_json::to_string(&ai_suggested).unwrap();
         let parsed: Element = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.origin, Origin::AiSuggested);
+    }
+
+    /// FR-CEM-13: only `Converged` satisfies an autonomy gate -- every other state, including
+    /// `Suspect-Numerical` (nominally "close" to success), drops to human review.
+    #[test]
+    fn solver_result_state_only_converged_satisfies_the_autonomy_gate() {
+        assert!(SolverResultState::Converged.satisfies_autonomy_gate());
+        for state in [
+            SolverResultState::Diverged,
+            SolverResultState::Failed,
+            SolverResultState::Timeout,
+            SolverResultState::SuspectNumerical,
+            SolverResultState::LicenceUnavailable,
+        ] {
+            assert!(
+                !state.satisfies_autonomy_gate(),
+                "{state:?} must not satisfy the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn solver_result_state_roundtrips_through_json() {
+        for (state, expected_json) in [
+            (SolverResultState::Converged, "\"Converged\""),
+            (SolverResultState::SuspectNumerical, "\"SuspectNumerical\""),
+            (
+                SolverResultState::LicenceUnavailable,
+                "\"LicenceUnavailable\"",
+            ),
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(json, expected_json);
+            let parsed: SolverResultState = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, state);
+        }
+        assert_eq!(
+            SolverResultState::SuspectNumerical.as_str(),
+            "Suspect-Numerical"
+        );
     }
 }

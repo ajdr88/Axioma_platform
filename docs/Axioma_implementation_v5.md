@@ -2029,3 +2029,161 @@ a real, non-trivial computation, not a check that trivially always passes or alw
 - `cargo build/clippy/fmt --workspace`: clean throughout.
 - Live `curl` verification against the real running host API for both checks (§21.1/§21.2) — no
   browser verification needed, no new frontend surface this pass.
+
+## 22. FR-ARCH-07/08's Real Build-Out — Closing the Entire FR-ARCH Group
+
+The two items explicitly deferred from §20's own scope note. Two real, confirmed gaps found during
+research, not assumed:
+
+1. **FR-CEM-13 (Solver Result States) doesn't exist as real code anywhere** — the six named states
+   were only ever mentioned in doc comments and this project's own memory notes, never a real Rust
+   type, confirmed by searching the whole codebase before writing anything. FR-ARCH-08 explicitly
+   says to *reuse* this pattern, not invent a second failure taxonomy — so this pass builds its
+   first real, minimal version, with FR-ARCH-08 as its first real consumer.
+2. **SBArchOpt's real hidden-constraint/Probability-of-Viability classifier is directly usable**
+   without the full `ArchSBO` Bayesian-optimization loop or the optional `smt` surrogate-modeling
+   dependency — confirmed by reading the actual vendored source
+   (`sb_arch_opt/algo/arch_sbo/hc_strategy.py`): `RandomForestClassifier.train(x, y_is_valid)` /
+   `.evaluate_probability_of_validity(x)` are real, standalone-callable methods once
+   `predictor.initialize(problem)` is given an `ArchOptProblemBase` — the exact `DSGArchOptProblem`
+   object `RunOptimization` already constructs today. Confirmed `ArchOptProblemBase._evaluate(x,
+   out)` (`sb_arch_opt/problem.py`) is a plain, directly-callable method, not something requiring
+   pymoo's full optimizer loop. Per explicit user choice, this pass wires the *real* classifier,
+   not a Rust-side heuristic stand-in.
+
+### 22.1 `sysml_core::SolverResultState` — FR-CEM-13's first real implementation
+
+New enum (`Converged`/`Diverged`/`Failed`/`Timeout`/`SuspectNumerical`/`LicenceUnavailable`),
+`as_str()` mirroring `Origin`'s own convention, plus `satisfies_autonomy_gate()` — a single,
+callable encoding of CLAUDE.md's own non-negotiable rule #3 ("Only `Converged`-within-bounds can
+satisfy an autonomy gate"), used when building an archspace-instance proposal's own `reason` string
+(informational for reviewers) rather than left as an unused, aspirational method. Doc comment
+honestly flags this as FR-CEM-13's first real implementation — not yet retrofitted into
+`trade_study.rs`/`fuml_client.rs`'s own existing ad hoc result shapes, a real, separate follow-up.
+2 new unit tests (31/31 passing overall, `cargo test -p sysml-core`).
+
+### 22.2 Sidecar: a real `EvaluateViability` RPC using SBArchOpt's actual classifier
+
+- New `EvaluateViabilityRequest`/`EvaluateViabilityResult` messages + RPC in
+  `cem_archspace.proto`, Python stubs regenerated via the documented `grpc_tools.protoc` command.
+- `packages/cem-archspace/src/server.py::EvaluateViability` reuses the *exact* existing objects
+  `RunOptimization` already builds (`built.dsg`, `built.objective_node`, `built.dv_nodes`,
+  `_PlaceholderEvaluator`, `DSGArchOptProblem`) — no new evaluator, no new problem class. Samples
+  `n_training_samples` (default 50) random design vectors via `GraphProcessor.
+  get_random_design_vector()`, evaluates them via `problem._evaluate(x, out)` directly, builds
+  `is_failed = ~np.isfinite(out['F'])`, trains a real `RandomForestClassifier` (`n=100, n_dim=10`),
+  evaluates the requested candidate's own PoV, and separately evaluates the candidate's own
+  objective to report `objective_computed`/`objective_value`. **Honestly documented gap**:
+  `request.seed` is accepted for API symmetry with `RunOptimization`/`DecodeInstance` but not
+  actually wired to anything — confirmed neither `get_random_design_vector()` nor `sb_arch_opt`'s
+  own `RandomForestClassifier` wrapper expose a seed parameter, so sample generation and the
+  classifier are both non-deterministic today, same as `DecodeInstance`'s own pre-existing
+  "empty vector = random" behavior.
+- `packages/cem-archspace/requirements.txt`: added `scikit-learn==1.9.0` (BSD-3-Clause; pulls in
+  `joblib`/`threadpoolctl`/`cloudpickle`/`narwhals` as real transitive deps) — installed into the
+  local `.venv` via `uv pip install` and confirmed the server module actually imports; separately
+  verified end to end against a locally-running instance of the sidecar (a minimal one-design-
+  variable/one-objective definition, real `DefineDesignSpace` + `EvaluateViability` calls over the
+  real gRPC wire) before touching any Rust code — real numbers came back
+  (`objective_computed=True, objective_value=2.0, probability_of_viability=1.0`), not assumed
+  correct from reading the classifier's source alone.
+- `apps/api/src/archspace_client.rs::evaluate_viability` — same shape as the other four client
+  functions, now a real, non-test caller (unlike `run_optimization`, still test-only — wiring a
+  real optimize/propose flow around it belongs to a future pass, not this one).
+
+### 22.3 A real design gap found and fixed before it caused a runtime failure
+
+Careful review (not live testing) caught this before it shipped: `to_proto_definition` (§20.2)
+always sent `objective: None` — meaning *every* design space defined through the real `/define`
+HTTP endpoint had no objective server-side, and `EvaluateViability`/`RunOptimization` both return
+`FAILED_PRECONDITION` for a space with none. Every real call to the new `evaluate`/
+`generate-instances`/`propose` endpoints would have failed immediately. Fixed at the source:
+`cem_core::archspace::DesignSpaceDefinitionInput` gained a real `objective: Option<ObjectiveInput>`
+field, set by `encode_design_space` whenever it encodes *any* real content at all (`{root_name}
+Objective`, direction `-1`/minimize — mirroring `archspace_client::spike_compressor_design_space`'s
+own precedent exactly, not re-derived); `None` when nothing was encodable, not a fabricated
+objective over an empty design space. `to_proto_definition` now maps it through. New unit tests
+confirm both the "real content → real objective" and "nothing encodable → no objective" cases.
+
+### 22.4 `apps/api`: real HTTP surface mapping the raw signal into FR-CEM-13's typed states
+
+New `apps/api/src/archspace.rs` endpoints:
+
+- **`POST .../cem/archspace/:handleId/evaluate`** — calls `evaluate_viability`, maps the raw
+  result: `objective_computed == false` → `Diverged` (the sidecar's own real, pre-existing,
+  documented NaN case); `objective_computed == true && probability_of_viability < 0.5` →
+  `SuspectNumerical` (the trained classifier's own signal, used as the literal "plausibility
+  check... before any graph write" NFR-REL-03 calls for); otherwise → `Converged`.
+- **`POST .../cem/archspace/:handleId/generate-instances`** — FR-ARCH-07's "browsable, comparable
+  set" half, literally: decodes `count` (default 5, clamped 1-20) random instances, each
+  summarized and evaluated via the same viability path.
+- **`POST .../cem/archspace/:handleId/propose`** — FR-ARCH-07's "enterable into the existing
+  proposal/review-gate flow" half. Re-decodes and re-evaluates the named design vector
+  server-side rather than trusting whatever the client last saw from `generate-instances` (same
+  "server recomputes, never passed through" discipline as FR-COMP-06's `flagged` field, §21.2).
+  Creates a real `proposals` row via the existing, already-generic `VersioningStore::
+  create_proposal` with `origin: "archspace-instance"`, always on a fresh review branch — no
+  auto-merge path exists for architecture instances (no autonomy-decision story for this shape
+  anywhere in the docs, and `SolverResultState::satisfies_autonomy_gate` means a non-`Converged`
+  state could never qualify for one anyway).
+
+### 22.5 `mode_b.rs::accept_proposal` gains the `"archspace-instance"` origin
+
+Exactly the proven extension pattern already used for `"document-import"` — `accept_proposal`
+branches on `proposal.origin`, calling `archspace::materialize_proposal`, no changes to the
+generic list/reject/status machinery. Creates one real new `:Structure` element (the literal
+"candidate Blocks/subgraphs" FR-ARCH-07 names, matching reqs v5's own bridging note), `origin:
+AiSuggested`, `Contains`-linked under the subsystem the design space was defined for, with real
+solver-shaped generation provenance (`tool: "cem-archspace"`, `adsgCoreVersion: "1.4.1"`,
+`designSpaceHandleId`) rather than LLM-shaped fields — this isn't LLM-driven, and FR-CEM-05's own
+text calls itself "the LLM analog of `SimulationRun` provenance," making the solver-shaped analog
+the correct one here. No manual timestamp field — confirmed no other provenance shape in this
+codebase embeds one either; `record_commit`'s own audit trail already captures "when."
+
+### 22.6 Minimal frontend extension
+
+`ArchspacePanel.tsx` gains "Generate & Compare (5)" (renders each candidate with a viability badge
+— color-coded the same way this app's other status badges already are) and a "Propose" button per
+listed candidate. Three new Next.js proxy routes under the existing `[projectId]/cem/archspace/
+[id]/` directory (`generate-instances`, `propose`, `evaluate`) — same `[id]` generic param already
+established in §20.4 specifically to avoid the sibling-dynamic-route-name crash found there.
+
+### 22.7 Verification
+
+- `cargo test -p sysml-core`: 31/31 (2 new).
+- `cargo test -p cem-core`: 14/14 (2 new — the real-content/no-content objective cases).
+- Sidecar `EvaluateViability` verified twice: once locally against a minimal fixture before
+  touching Rust code (§22.2), once more via the full Rust integration tests below against the
+  rebuilt Docker container.
+- `apps/api --ignored`: **72/72 passing** (69 prior + 3 new), zero regressions. New tests:
+  `generate_instances_returns_real_instances_each_with_a_real_viability_signal`;
+  `propose_and_accept_archspace_instance_materializes_a_real_structure_element` (asserts the real
+  new `:Structure` element, its `Contains` edge, its provenance, and the proposal's status
+  transitioning to `accepted`); `evaluate_reports_diverged_for_a_design_space_with_no_design_
+  variables` — a deterministic trigger for the real non-convergent path (a design space with a
+  real objective but zero design variables means the placeholder evaluator can never find a value
+  for it, confirmed to reliably reproduce `Diverged`, not a mocked/forced result).
+- `cargo build/clippy/fmt --workspace`: clean throughout.
+- Live browser verification (Playwright, against the real running dev stack — `localhost:3000`/
+  `localhost:8080`, Turbofan-Ref project `1d092f7b-4137-4b71-b6f3-19f9e30fa0f7`): opened the
+  Architecture Design Space panel, selected `Core (HP) Compressor`, clicked "Define Design Space"
+  (handle `b7e382a4-fe7a-4f19-9211-83b41050ffbb`, 2 design variables, 6/6 valid, imputation ratio
+  1.000). Clicked "Generate & Compare (5)" — exactly 5 cards rendered, each with a distinct
+  real-valued design vector (e.g. `[2.00, 2.82]`, `[1.00, 2.61]`, `[1.00, 1.53]`), a resolved
+  `BleedOfftakeStage` choice, and a real viability line (`Converged · PoV 1.00 · f=<objective>`);
+  the `/generate-instances` response carried `trainingSamplesUsed: 50` in every payload, confirming
+  the `RandomForestClassifier` was genuinely trained and queried per candidate, not stubbed. Clicked
+  "Propose" on the first card — no error; that card's button area was replaced with
+  `proposed: f0a68cfc-06f2-46f1-aa07-315813272d8b` while the other four kept their Propose buttons.
+  The underlying `POST .../propose` call returned HTTP 200 with a real body —
+  `{"proposalId":"f0a68cfc-...","branchId":"4ad0b146-...","viability":{"state":"Converged",
+  "probabilityOfViability":1,"objectiveValue":2.819984711439288,"trainingSamplesUsed":50}}` — and
+  zero browser console/page errors occurred throughout. One honest observation, not a defect: all 5
+  generated instances came back `Converged`/PoV 1.00 for this particular subsystem — plausible given
+  Core-HP-Compressor's design space is small (2 design variables, one near-binary choice), so the
+  classifier lands confidently uniform; a subsystem with a richer design space would be needed to
+  observe `Suspect-Numerical`/`Diverged` states surface live in this same panel (the `evaluate_
+  reports_diverged_...` integration test above already exercises that path directly, just not
+  through this UI).
+
+**This closes the entire FR-ARCH-01…08 group.**

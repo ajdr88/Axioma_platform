@@ -23,9 +23,11 @@ use proto::{
     ChoiceConstraint, ChoiceConstraintKind, ConnectionChoice, DesignVariable,
     IncompatibilityConstraint, Objective, SelectionChoice,
 };
-use proto::{DecodeRequest, DesignSpaceDefinition, OptimizeRequest};
+use proto::{DecodeRequest, DesignSpaceDefinition, EvaluateViabilityRequest, OptimizeRequest};
 
-pub(crate) use proto::{ArchitectureInstance, DesignSpaceStats, OptimizeResult};
+pub(crate) use proto::{
+    ArchitectureInstance, DesignSpaceStats, EvaluateViabilityResult, OptimizeResult,
+};
 
 async fn connect() -> anyhow::Result<CemArchspaceClient<tonic::transport::Channel>> {
     let addr = env_or("ARCHSPACE_ADDR", "http://localhost:50052");
@@ -84,6 +86,27 @@ pub(crate) async fn run_optimization(
             handle_id: handle_id.to_string(),
             population_size,
             n_generations,
+            seed,
+        })
+        .await?
+        .into_inner();
+    Ok(result)
+}
+
+/// FR-ARCH-08. `design_vector` empty asks the sidecar to sample one at random first, same
+/// convention as `decode_instance`. `n_training_samples <= 0` lets the sidecar default to 50.
+pub(crate) async fn evaluate_viability(
+    handle_id: &str,
+    design_vector: Vec<f64>,
+    n_training_samples: i32,
+    seed: i32,
+) -> anyhow::Result<EvaluateViabilityResult> {
+    let mut client = connect().await?;
+    let result = client
+        .evaluate_viability(EvaluateViabilityRequest {
+            handle_id: handle_id.to_string(),
+            design_vector,
+            n_training_samples,
             seed,
         })
         .await?

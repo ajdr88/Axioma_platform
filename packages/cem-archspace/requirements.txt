@@ -5,3 +5,6 @@ sb-arch-opt==1.6.3
 grpcio==1.83.0
 grpcio-tools==1.83.0
 protobuf==7.36.0
+# FR-ARCH-08 -- sb_arch_opt.algo.arch_sbo.hc_strategy.RandomForestClassifier's real predictor
+# (BSD-3-Clause). Pulls in joblib/threadpoolctl/cloudpickle/narwhals as real transitive deps.
+scikit-learn==1.9.0

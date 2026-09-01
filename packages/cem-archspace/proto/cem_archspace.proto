@@ -38,6 +38,16 @@ service CemArchspace {
   // SBArchOpt's own NSGA-II wrapper (sb_arch_opt.algo.pymoo_interface.get_nsga2) for a fixed
   // number of generations against the single declared objective.
   rpc RunOptimization(OptimizeRequest) returns (OptimizeResult);
+
+  // FR-ARCH-08 (Non-Convergent Evaluation Handling). Reuses the exact DSGEvaluator/
+  // DSGArchOptProblem RunOptimization already builds -- samples `n_training_samples` random
+  // design vectors, evaluates each via the placeholder objective (a real NaN-producing failure
+  // mode already exists there, see server.py's own doc comment), trains a real
+  // sb_arch_opt.algo.arch_sbo.hc_strategy.RandomForestClassifier on the resulting (x, is_valid)
+  // pairs, and reports the requested candidate's own Probability-of-Viability plus whether its
+  // own objective evaluation actually converged. No ArchSBO/smt surrogate-optimization loop
+  // needed -- the classifier's train/predict methods are real, standalone-callable primitives.
+  rpc EvaluateViability(EvaluateViabilityRequest) returns (EvaluateViabilityResult);
 }
 
 message DesignVariable {
@@ -139,4 +149,25 @@ message OptimizeRequest {
 message OptimizeResult {
   double best_objective_value = 1;
   repeated double best_design_vector = 2;
+}
+
+// FR-ARCH-08. An empty `design_vector` asks the server to sample one at random first, same
+// convention as `DecodeRequest`. `n_training_samples <= 0` defaults to 50 server-side.
+message EvaluateViabilityRequest {
+  string handle_id = 1;
+  repeated double design_vector = 2;
+  int32 n_training_samples = 3;
+  int32 seed = 4;
+}
+
+message EvaluateViabilityResult {
+  // Whether the candidate's own objective evaluation produced a real (non-NaN) value -- the
+  // real, existing non-convergence signal `_PlaceholderEvaluator` already produces.
+  bool objective_computed = 1;
+  double objective_value = 2;
+  // A real sb_arch_opt.algo.arch_sbo.hc_strategy.RandomForestClassifier's own predicted
+  // Probability of Viability (0-1) for this candidate, trained on `training_samples_used` freshly
+  // sampled and evaluated points from the same design space.
+  double probability_of_viability = 3;
+  int32 training_samples_used = 4;
 }

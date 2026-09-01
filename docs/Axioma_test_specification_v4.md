@@ -512,10 +512,17 @@ spike's synthetic problem.
 same proposal/review-gate flow every other AI-generated element uses — not a separate approval
 mechanism.
 **FAIL:** No browsable candidate set, or a second, divergent review mechanism.
-**Landed status:** **not built** — this is exactly what "FR-ARCH-01…06 real build-out" (wiring
-`cem-archspace` into a real `apps/api` HTTP surface + `cem-core`'s own encode/decode logic) exists
-to build in a later pass; the sidecar spike (T-ARCH-05/06) proved the underlying mechanism works,
-it isn't wired into a user-facing generation/comparison flow yet.
+**Landed status:** built and covered — FR-ARCH-07/08 real build-out (impl v5 §22).
+`POST .../cem/archspace/:handleId/generate-instances` decodes and evaluates a real, browsable set
+of candidates from a real defined design space; `POST .../cem/archspace/:handleId/propose` enters
+one specific candidate into the *existing* `/cem/proposals/*` review-gate flow (`origin:
+"archspace-instance"`, dispatched from the same `mode_b::accept_proposal` every other origin
+already uses — no second, divergent mechanism). Accepting materializes a real new `:Structure`
+element, `Contains`-linked to its subsystem, with real solver-shaped provenance (`tool:
+"cem-archspace"`, `adsgCoreVersion`, `designSpaceHandleId`) — the FR-CEM-04/05 analog this isn't-
+LLM-driven generator actually needs, per FR-CEM-05's own "the LLM analog of `SimulationRun`
+provenance" framing. See `generate_instances_returns_real_instances_each_with_a_real_viability_
+signal` and `propose_and_accept_archspace_instance_materializes_a_real_structure_element`.
 
 ### T-ARCH-08 — Non-convergent evaluation handling
 **Verifies:** FR-ARCH-08
@@ -524,8 +531,18 @@ it isn't wired into a user-facing generation/comparison flow yet.
 **PASS:** A typed, non-fatal outcome (e.g. a Probability-of-Viability signal) usable by the
 optimizer, reusing the existing solver-result-state pattern (FR-CEM-13) — not a hard failure.
 **FAIL:** A hard failure/crash, or a second, divergent result-state taxonomy invented for this case.
-**Landed status:** **not built** — same reason as T-ARCH-07; belongs to the same future real
-build-out pass, not this one.
+**Landed status:** built and covered — **this pass builds FR-CEM-13's first real implementation**
+(`sysml_core::SolverResultState`, the six named states, confirmed to not exist as real code
+anywhere before this — only in doc comments/memory), with FR-ARCH-08 as its first real consumer,
+not a second taxonomy. The Probability-of-Viability signal is real, not a heuristic stand-in: a
+real `sb_arch_opt.algo.arch_sbo.hc_strategy.RandomForestClassifier`
+(`packages/cem-archspace/src/server.py::EvaluateViability`), trained fresh on sampled/evaluated
+points from the same design space, using the sidecar's own pre-existing, documented NaN-producing
+non-convergence signal as real training-data material. `objective_computed == false` (a real
+non-convergence) maps to `Diverged`; `probability_of_viability < 0.5` maps to `SuspectNumerical`;
+otherwise `Converged` — see `POST .../cem/archspace/:handleId/evaluate` and
+`evaluate_reports_diverged_for_a_design_space_with_no_design_variables` (a deterministic,
+self-contained trigger for the real non-convergent path, not a mocked one).
 
 ---
 
@@ -908,7 +925,7 @@ build-out pass, not this one.
 | NFR-COMP-01/02/03/05 | T-X-07 |
 | NFR-COMP-04 | T-P1.1-05 |
 
-**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` now has at least one test-spec row, including FR-COMP-01…06 and FR-ARCH-01…08 (authored in the scope-downs pass, §§ above; FR-ARCH-01…06 then given a real HTTP-layer/resolution build-out, impl v5 §20; FR-COMP-03/06 then given a real HTTP-layer build-out too, impl v5 §21) — though several of those rows still document a genuinely **not-built** PASS criterion rather than a passing test (T-ARCH-02/07/08 fully so; T-ARCH-03 partially — its ordering half is now real, its cardinality-enforcement half isn't — each says so explicitly in its own "Landed status" line; not silently marked green). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
+**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` now has at least one test-spec row, including FR-COMP-01…06 and FR-ARCH-01…08 (authored in the scope-downs pass, §§ above; FR-ARCH-01…06 then given a real HTTP-layer/resolution build-out, impl v5 §20; FR-COMP-03/06 then given a real HTTP-layer build-out too, impl v5 §21; FR-ARCH-07/08 then closed for real too, impl v5 §22 — **this closes the entire FR-ARCH-01…08 group**) — though one row still documents a genuinely **not-built** PASS criterion rather than a passing test (T-ARCH-03, partially — its ordering half is now real, its cardinality-enforcement half isn't, T-ARCH-02's cyclic-derivation half also remains unbuilt; each says so explicitly in its own "Landed status" line; not silently marked green). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
 
 ## Phase 6 landed status **[REV-D]**
 

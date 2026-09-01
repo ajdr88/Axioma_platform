@@ -323,6 +323,18 @@ async fn main() -> anyhow::Result<()> {
             post(archspace::decode),
         )
         .route(
+            "/api/v0/projects/:projectId/cem/archspace/:handleId/evaluate",
+            post(archspace::evaluate),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/archspace/:handleId/generate-instances",
+            post(archspace::generate_instances),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/archspace/:handleId/propose",
+            post(archspace::propose),
+        )
+        .route(
             "/api/v0/projects/:projectId/cem/archspace/choices/:id/resolve",
             axum::routing::patch(archspace::resolve_choice),
         )
@@ -5601,6 +5613,223 @@ mod tests {
             "expected at least one grouped choice (e.g. BleedOfftakeStage), got {:?}",
             decoded.choices
         );
+    }
+
+    /// FR-ARCH-07's "browsable, comparable set" half — `generate_instances` decodes real instances
+    /// from real seeded content, each carrying a real FR-ARCH-08 viability signal.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn generate_instances_returns_real_instances_each_with_a_real_viability_signal() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-generate").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let defined = archspace::define(
+            State(state.clone()),
+            Path((project.id.clone(), "CoreHpCompressor".to_string())),
+        )
+        .await
+        .expect("defining a design space from real seeded content")
+        .0;
+
+        let instances = archspace::generate_instances(
+            State(state.clone()),
+            Path((project.id.clone(), defined.handle_id.clone())),
+            Json(archspace::GenerateInstancesRequest { count: Some(3) }),
+        )
+        .await
+        .expect("generating instances")
+        .0;
+        assert_eq!(instances.len(), 3);
+        for instance in &instances {
+            assert!(!instance.design_vector.is_empty());
+            assert!(
+                instance
+                    .present_node_names
+                    .contains(&"CoreHpCompressor".to_string()),
+                "expected the root name present in {:?}",
+                instance.present_node_names
+            );
+            assert!(
+                [
+                    "Converged",
+                    "Diverged",
+                    "Failed",
+                    "Timeout",
+                    "Suspect-Numerical",
+                    "LicenceUnavailable"
+                ]
+                .contains(&instance.viability.state),
+                "unexpected state {:?}",
+                instance.viability.state
+            );
+            assert!(
+                (0.0..=1.0).contains(&instance.viability.probability_of_viability),
+                "PoV out of [0,1]: {}",
+                instance.viability.probability_of_viability
+            );
+        }
+    }
+
+    /// FR-ARCH-07's "enterable into the existing proposal/review-gate flow" half, end to end:
+    /// `propose` creates a real, review-gated proposal; accepting it (the exact same
+    /// `mode_b::accept_proposal` every other origin already uses) materializes a real new
+    /// `:Structure` element, `Contains`-linked to its subsystem, with real provenance.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn propose_and_accept_archspace_instance_materializes_a_real_structure_element() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-propose").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let defined = archspace::define(
+            State(state.clone()),
+            Path((project.id.clone(), "CoreHpCompressor".to_string())),
+        )
+        .await
+        .expect("defining a design space from real seeded content")
+        .0;
+        let decoded = archspace::decode(
+            State(state.clone()),
+            Path((project.id.clone(), defined.handle_id.clone())),
+            Json(archspace::DecodeRequestDto::default()),
+        )
+        .await
+        .expect("decoding a real instance")
+        .0;
+
+        let proposed = archspace::propose(
+            State(state.clone()),
+            Path((project.id.clone(), defined.handle_id.clone())),
+            Json(archspace::ProposeInstanceRequest {
+                design_vector: decoded.design_vector.clone(),
+                subsystem_id: "CoreHpCompressor".to_string(),
+            }),
+        )
+        .await
+        .expect("proposing an archspace instance")
+        .0;
+        assert!(!proposed.proposal_id.is_empty());
+        assert!(!proposed.branch_id.is_empty());
+
+        let proposal = state
+            .versioning
+            .get_proposal(&project.id, &proposed.proposal_id)
+            .await
+            .unwrap()
+            .expect("proposal should exist");
+        assert_eq!(proposal.origin, "archspace-instance");
+        assert_eq!(proposal.status, "pending");
+
+        // Real elements before accept: just what seed_turbofan_ref already created.
+        let before = state.neo4j.list_elements(&project.id).await.unwrap();
+        let before_ids: std::collections::HashSet<String> =
+            before.iter().map(|e| e.id.clone()).collect();
+
+        mode_b::accept_proposal(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), proposed.proposal_id.clone())),
+        )
+        .await
+        .expect("accepting the archspace-instance proposal");
+
+        let after = state.neo4j.list_elements(&project.id).await.unwrap();
+        let new_elements: Vec<&Element> = after
+            .iter()
+            .filter(|e| !before_ids.contains(&e.id))
+            .collect();
+        assert_eq!(
+            new_elements.len(),
+            1,
+            "expected exactly one new Structure element, got {new_elements:?}"
+        );
+        let new_element = new_elements[0];
+        assert_eq!(new_element.kind, NodeKind::Structure);
+        assert_eq!(new_element.origin, Origin::AiSuggested);
+        assert!(new_element.name.contains("CoreHpCompressor"));
+
+        let contains_edges = state.neo4j.contains_edges(&project.id).await.unwrap();
+        assert!(
+            contains_edges
+                .iter()
+                .any(|e| e.source == "CoreHpCompressor" && e.target == new_element.id),
+            "expected CoreHpCompressor -Contains-> {}, got {contains_edges:?}",
+            new_element.id
+        );
+
+        let body = state
+            .postgres
+            .get_body(&project.id, &new_element.id)
+            .await
+            .unwrap()
+            .expect("new element should have a body");
+        assert_eq!(
+            body["properties"]["provenance"]["tool"],
+            serde_json::json!("cem-archspace")
+        );
+        assert!(!body["properties"]["viability"]["state"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
+
+        let proposal_after = state
+            .versioning
+            .get_proposal(&project.id, &proposed.proposal_id)
+            .await
+            .unwrap()
+            .expect("proposal should still exist");
+        assert_eq!(proposal_after.status, "accepted");
+    }
+
+    /// FR-ARCH-08's own non-convergent path, triggered deterministically: a design space with a
+    /// real objective but zero design variables means `_PlaceholderEvaluator` (the sidecar's own,
+    /// pre-existing, documented behavior) can never find a value for it — every evaluation, for
+    /// training and for the candidate, comes back NaN. A self-contained synthetic fixture, not
+    /// depending on incidental seed shape (same precedent as the FR-ARCH-04 fixture from the
+    /// previous pass) -- calls `archspace_client` directly rather than through our own encoder,
+    /// since `encode_design_space` never emits a design space with zero real content in the first
+    /// place (there'd be nothing to skip-and-still-succeed on).
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn evaluate_reports_diverged_for_a_design_space_with_no_design_variables() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-diverged").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let definition = archspace_client::proto::DesignSpaceDefinition {
+            root_name: "EmptyRoot".to_string(),
+            connector_names: vec![],
+            design_variables: vec![],
+            selection_choices: vec![archspace_client::proto::SelectionChoice {
+                choice_id: "OnlyChoice".to_string(),
+                option_names: vec!["A".to_string(), "B".to_string()],
+            }],
+            connection_choices: vec![],
+            incompatibility_constraints: vec![],
+            choice_constraints: vec![],
+            objective: Some(archspace_client::proto::Objective {
+                name: "EmptyObjective".to_string(),
+                direction: -1,
+            }),
+        };
+        let handle_id = archspace_client::define_design_space(definition)
+            .await
+            .expect("defining a design space with no design variables");
+
+        let viability = archspace::evaluate(
+            State(state.clone()),
+            Path((project.id.clone(), handle_id)),
+            Json(archspace::DecodeRequestDto::default()),
+        )
+        .await
+        .expect("evaluating viability")
+        .0;
+        assert_eq!(
+            viability.state, "Diverged",
+            "a design space with zero design variables should always diverge, got {viability:?}"
+        );
+        assert!(viability.objective_value.is_none());
     }
 
     /// The genuinely-unencodable half: `TurbineHpLp`'s scope includes `MixedNozzle` (a real

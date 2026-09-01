@@ -23,7 +23,9 @@
 //! endpoint for `document-import`-origin proposals (`document_import.rs`) — it dispatches to that
 //! module's own materialization, never calling an LLM itself (the drafting LLM call already ran
 //! earlier, during that pipeline's own async Structuring stage, well before any human accept
-//! decision) — the "no LLM in the decision path" invariant above stays structurally true.
+//! decision) — the "no LLM in the decision path" invariant above stays structurally true. FR-ARCH-07
+//! adds a third origin, `archspace-instance` (`archspace.rs::propose`/`materialize_proposal`) —
+//! same dispatch shape again, no changes needed to the generic list/reject/status machinery below.
 
 use anyhow::Context;
 use axum::{
@@ -36,8 +38,8 @@ use cem_core::{Candidate, Constraints, Targets};
 use sysml_core::{Edge, EdgeKind, ElementBody, Origin};
 
 use crate::{
-    autonomy, document_import, import::BadRequest, record_commit, store::versioning::Proposal,
-    ApiError, AppState, DiffEntry, MAIN_BRANCH,
+    archspace, autonomy, document_import, import::BadRequest, record_commit,
+    store::versioning::Proposal, ApiError, AppState, DiffEntry, MAIN_BRANCH,
 };
 
 /// The four subsystems `cem_core`'s grid actually varies — `accept`/`interface_contract` only
@@ -481,6 +483,8 @@ pub async fn accept_proposal(
     if proposal.origin == "document-import" {
         document_import::materialize_proposal(&state, &project_id, &actor, &proposal.candidate)
             .await?;
+    } else if proposal.origin == "archspace-instance" {
+        archspace::materialize_proposal(&state, &project_id, &actor, &proposal.candidate).await?;
     } else {
         let candidate: Candidate = serde_json::from_value(proposal.candidate)
             .context("parsing stored proposal candidate")?;
