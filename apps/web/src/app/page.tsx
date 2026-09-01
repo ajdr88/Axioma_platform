@@ -40,6 +40,7 @@ import {
 } from "@xyflow/react";
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArchspacePanel } from "@/components/ArchspacePanel";
 import { AutonomyPanel } from "@/components/AutonomyPanel";
 import { ElementInspector } from "@/components/ElementInspector";
 import { HazardRiskPanel } from "@/components/HazardRiskPanel";
@@ -217,6 +218,7 @@ export default function Home() {
   const [showTraceabilityPanel, setShowTraceabilityPanel] = useState(false);
   /** FR-PARAM-03 — panel toggle, same convention as every other panel below. */
   const [showParametricsPanel, setShowParametricsPanel] = useState(false);
+  const [showArchspacePanel, setShowArchspacePanel] = useState(false);
   /** docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-12) — replaces the normal ELK/clustering
    * layout with a lane-partitioned one while active; mutually exclusive with clustering (not
    * combined this pass — see `swimlane.ts`'s own doc comment). */
@@ -836,6 +838,8 @@ export default function Home() {
         setShowTraceabilityPanel={setShowTraceabilityPanel}
         showParametricsPanel={showParametricsPanel}
         setShowParametricsPanel={setShowParametricsPanel}
+        showArchspacePanel={showArchspacePanel}
+        setShowArchspacePanel={setShowArchspacePanel}
         showSwimlaneView={showSwimlaneView}
         setShowSwimlaneView={setShowSwimlaneView}
         elements={elements}
@@ -910,6 +914,8 @@ interface CanvasProps {
   setShowTraceabilityPanel: React.Dispatch<React.SetStateAction<boolean>>;
   showParametricsPanel: boolean;
   setShowParametricsPanel: React.Dispatch<React.SetStateAction<boolean>>;
+  showArchspacePanel: boolean;
+  setShowArchspacePanel: React.Dispatch<React.SetStateAction<boolean>>;
   showSwimlaneView: boolean;
   setShowSwimlaneView: React.Dispatch<React.SetStateAction<boolean>>;
   elements: ApiElement[];
@@ -994,6 +1000,8 @@ function Canvas({
   setShowTraceabilityPanel,
   showParametricsPanel,
   setShowParametricsPanel,
+  showArchspacePanel,
+  setShowArchspacePanel,
   showSwimlaneView,
   setShowSwimlaneView,
   elements,
@@ -1657,6 +1665,13 @@ function Canvas({
                 Swimlane View
               </Button>
               <Button
+                variant={showArchspacePanel ? "primary" : "ghost"}
+                onClick={() => setShowArchspacePanel((v) => !v)}
+                className="!px-2 !py-1 text-xs"
+              >
+                Architecture Design Space
+              </Button>
+              <Button
                 variant={showTextPanel ? "primary" : "ghost"}
                 onClick={() => setShowTextPanel((v) => !v)}
                 className="!px-2 !py-1 text-xs"
@@ -1757,6 +1772,14 @@ function Canvas({
               projectId={projectId}
               elements={elements}
               onClose={() => setShowParametricsPanel(false)}
+            />
+          )}
+
+          {showArchspacePanel && projectId && (
+            <ArchspacePanel
+              projectId={projectId}
+              elements={elements}
+              onClose={() => setShowArchspacePanel(false)}
             />
           )}
 

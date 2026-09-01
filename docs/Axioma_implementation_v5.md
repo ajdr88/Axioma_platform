@@ -1712,3 +1712,229 @@ simplicity tradeoff for a first version.
 - Final re-checks after the §19.5 fix: `tsc --noEmit`, `biome check src` (after one `biome check
   --write` formatting fix the edit itself needed), and `next build` all re-run clean; `cargo build
   --workspace` re-run clean (frontend-only change, but checked regardless).
+
+## 20. FR-ARCH-01…06's Real Build-Out
+
+The `packages/cem-archspace/` Python gRPC sidecar (wrapping `adsg-core`/`SBArchOpt`, ADR-011) was
+built and verified end-to-end as a Phase 2 **spike** — but before this pass, nothing in `apps/api`
+actually called it outside a `#[cfg(test)]`-only integration test using a synthetic fixture
+(`archspace_client::spike_compressor_design_space()`); every function in
+`apps/api/src/archspace_client.rs` was `#[allow(dead_code)]`. `cem-core` (the pure Rust Mode B
+optimizer) had zero notion of "design vector," "encode," or "decode" at all. This pass closes that
+gap for real: a real `apps/api` HTTP surface, real `cem-core` encode/decode logic translating
+actual graph content into the sidecar's protobuf contract and back, a real resolution state
+machine (nothing resolved a `SelectionChoice`/`ConnectionChoice` before this pass at all), and a
+minimal frontend panel.
+
+**Explicitly out of scope, not invented around**: FR-ARCH-07 (architecture instances entering the
+`/cem/proposals/*` review-gate flow) and FR-ARCH-08 (non-convergent-evaluation Probability-of-
+Viability typed outcome) — both named as separate FR-ARCH items with no design detail given yet,
+already placed in "P2.2 Contract + Autonomy + Review" by CLAUDE.md's own roadmap. A decoded
+architecture instance in this pass is returned as data (JSON), never materialized as new persisted
+graph elements. Design-space handles stay process-lifetime/in-memory sidecar-side, exactly as
+`cem_archspace.proto`'s own doc comment already scopes the spike — no new persistence added.
+
+### 20.1 `cem-core` gains a real, pure `archspace` module (FR-ARCH-05)
+
+New `packages/cem-core/src/archspace.rs` — zero new dependencies, no `tonic`/protobuf types (same
+"no I/O" discipline as this crate's own top-level doc comment). Plain input structs
+(`ParameterInput`/`SelectionChoiceElement`/`ConnectionChoiceElement`/`IncompatibleWithEdge`/
+`ChoiceConstraintEdge`) mirror already-fetched graph content; `encode_design_space(...)` builds a
+`DesignSpaceDefinitionInput` from them, reporting every item it could not encode
+(`EncodeResult::skipped`, `{element_id, reason}`) rather than silently dropping or force-fitting
+it. `summarize_instance(...)` is the light, pure "decode... back into a graph instance" half —
+groups a decoded instance's `present_node_names` by which selection choice they belong to.
+
+- **Real, confirmed schema/seed mismatches, itemized rather than guessed around**: the seeded
+  Turbofan-Ref `SelectionChoice`/`ConnectionChoice` content didn't cleanly map onto adsg-core's
+  expected shapes before this pass — `BleedOfftakeStage.options` was one illustrative descriptive
+  string, not a real array; the two seeded `:ConnectionChoice`s used heterogeneous free-form
+  properties, not the connector-name-list shape the sidecar needs; the four stage-count
+  `:Parameter`s (the real `LINKED` `ChoiceConstraint` pair FR-COMP-04 needs) had no `bound`
+  property at all. Fixed in the seed (`apps/api/src/main.rs::seed_fr_arch_system_model`): a real
+  3-option array for `BleedOfftakeStage`; new `sourceConnectorNames`/`targetConnectorNames` array
+  properties on both `:ConnectionChoice`s (alongside their existing free-form properties, kept as
+  documentation, not replaced); a `bound: [1.0, 4.0]` on all four stage-count Parameters, reusing
+  the exact range `archspace_client::spike_compressor_design_space()`'s own already-proven
+  `n_HP_stages` test fixture used, not re-derived.
+- **The one real seeded item that stays genuinely unencodable, on purpose**: the `IncompatibleWith`
+  edge `MixedNozzle -> FanBypassDuctExitPort` references a whole `:SelectionChoice` element and an
+  unrelated `:Port`, but adsg-core's own `IncompatibilityConstraint.node_names` needs two **option
+  names** (confirmed directly against `archspace_client.rs`'s own spike fixture, where
+  `"MixedNozzle"`/`"Geared"` are option names *within* their own choices, not choice ids or
+  arbitrary elements). `encode_design_space` reports this honestly (`skipped`) rather than
+  force-fitting it — proven live, not just asserted, see §20.4.
+- Unit tests (no gRPC/sidecar/Docker needed): a full clean encode of every primitive, one test per
+  skip rule (bad bound, malformed options, missing connector properties, an incompatibility/
+  choice-constraint edge referencing an unknown name), and `summarize_instance`'s per-choice
+  grouping. 12/12 passing (`cargo test -p cem-core`).
+
+### 20.2 New `apps/api/src/archspace.rs` — the real HTTP surface (FR-ARCH-05/06)
+
+Mirrors `mode_b.rs`'s own shape. New routes:
+
+- **`POST /api/v0/projects/:projectId/cem/archspace/:subsystemId/define`** — fetches the
+  subsystem's real graph content via existing `Neo4jStore`/`PostgresStore` methods only (no new
+  store methods needed): `list_elements`/`element_kinds` + `edges_of_kind(Bound|ArchDerives|
+  IncompatibleWith|ChoiceConstraint)` + `postgres.list_bodies`. A `ChoiceConstraint`/
+  `IncompatibleWith` edge's *other* endpoint is pulled in even when it belongs to a different
+  subsystem (a one-hop closure) — otherwise a real cross-subsystem constraint like FR-COMP-04's
+  stage-count `LINKED` pair (Core (HP) Compressor's `CoreHpStagesParam` / Turbine's
+  `TurbineHpStagesParam`) would always show up as unencodable for either subsystem alone, defeating
+  the entire point of proving that primitive. `:ConnectionChoice`s are project-wide, not
+  subsystem-scoped (they route *between* subsystems by construction — e.g. bleed air from Core (HP)
+  Compressor to an external boundary — so there's no single subsystem to scope them to).
+  Encodes via `cem_core::archspace::encode_design_space`, converts the result into the real
+  `archspace_client::proto::DesignSpaceDefinition` (a small, explicit field-by-field conversion),
+  calls `define_design_space` then `get_design_space_stats` in the same round trip (FR-ARCH-06
+  bundled in, not a second user action). `archspace_client.rs`'s `#[allow(dead_code)]` attributes
+  came off — this is a real, non-test caller now.
+- **`POST /api/v0/projects/:projectId/cem/archspace/:handleId/decode`** — FR-ARCH-05's decode half.
+  Empty/omitted `designVector` asks the sidecar to sample randomly. Groups the decoded instance's
+  present nodes by which selection choice they belong to (`DecodeResponse::choices`), via a new
+  `AppState::archspace_definitions` field — an in-process-only `handle_id ->
+  DesignSpaceDefinitionInput` cache, populated by `define`, read by `decode`. **A real gap found
+  by live browser verification, not by any test**: the first version always summarized against an
+  *empty* definition (the comment reasoned "choices unknown at decode time, since the handle is
+  opaque sidecar-side"), so `choices` was unconditionally `[]` for every call — confirmed live (an
+  agent decoded a real instance and got real `present_node_names` but zero grouped choices, then
+  traced it to that exact line). Fixed with the cache above — deliberately **not** new handle
+  persistence (design-space handles still live process-lifetime, sidecar-side only, unchanged);
+  this is apps/api's own bookkeeping, lost on restart exactly like the sidecar's handles already
+  are. Re-verified live afterward: the same real instance now returns
+  `"choices":[{"choiceId":"BleedOfftakeStage","presentOption":"Stage 3"}]`.
+- New `#[ignore]`d integration tests (sidecar + DB required): one defining a design space from the
+  *real* seeded Core (HP) Compressor content (asserts only the honestly-expected skips —
+  three pre-existing FR-COMP Parameters with no `bound` — appear, nothing else) and decoding a
+  real instance from it; one confirming `TurbineHpLp`'s scope reports the genuinely-unencodable
+  `MixedNozzle -> FanBypassDuctExitPort` edge.
+
+### 20.3 The resolution state machine + FR-ARCH-04 enforcement (FR-ARCH-02/03/04)
+
+No resolution endpoint existed anywhere before this pass — `resolutionState` was set once at seed
+time and never touched again.
+
+- **`PATCH /api/v0/projects/:projectId/cem/archspace/choices/:id/resolve`** — body
+  `{selectedOption}` for a `:SelectionChoice` (validates it's one of the choice's real `options`),
+  or an empty body for a `:ConnectionChoice`. Transitions `resolutionState: "unresolved" ->
+  "resolved"` directly — a single pick-one-of-N choice has no meaningful per-choice "partial"
+  state; §5.17's literal "unresolved → partial → resolved" language is satisfied at the aggregate
+  level instead (see the `resolution-status` endpoint below), not invented as a fake intermediate
+  state. `:ConnectionChoice` resolution is rejected until any `SelectionChoice` its properties
+  reference (`sourceSelectionChoiceId`/`targetSelectionChoiceId`) is already resolved (FR-ARCH-03's
+  literal "resolved after selection choices" ordering). Every resolve is a real, versioned write
+  through the existing `PATCH .../body` + `record_commit` path.
+- **`GET /api/v0/projects/:projectId/cem/archspace/:subsystemId/resolution-status`** — aggregates
+  `{state: "unresolved"|"partial"|"resolved", resolved, total}` across every SelectionChoice/
+  ConnectionChoice scoped to a subsystem.
+- **FR-ARCH-04 enforcement, and a real design correction found via a live test run, not assumed
+  correct on the first try**: the first version matched `IncompatibleWith`/`ChoiceConstraint` edges
+  against **option names** (mirroring `cem_core::archspace::encode_design_space`'s own adsg-core-
+  facing semantics) — but a live test run failed immediately: `Neo4jStore::create_edge` rejects
+  dangling edges, so such an edge can only ever connect two real *elements*, never a bare
+  option-value string (confirmed directly — `create_edge("red", "square", ...)` failed with
+  "element red does not exist," since "red" was never a real element, just an option value).
+  Re-reading FR-ARCH-04's own literal wording confirmed the correct scope: "mutual exclusion
+  between two **elements/choices**," not options. Fixed to match: `check_constraints` now matches
+  edges against the choice **element id**, consistent with how the real seeded `MixedNozzle ->
+  FanBypassDuctExitPort` edge is actually shaped. The rule: once one of two `IncompatibleWith`-
+  linked elements is resolved to anything, the other cannot also be resolved (an edge to a `:Port`,
+  like the real seeded one, never blocks anything under this rule, since a `:Port` never carries a
+  `selectedOption` — checked directly, not assumed). `LINKED` `ChoiceConstraint` uses the same
+  "other side already resolved" trigger, additionally requiring the two selected values to match.
+  This is a genuinely different, independent concern from `cem_core::archspace`'s own option-name
+  matching — that module answers "what does the *sidecar* need," this endpoint answers "what does
+  *this graph's own resolution state* allow" — and the two don't need to (and don't) agree.
+- New tests: state-machine transition + validation (unknown option rejected) against real seeded
+  content; a self-contained three-choice fixture (not depending on the real seed's Port-shaped
+  `IncompatibleWith` edge, which can never exercise this path) proving a genuine conflict is
+  rejected while an unrelated resolution still succeeds.
+
+### 20.4 Minimal frontend panel
+
+New `apps/web/src/components/ArchspacePanel.tsx` (mirrors `ParametricsPanel.tsx`'s shape) — a
+subsystem picker, "Define Design Space" (shows handle/stats/skipped list), "Decode Random
+Instance" (shows the decoded vector + per-choice values). New toolbar toggle in `page.tsx`,
+following this codebase's more recently established simpler precedent (a bare self-toggle, not the
+older "close every other panel" convention every earlier panel followed — confirmed by checking
+the already-existing "Swimlane View"/"Text View" buttons, which had already relaxed that pattern).
+Two new Next.js proxy routes.
+
+- **A real Next.js routing bug found and fixed via an actual dev-server crash, not assumed away**:
+  the two new dynamic routes were first authored as `[subsystemId]/define` and `[handleId]/decode`
+  siblings under the same `cem/archspace/` directory — Next.js's App Router requires the *same*
+  dynamic segment name at a given path position across the whole route tree and refused to start
+  (`Error: You cannot use different slug names for the same dynamic path ('handleId' !==
+  'subsystemId')`). Fixed by unifying both to `[id]`, matching this repo's own existing generic-
+  param convention elsewhere (e.g. `elements/[id]/attachments`). A stale `.next/types` cache
+  referencing the old directory names caused a second, separate `tsc` failure after the rename —
+  cleared by deleting `.next` before re-checking, not by chasing the stale error.
+
+### 20.5 A real, pre-existing multi-tenancy data-integrity bug, found via live verification and fixed
+
+Live browser verification of the new panel against the real dev stack found `POST .../define`
+returning 400 for the seeded Core (HP) Compressor subsystem — not a bug in this pass's own new
+code, but a real, **pre-existing** defect in `apps/api/src/store/postgres.rs`'s `element_bodies`
+table, exposed because this pass was the first to define a design space from real (not synthetic)
+seeded content on a fresh project, live, against the actual shared dev database.
+
+- **The bug**: `element_bodies` had `element_id TEXT PRIMARY KEY` — not composite with
+  `project_id`, even though a `project_id` column existed and every read query correctly filtered
+  by both. The table's own original comment reasoned this was safe: "ids are either fixture-
+  seeded-once-per-project or freshly minted UUIDs, so a cross-project collision is not a real risk
+  in practice." **That assumption was false, confirmed directly**: `seed_turbofan_ref` always uses
+  the exact same fixed literal ids (`"CoreHpStagesParam"`, `"REQ-THRUST"`, etc.), and
+  `upsert_body`/`upsert_position`'s own `ON CONFLICT (element_id) DO UPDATE SET project_id =
+  EXCLUDED.project_id, ...` meant the *second* project ever seeded with those ids silently stole
+  every row from the *first* — its `project_id` got overwritten right along with its body. Traced
+  end to end in the live dev database: a freshly-seeded "Turbofan Reference" project had 49 real
+  `element_bodies` rows at one timestamp; an unrelated `#[ignore]`d integration test ran against
+  the same shared Postgres two minutes later, called the identical seed function against a new
+  throwaway project, and every one of those 49 rows silently changed owner — the original project
+  was left with zero, with no error anywhere.
+- **Why the existing test suite never caught it**: `projects_are_isolated` — the one test whose
+  entire purpose is proving cross-project isolation — only ever exercised the Neo4j store
+  (`upsert_element`/`list_elements`, both always correctly scoped by `(id, project_id)`). It never
+  touched `PostgresStore` at all, so the one store that actually had the bug was never under test.
+- **Fixed for real**: `element_bodies`' primary key migrated to `(project_id, element_id)`
+  (`ALTER TABLE ... DROP CONSTRAINT` + `ADD CONSTRAINT`, safe to run unconditionally on every
+  startup — no dedup step needed, since by construction at most one row could ever exist per
+  `element_id` before this fix, which is exactly the bug); both `ON CONFLICT` targets in
+  `upsert_body`/`upsert_position` corrected to match. `projects_are_isolated` extended with a real
+  regression case: the same element id seeded into two different projects via `upsert_body`, each
+  asserted to keep its own independent body afterward — this is the test that would have caught
+  the bug originally, and now guards against it recurring.
+- **Real data recovery, not just a schema fix**: the shared dev Postgres's `projects`/`branches`/
+  `commits`/`audit_log`/`element_bodies`/etc. tables were cleared and the host `api` process
+  restarted so `ensure_seeded()` recreated a single, fully-populated Turbofan Reference project
+  under the fixed schema — confirmed via direct Postgres query (50/50 `element_bodies` rows) and by
+  re-running the full `--ignored` suite twice more afterward, confirming the fresh project's rows
+  survive real concurrent-ish seeding activity that would have destroyed them under the old schema.
+  This bulk-delete of shared dev-only state was explicitly confirmed with the user before running,
+  since it touched the whole shared database, not just this pass's own data.
+
+### 20.6 Verification
+
+- `cargo test -p cem-core`: 12/12 passing, no Docker/DB needed.
+- `apps/api --ignored` (host, real sidecars): **67/67 passing** (63 prior + 4 new), zero
+  regressions — re-run three more times after the §20.5 schema fix (once right after the migration,
+  twice more after the final dev-DB reseed), each time confirming the freshly-seeded Turbofan
+  Reference project's `element_bodies` rows survive intact. (Three unrelated `fuml-runtime`
+  failures surfaced mid-pass from a long-running sidecar container accumulating gRPC state across
+  this whole session's many prior test runs — confirmed environmental, not caused by this pass, by
+  restarting just that one container and re-running: clean immediately after.)
+- `cargo build/clippy/fmt --workspace`: clean throughout, including after the §20.5 schema fix.
+- `pnpm --filter @axioma/web exec tsc --noEmit` / Biome / `next build`: clean.
+- Live browser verification of the new panel against the real running dev stack (Turbofan-Ref
+  project `1d092f7b-4137-4b71-b6f3-19f9e30fa0f7`, created fresh after the §20.5 fix): **four**
+  verification passes total. The first two surfaced the two real bugs in §20.5 (a missing-rows
+  data desync, then the actual root-cause schema bug). The third, after both were fixed, confirmed
+  the define/decode flow end to end for real: subsystem dropdown populated with real names;
+  `CoreHpCompressor` define returned a real handle and `design variables: 2 · declared: 6 ·
+  valid: 6 · imputation ratio: 1.000`, with exactly the three honestly-expected skips
+  (`CoreEquivalentSpeedParam`/`CoreEquivalentWeightFlowParam`/`OprCoreParam`) and nothing else;
+  `TurbineHpLp` define's skip list correctly included the genuinely-unencodable `MixedNozzle ->
+  FanBypassDuctExitPort` edge; decode returned a real, non-empty design vector. That same pass
+  also caught the `choices`-always-empty gap documented in §20.2 — confirmed via direct `curl`
+  after the fix: `POST .../define` then `POST .../decode` on the real running host API returned
+  `"choices":[{"choiceId":"BleedOfftakeStage","presentOption":"Stage 3"}]`, not `[]`.

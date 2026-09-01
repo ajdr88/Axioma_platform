@@ -46,10 +46,7 @@ impl PostgresStore {
         .context("adding canvas_y column")?;
 
         // Multi-project support (roadmap versioning work) — same ad hoc `ALTER ... IF NOT
-        // EXISTS` upgrade path as canvas_x/canvas_y above. `element_id` stays the primary key
-        // (ids are either fixture-seeded-once-per-project or freshly minted UUIDs, so a
-        // cross-project collision is not a real risk in practice) — `project_id` is an indexed
-        // filter column, not part of a composite key.
+        // EXISTS` upgrade path as canvas_x/canvas_y above.
         sqlx::query("ALTER TABLE element_bodies ADD COLUMN IF NOT EXISTS project_id TEXT")
             .execute(&pool)
             .await
@@ -61,6 +58,42 @@ impl PostgresStore {
         .execute(&pool)
         .await
         .context("indexing project_id column")?;
+
+        // FR-ARCH-01…06 real build-out pass — a real, confirmed multi-tenancy bug found via live
+        // browser verification, not assumed: the original design (comment above, until this fix)
+        // kept `element_id` alone as the primary key, reasoning "ids are either fixture-seeded-
+        // once-per-project or freshly minted UUIDs, so a cross-project collision is not a real
+        // risk in practice." That assumption is false — `seed_turbofan_ref` uses the exact same
+        // fixed literal ids (`"CoreHpStagesParam"`, `"REQ-THRUST"`, etc.) every time it seeds any
+        // project, and `upsert_body`/`upsert_position`'s own `ON CONFLICT (element_id)` target
+        // meant the *second* project ever seeded with those ids silently stole every row from the
+        // *first* (`project_id` got overwritten along with the body) — confirmed directly this way
+        // in the live dev database: seeding a second Turbofan-Ref-shaped project reassigned all 49
+        // of the first project's `element_bodies` rows to itself, leaving the first with zero.
+        // `element_id` alone staying globally unique was never actually enforced by any invariant
+        // in this codebase — it was just true by accident until two projects genuinely collided.
+        // Migrated to a composite primary key; safe to run unconditionally on every startup (no
+        // dedup step needed — by construction, at most one row can exist per `element_id` today,
+        // which is exactly this bug, so `(project_id, element_id)` is trivially already unique).
+        sqlx::query("UPDATE element_bodies SET project_id = '' WHERE project_id IS NULL")
+            .execute(&pool)
+            .await
+            .context("backfilling null project_id before making it part of the primary key")?;
+        sqlx::query("ALTER TABLE element_bodies ALTER COLUMN project_id SET NOT NULL")
+            .execute(&pool)
+            .await
+            .context("making project_id NOT NULL")?;
+        sqlx::query("ALTER TABLE element_bodies DROP CONSTRAINT IF EXISTS element_bodies_pkey")
+            .execute(&pool)
+            .await
+            .context("dropping the single-column element_bodies primary key")?;
+        sqlx::query(
+            "ALTER TABLE element_bodies ADD CONSTRAINT element_bodies_pkey \
+             PRIMARY KEY (project_id, element_id)",
+        )
+        .execute(&pool)
+        .await
+        .context("adding the composite element_bodies primary key")?;
 
         // docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-CORE-10/11) — a Dynamic Query's definition
         // (root/depth/maxFanout/direction, the exact shape `traceability::run_traversal` already
@@ -155,8 +188,7 @@ impl PostgresStore {
         });
         sqlx::query(
             "INSERT INTO element_bodies (element_id, project_id, body) VALUES ($1, $2, $3) \
-             ON CONFLICT (element_id) DO UPDATE SET project_id = EXCLUDED.project_id, \
-             body = EXCLUDED.body",
+             ON CONFLICT (project_id, element_id) DO UPDATE SET body = EXCLUDED.body",
         )
         .bind(&body.element_id)
         .bind(project_id)
@@ -211,7 +243,7 @@ impl PostgresStore {
         sqlx::query(
             "INSERT INTO element_bodies (element_id, project_id, body, canvas_x, canvas_y) \
              VALUES ($1, $2, '{}'::jsonb, $3, $4) \
-             ON CONFLICT (element_id) DO UPDATE SET project_id = EXCLUDED.project_id, \
+             ON CONFLICT (project_id, element_id) DO UPDATE SET \
              canvas_x = EXCLUDED.canvas_x, canvas_y = EXCLUDED.canvas_y",
         )
         .bind(element_id)

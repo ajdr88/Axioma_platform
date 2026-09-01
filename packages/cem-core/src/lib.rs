@@ -23,6 +23,8 @@
 
 use std::collections::HashMap;
 
+pub mod archspace;
+
 /// This crate's own version, exposed so callers (`apps/api`'s `mode_b.rs`) can record which
 /// `cem-core` produced a given accepted candidate as part of its generation provenance — the
 /// deterministic-optimizer equivalent of an LLM call's `modelVersion` (FR-CEM-05's own precedent).

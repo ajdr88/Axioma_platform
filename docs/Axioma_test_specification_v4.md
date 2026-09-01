@@ -401,7 +401,10 @@ anything.
 distinct from fUML Actions (FR-CORE-04) — no kind confusion.
 **FAIL:** Missing kinds, or Functions/Actions conflated.
 **Landed status:** built and covered —
-`seed_turbofan_ref_lands_fr_arch_system_model_across_all_five_subsystems`.
+`seed_turbofan_ref_lands_fr_arch_system_model_across_all_five_subsystems`. FR-ARCH-01…06 real
+build-out pass: these kinds were already user-creatable via the existing generic element API (no
+special restriction on `NodeKind::Function`/`SelectionChoice`/`ConnectionChoice`); no additional
+work was needed for that half of this requirement.
 
 ### T-ARCH-02 — Selection choice modeling, including cyclic derivation
 **Verifies:** FR-ARCH-02
@@ -416,7 +419,11 @@ scoped to its owning subsystem" links, not a genuine cyclic mutual-dependency gr
 code's own comment says a real DSG's option-derivation graph is "out of scope for this static
 seed." `ArchDerives` is cycle-permitted by schema (confirmed in `sysml-core`), so a real cyclic
 example is representable whenever real Mode B design-space content needs one — just not
-constructed by today's fixture.
+constructed by today's fixture. **Still true after the FR-ARCH-01…06 real build-out pass** — that
+pass added real *resolution* (`PATCH .../cem/archspace/choices/:id/resolve`,
+`resolve_choice_transitions_state_and_enforces_incompatibility_and_linked_constraints`) and
+constraint *enforcement* (FR-ARCH-04, see T-ARCH-04), but did not touch `ArchDerives`'s own seeded
+shape — cyclic derivation remains unbuilt, unchanged from before.
 
 ### T-ARCH-03 — Connection choice modeling, cardinality rules
 **Verifies:** FR-ARCH-03
@@ -426,10 +433,15 @@ cardinality.
 **PASS:** Cardinality (list/range/lower-bound-only) is a real, enforced rule — a violating
 connection is rejected.
 **FAIL:** Cardinality accepted as a descriptive label only, never checked.
-**Landed status:** **not built** — `ConnectionChoice` nodes are real and seeded, and each carries a
-`cardinality` field, but it's confirmed (by direct code reading — no `cardinality` reference exists
-outside that one descriptive seed string anywhere in `sysml-core`/`apps/api`) to be plain
-descriptive text, never a computed/enforced rule. Flagged here, not invented around.
+**Landed status:** **partially built after the FR-ARCH-01…06 real build-out pass.** The
+requirement's own "resolved after selection choices" ordering is now real and enforced:
+`resolve_choice`'s `:ConnectionChoice` branch rejects (400) resolving a connection choice before
+every `SelectionChoice` its properties reference (`sourceSelectionChoiceId`/
+`targetSelectionChoiceId`) is itself resolved. The `cardinality` field itself is still confirmed
+(by direct code reading — no reference to it exists outside that one descriptive seed string
+anywhere in `sysml-core`/`apps/api`) to be plain descriptive text, never a computed/enforced rule —
+list/range/lower-bound-only cardinality checking specifically remains **not built**, flagged here,
+not invented around.
 
 ### T-ARCH-04 — Incompatibility & choice constraints
 **Verifies:** FR-ARCH-04
@@ -441,7 +453,14 @@ claim in a comment.
 **FAIL:** Edges absent, or a `ChoiceConstraint`'s type unpersisted/undistinguishable from a bare
 edge with no type at all.
 **Landed status:** built and covered — same fixture/tests as T-COMP-04 above (the `ChoiceConstraint`
-metadata fix in this pass closes what was previously a real, flagged gap here too).
+metadata fix in this pass closes what was previously a real, flagged gap here too). **The
+FR-ARCH-01…06 real build-out pass additionally adds real enforcement**, not just storage: resolving
+a `SelectionChoice` now rejects (400) if it would conflict with an already-resolved
+`IncompatibleWith`-linked element, or violate an already-resolved `LINKED` `ChoiceConstraint` — see
+`resolve_choice_rejects_a_resolution_conflicting_with_an_incompatible_choice` (a self-contained
+fixture; the real seeded `IncompatibleWith` edge targets a `:Port`, which never resolves, so it
+can't itself exercise the rejection path — a real, honestly-noted schema limitation, not a gap in
+the enforcement logic itself).
 
 ### T-ARCH-05 — Design vector encode/decode
 **Verifies:** FR-ARCH-05
@@ -452,7 +471,11 @@ instance, over the real gRPC boundary.
 **FAIL:** Round-trip loses information or the sidecar isn't actually exercised (a mocked result).
 **Landed status:** built and covered — `archspace_design_space_round_trips_through_the_sidecar`
 (`#[ignore]`d, requires the `cem-archspace` sidecar running) exercises this over the real gRPC
-wire against the Dockerized service, not a mock.
+wire against the Dockerized service, not a mock. **The FR-ARCH-01…06 real build-out pass adds the
+missing HTTP-layer half**: `POST .../cem/archspace/:subsystemId/define` +
+`POST .../cem/archspace/:handleId/decode` encode/decode *real seeded graph content* (not just the
+spike's own synthetic fixture) via a new `cem_core::archspace` module — see
+`define_design_space_from_real_seeded_core_hp_compressor_subsystem_round_trips_through_the_sidecar`.
 
 ### T-ARCH-06 — Design-space health metrics
 **Verifies:** FR-ARCH-06
@@ -464,7 +487,11 @@ or `0.0` as a stub).
 **FAIL:** Placeholder/stub values, or metrics only available after a full optimization run
 completes (defeating their "before an expensive run" purpose).
 **Landed status:** built and covered — same test as T-ARCH-05; a real Imputation Ratio (`1.333` on
-the spike's own test problem, per impl v5 §10) comes back from the real sidecar.
+the spike's own test problem, per impl v5 §10) comes back from the real sidecar. The FR-ARCH-01…06
+real build-out pass bundles this into the same `/define` HTTP call that builds the design space
+(one round trip, not a second user action) — real, non-zero `nDeclared`/`nValid`/
+`imputationRatio` confirmed against the real seeded Core (HP) Compressor subsystem, not just the
+spike's synthetic problem.
 
 ### T-ARCH-07 — Architecture instance generation & comparison
 **Verifies:** FR-ARCH-07
@@ -870,7 +897,7 @@ build-out pass, not this one.
 | NFR-COMP-01/02/03/05 | T-X-07 |
 | NFR-COMP-04 | T-P1.1-05 |
 
-**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` now has at least one test-spec row, including FR-COMP-01…06 and FR-ARCH-01…08 (authored in the scope-downs pass, §§ above) — though several of those rows document a genuinely **not-built** PASS criterion rather than a passing test (T-COMP-03/06, T-ARCH-02/03/07/08 each say so explicitly in their own "Landed status" line; not silently marked green). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
+**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` now has at least one test-spec row, including FR-COMP-01…06 and FR-ARCH-01…08 (authored in the scope-downs pass, §§ above; FR-ARCH-01…06 then given a real HTTP-layer/resolution build-out in a follow-up pass, impl v5 §20) — though several of those rows document a genuinely **not-built** PASS criterion rather than a passing test (T-COMP-03/06, T-ARCH-02/07/08 fully so; T-ARCH-03 partially — its ordering half is now real, its cardinality-enforcement half isn't — each says so explicitly in its own "Landed status" line; not silently marked green). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
 
 ## Phase 6 landed status **[REV-D]**
 

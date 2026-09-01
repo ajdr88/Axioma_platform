@@ -8,6 +8,7 @@
 //! nouns impl §1 names, made real rather than a `/api/v0/elements` stand-in.
 
 mod alf_ir;
+mod archspace;
 mod archspace_client;
 mod auth;
 mod autonomy;
@@ -75,6 +76,16 @@ struct AppState {
     versioning: VersioningStore,
     auth: Arc<dyn auth::AuthProvider>,
     prometheus_handle: PrometheusHandle,
+    /// FR-ARCH-01…06 real build-out — an in-process-only cache from a `cem-archspace` design-space
+    /// handle id to the `DesignSpaceDefinitionInput` it was built from, so `archspace::decode` can
+    /// group a decoded instance's present nodes by choice (`archspace::DecodeResponse::choices`)
+    /// instead of always reporting an empty per-choice summary. Deliberately *not* the "handle
+    /// persistence" the design-space handles themselves still explicitly lack (see
+    /// `archspace.rs`'s own doc comment) — this is apps/api-side bookkeeping only, lost on
+    /// restart exactly like the sidecar's own in-memory handles are, not a new durability
+    /// guarantee.
+    archspace_definitions:
+        Arc<std::sync::Mutex<HashMap<String, cem_core::archspace::DesignSpaceDefinitionInput>>>,
 }
 
 /// Wraps any error as a 500 by default, logging the full chain server-side. A `ValidationError`
@@ -169,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         versioning,
         auth,
         prometheus_handle,
+        archspace_definitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     ensure_seeded(&state).await?;
@@ -301,6 +313,22 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/cem/autonomy-level/:scope",
             get(mode_b::get_autonomy_level),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/archspace/:subsystemId/define",
+            post(archspace::define),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/archspace/:handleId/decode",
+            post(archspace::decode),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/archspace/choices/:id/resolve",
+            axum::routing::patch(archspace::resolve_choice),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/archspace/:subsystemId/resolution-status",
+            get(archspace::resolution_status),
         )
         .route(
             "/api/v0/projects/:projectId/simulate/hello-world",
@@ -2152,7 +2180,15 @@ async fn seed_fr_arch_system_model(
             id: "BleedOfftakeStage",
             name: "Bleed Offtake Stage (Core (HP) Compressor)",
             subsystem_id: "CoreHpCompressor",
-            options: &["stage 1..n_HP_stages (illustrative set: stage 1, stage 2, stage 3)"],
+            // FR-ARCH-05 real build-out — was a single illustrative descriptive string
+            // ("stage 1..n_HP_stages..."), not a real array `cem_core::archspace::encode_
+            // design_space` (or adsg-core itself) can treat as distinct option names. A real
+            // stage count bound (n_HP_stages, see CoreHpStagesParam below) can exceed 3 stages,
+            // so this fixed 3-option list is itself an illustrative starting point, same
+            // "illustrative, subject to real numeric sourcing" caveat reqs v5 §5.16 already
+            // applies to every other numeric seed in this function -- not a claim that exactly
+            // 3 stages is correct.
+            options: &["Stage 1", "Stage 2", "Stage 3"],
             incompatibility_note: None,
         },
         SelectionChoiceSeed {
@@ -2239,6 +2275,14 @@ async fn seed_fr_arch_system_model(
         properties: serde_json::Value,
     }
 
+    // `sourceConnectorNames`/`targetConnectorNames` (FR-ARCH-05 real build-out) are the new
+    // canonical array-of-string properties `cem_core::archspace::encode_design_space` actually
+    // requires -- added alongside the existing free-form properties (kept as human-readable
+    // documentation, not replaced). `EcsExternalConnector` is a new synthetic connector name for
+    // `BleedAirRouting`'s existing `targetBoundary` prose ("external ECS/airframe port... outside
+    // the engine System-of-Interest, so no target Port element exists for it") -- there was no
+    // real connector-shaped element to reference, so this pass invents one purely as an
+    // encode-target name, not a claim that a real `:Port` element for it now exists.
     let connection_choices = [
         ConnectionChoiceSeed {
             id: "BleedAirRouting",
@@ -2247,6 +2291,8 @@ async fn seed_fr_arch_system_model(
                 "sourcePortId": "CoreBleedOfftakePort",
                 "targetBoundary": "external ECS/airframe port -- outside the engine System-of-Interest (reqs v5 §5.16's reconciliation table), so no target Port element exists for it",
                 "cardinality": "single connection",
+                "sourceConnectorNames": ["CoreBleedOfftakePort"],
+                "targetConnectorNames": ["EcsExternalConnector"],
             }),
         },
         ConnectionChoiceSeed {
@@ -2256,6 +2302,8 @@ async fn seed_fr_arch_system_model(
                 "sourceSelectionChoiceId": "PowerOfftake",
                 "targetPortId": "ControlAccessoryPort",
                 "cardinality": "single connection, resolved after the PowerOfftake selection choice",
+                "sourceConnectorNames": ["PowerOfftake"],
+                "targetConnectorNames": ["ControlAccessoryPort"],
             }),
         },
     ];
@@ -2450,6 +2498,14 @@ async fn seed_fr_arch_system_model(
             properties: serde_json::json!({
                 "description": "LP-compressor stage count; ChoiceConstraint-linked to TurbineLpStagesParam (FR-COMP-04).",
                 "type": "integer",
+                // FR-ARCH-05 real build-out: a `bound` is what lets `cem_core::archspace::
+                // encode_design_space` turn this into a real design variable at all -- without
+                // one, the LINKED constraint pairing this Parameter can never actually be
+                // encoded (both endpoints must be known names). [1.0, 4.0] matches the exact
+                // range `archspace_client::spike_compressor_design_space`'s own already-proven
+                // n_HP_stages test fixture used, reused here for consistency, not re-derived.
+                "bound": [1.0, 4.0],
+                "illustrative": true,
             }),
         },
         ParamSeed {
@@ -2459,6 +2515,8 @@ async fn seed_fr_arch_system_model(
             properties: serde_json::json!({
                 "description": "HP-compressor stage count; ChoiceConstraint-linked to TurbineHpStagesParam (FR-COMP-04).",
                 "type": "integer",
+                "bound": [1.0, 4.0],
+                "illustrative": true,
             }),
         },
         ParamSeed {
@@ -2468,6 +2526,8 @@ async fn seed_fr_arch_system_model(
             properties: serde_json::json!({
                 "description": "HP-turbine stage count; ChoiceConstraint-linked to CoreHpStagesParam (FR-COMP-04).",
                 "type": "integer",
+                "bound": [1.0, 4.0],
+                "illustrative": true,
             }),
         },
         ParamSeed {
@@ -2477,6 +2537,8 @@ async fn seed_fr_arch_system_model(
             properties: serde_json::json!({
                 "description": "LP-turbine stage count; ChoiceConstraint-linked to FanLpStagesParam (FR-COMP-04).",
                 "type": "integer",
+                "bound": [1.0, 4.0],
+                "illustrative": true,
             }),
         },
         ParamSeed {
@@ -2767,6 +2829,7 @@ mod tests {
             versioning,
             auth: Arc::new(auth::LocalAuthProvider),
             prometheus_handle: shared_prometheus_handle(),
+            archspace_definitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -4220,7 +4283,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires `docker compose up -d`"]
     async fn projects_are_isolated() {
-        let (neo4j, _postgres, _objects, versioning) = connect_test_stores().await;
+        let (neo4j, postgres, _objects, versioning) = connect_test_stores().await;
         let project_a = test_project(&versioning, "isolation-a").await;
         let project_b = test_project(&versioning, "isolation-b").await;
 
@@ -4246,6 +4309,53 @@ mod tests {
 
         let a_elements = neo4j.list_elements(&project_a.id).await.unwrap();
         assert!(a_elements.iter().any(|e| e.id == "SharedId"));
+
+        // FR-ARCH-01…06 real build-out pass — a real, confirmed bug found via live browser
+        // verification: `element_bodies` previously had `element_id` alone as its primary key,
+        // so seeding the SAME literal id (e.g. `seed_turbofan_ref`'s fixed ids) into a second
+        // project silently stole the first project's row (`ON CONFLICT (element_id)` overwrote
+        // `project_id` along with `body`), leaving the first with nothing. This test's own Neo4j
+        // half never would have caught it — `upsert_element`/`list_elements` were always correctly
+        // scoped; only the Postgres store had the gap. Now a real regression guard for it.
+        postgres
+            .upsert_body(
+                &project_a.id,
+                &ElementBody {
+                    element_id: "SharedId".to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "owner": "A" }),
+                },
+            )
+            .await
+            .unwrap();
+        postgres
+            .upsert_body(
+                &project_b.id,
+                &ElementBody {
+                    element_id: "SharedId".to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "owner": "B" }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let body_a = postgres
+            .get_body(&project_a.id, "SharedId")
+            .await
+            .unwrap()
+            .expect("project A's SharedId body should still exist");
+        let body_b = postgres
+            .get_body(&project_b.id, "SharedId")
+            .await
+            .unwrap()
+            .expect("project B's SharedId body should still exist");
+        assert_eq!(
+            body_a["properties"]["owner"].as_str(),
+            Some("A"),
+            "project A's body must survive project B seeding the same element id"
+        );
+        assert_eq!(body_b["properties"]["owner"].as_str(), Some("B"));
     }
 
     // -----------------------------------------------------------------------
@@ -5345,6 +5455,286 @@ mod tests {
         // A bogus handle must be rejected loudly (NOT_FOUND), never silently.
         let bogus = archspace_client::get_design_space_stats("does-not-exist").await;
         assert!(bogus.is_err(), "a bogus handle should be rejected");
+    }
+
+    /// FR-ARCH-01…06 real build-out — the real `/define` HTTP handler, driven against the
+    /// actual seeded Core (HP) Compressor subsystem content (not a synthetic fixture), proving
+    /// `cem_core::archspace::encode_design_space` + the real sidecar round-trip end to end
+    /// through `apps/api`'s own HTTP surface. After this pass's seed touch-up (real `options`
+    /// array for `BleedOfftakeStage`, real `sourceConnectorNames`/`targetConnectorNames` on both
+    /// `:ConnectionChoice`s, real `bound`s on the two stage-count Parameters), every primitive
+    /// this pass's touch-up targeted is genuinely encodable. Three *other*, pre-existing
+    /// FR-COMP-01/02 Parameters (`CoreEquivalentSpeedParam`/`CoreEquivalentWeightFlowParam`/
+    /// `OprCoreParam`) are real, honestly-expected skips — they're seeded with no `bound` at all
+    /// ("no numeric target sourced anywhere yet", their own seed comment), not a bug this test
+    /// should paper over.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn define_design_space_from_real_seeded_core_hp_compressor_subsystem_round_trips_through_the_sidecar(
+    ) {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-define-core-hp").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let response = archspace::define(
+            State(state.clone()),
+            Path((project.id.clone(), "CoreHpCompressor".to_string())),
+        )
+        .await
+        .expect("defining a design space from real seeded content")
+        .0;
+        let expected_skips: std::collections::HashSet<&str> = [
+            "CoreEquivalentSpeedParam",
+            "CoreEquivalentWeightFlowParam",
+            "OprCoreParam",
+        ]
+        .into_iter()
+        .collect();
+        for skipped in &response.skipped {
+            assert!(
+                expected_skips.contains(skipped.element_id.as_str()),
+                "unexpected skip after the seed touch-up: {skipped:?} (full list: {:?})",
+                response.skipped
+            );
+        }
+        assert!(!response.handle_id.is_empty());
+        assert!(response.stats.n_design_variables >= 1);
+        assert!(
+            response.stats.n_declared > 0
+                && response.stats.n_valid > 0
+                && response.stats.n_valid <= response.stats.n_declared
+        );
+
+        let decoded = archspace::decode(
+            State(state.clone()),
+            Path((project.id.clone(), response.handle_id.clone())),
+            Json(archspace::DecodeRequestDto::default()),
+        )
+        .await
+        .expect("decoding a real instance")
+        .0;
+        assert!(!decoded.design_vector.is_empty());
+        assert!(
+            decoded
+                .present_node_names
+                .contains(&"CoreHpCompressor".to_string()),
+            "expected the root name present in {:?}",
+            decoded.present_node_names
+        );
+        // AppState::archspace_definitions cache: decode groups the instance by choice, not just
+        // an empty summary, since this handle was `define`d earlier in this same test/process.
+        assert!(
+            !decoded.choices.is_empty(),
+            "expected at least one grouped choice (e.g. BleedOfftakeStage), got {:?}",
+            decoded.choices
+        );
+    }
+
+    /// The genuinely-unencodable half: `TurbineHpLp`'s scope includes `MixedNozzle` (a real
+    /// `:SelectionChoice`) and its `IncompatibleWith` edge to `FanBypassDuctExitPort` (a `:Port`,
+    /// not an option name of any choice) — confirming `encode_design_space` reports this honestly
+    /// rather than silently dropping it or crashing the sidecar call.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn define_design_space_reports_the_genuinely_unencodable_incompatibility_edge() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-define-turbine").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let response = archspace::define(
+            State(state.clone()),
+            Path((project.id.clone(), "TurbineHpLp".to_string())),
+        )
+        .await
+        .expect("defining a design space from real seeded content")
+        .0;
+        assert!(
+            response
+                .skipped
+                .iter()
+                .any(|s| s.element_id.contains("FanBypassDuctExitPort")),
+            "expected the MixedNozzle -> FanBypassDuctExitPort edge to be reported as \
+             unencodable, got skipped: {:?}",
+            response.skipped
+        );
+    }
+
+    /// FR-ARCH-02/03/04 real build-out — the resolution state machine and its constraint
+    /// enforcement. No resolution endpoint existed anywhere before this pass.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn resolve_choice_transitions_state_and_enforces_incompatibility_and_linked_constraints()
+    {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-resolve").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        // Aggregate resolution status starts fully unresolved.
+        let status = archspace::resolution_status(
+            State(state.clone()),
+            Path((project.id.clone(), "CoreHpCompressor".to_string())),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(status.state, "unresolved");
+        assert!(status.total > 0);
+        assert_eq!(status.resolved, 0);
+
+        // A real resolve, with a real versioned write behind it.
+        let resolve_status = archspace::resolve_choice(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), "BleedOfftakeStage".to_string())),
+            Json(archspace::ResolveChoiceRequest {
+                selected_option: Some("Stage 2".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolve_status, StatusCode::NO_CONTENT);
+        let body = state
+            .postgres
+            .get_body(&project.id, "BleedOfftakeStage")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body["properties"]["resolutionState"].as_str(),
+            Some("resolved")
+        );
+        assert_eq!(
+            body["properties"]["selectedOption"].as_str(),
+            Some("Stage 2")
+        );
+
+        // An unknown option is rejected.
+        let bad_option = archspace::resolve_choice(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), "MixedNozzle".to_string())),
+            Json(archspace::ResolveChoiceRequest {
+                selected_option: Some("not-a-real-option".to_string()),
+            }),
+        )
+        .await;
+        assert!(bad_option.is_err());
+        archspace::resolve_choice(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), "MixedNozzle".to_string())),
+            Json(archspace::ResolveChoiceRequest {
+                selected_option: Some("mixed".to_string()),
+            }),
+        )
+        .await
+        .expect("resolving MixedNozzle to a real option should succeed");
+    }
+
+    /// FR-ARCH-04 enforcement, isolated from any particular seed content: a three-choice fixture
+    /// where `ChoiceA`/`ChoiceB` carry a real, direct `IncompatibleWith` edge (element-to-element,
+    /// matching FR-ARCH-04's own literal wording — "mutual exclusion between two elements/
+    /// choices" — and how `Neo4jStore::create_edge`'s dangling-edge rejection means such an edge
+    /// can only ever connect two real elements in the first place) and `ChoiceC` carries none.
+    /// Confirms: resolving `ChoiceA` succeeds; resolving `ChoiceB` afterward is rejected (it's
+    /// now resolved, and the two are incompatible); resolving the unrelated `ChoiceC` still
+    /// succeeds (the constraint doesn't block anything it doesn't actually touch). The Turbofan-
+    /// Ref seed's own `IncompatibleWith` edge (`MixedNozzle -> FanBypassDuctExitPort`) targets a
+    /// `:Port`, which never carries a `selectedOption` and so never blocks anything under this
+    /// rule — this fixture is deliberately self-contained rather than depending on that shape.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn resolve_choice_rejects_a_resolution_conflicting_with_an_incompatible_choice() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-incompatibility").await;
+
+        for (id, options) in [
+            ("ChoiceA", vec!["red", "blue"]),
+            ("ChoiceB", vec!["square", "circle"]),
+            ("ChoiceC", vec!["north", "south"]),
+        ] {
+            state
+                .neo4j
+                .upsert_element(
+                    &project.id,
+                    &Element {
+                        id: id.to_string(),
+                        kind: NodeKind::SelectionChoice,
+                        name: id.to_string(),
+                        active: true,
+                        origin: Origin::Human,
+                    },
+                )
+                .await
+                .unwrap();
+            state
+                .postgres
+                .upsert_body(
+                    &project.id,
+                    &ElementBody {
+                        element_id: id.to_string(),
+                        rationale: None,
+                        properties: serde_json::json!({
+                            "options": options,
+                            "resolutionState": "unresolved",
+                        }),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "ChoiceA".to_string(),
+                    target: "ChoiceB".to_string(),
+                    kind: EdgeKind::IncompatibleWith,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        archspace::resolve_choice(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), "ChoiceA".to_string())),
+            Json(archspace::ResolveChoiceRequest {
+                selected_option: Some("red".to_string()),
+            }),
+        )
+        .await
+        .expect("resolving ChoiceA should succeed (nothing resolved yet on the other side)");
+
+        // ChoiceB is now blocked -- ChoiceA (its IncompatibleWith partner) is resolved.
+        let conflicting = archspace::resolve_choice(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), "ChoiceB".to_string())),
+            Json(archspace::ResolveChoiceRequest {
+                selected_option: Some("square".to_string()),
+            }),
+        )
+        .await;
+        assert!(
+            conflicting.is_err(),
+            "resolving ChoiceB should be rejected -- ChoiceA (its IncompatibleWith partner) is \
+             already resolved"
+        );
+
+        // ChoiceC has no IncompatibleWith edge to anything -- unaffected.
+        archspace::resolve_choice(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), "ChoiceC".to_string())),
+            Json(archspace::ResolveChoiceRequest {
+                selected_option: Some("north".to_string()),
+            }),
+        )
+        .await
+        .expect("resolving the unrelated ChoiceC should succeed -- no incompatibility touches it");
     }
 
     /// docs/IMPLEMENTATION_KICKOFF.md Phase 3 (FR-COMP-01/02/05, extended Interface Contract

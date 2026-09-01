@@ -255,10 +255,17 @@ dependency, lowest urgency of the merged groups.*
    architecture design-space representation — what it actually searches over, reqs §5.17).
    **ADR-011 is now ratified**: `packages/cem-archspace/` (Python gRPC sidecar, `adsg-core` +
    `SBArchOpt`, MIT-licensed) is built and verified end-to-end — see its README and impl v5 §10.
-   FR-ARCH-01…06 (wiring it into a real `apps/api` HTTP surface + `cem-core`'s own encode/decode
-   logic) and FR-COMP-01…06 (compressor requirements) still belong in this phase's real build-out.
-   **Don't assume the Mo 7–9 window absorbs that unchanged just because the spike is done** — the
-   spike de-risked *whether* the approach works, not *how long* the real build takes.
+   **FR-ARCH-01…06's real build-out is now done** — see impl v5 §20: a real `cem_core::archspace`
+   encode/decode module, a real `apps/api` HTTP surface (`/cem/archspace/:subsystemId/define`,
+   `/cem/archspace/:handleId/decode`, bundling FR-ARCH-06's health stats into the same round trip),
+   a real resolution state machine with FR-ARCH-04 enforcement
+   (`PATCH /cem/archspace/choices/:id/resolve`), and a minimal frontend panel — proven against the
+   real seeded Turbofan-Ref content, not just the Phase 2 spike's synthetic fixture.
+   FR-ARCH-02/03's cyclic-derivation/cardinality-enforcement halves and FR-ARCH-07/08 remain
+   explicitly open (see impl v5 §20's own scope note). FR-COMP-01…06 (compressor requirements) is
+   the next requested pass — **don't assume the Mo 7–9 window absorbs that unchanged just because
+   the spike is done** — the spike de-risked *whether* the approach works, not *how long* the real
+   build takes.
 6. **P2.2 Contract + Autonomy + Review (Mo 9–10):** proposal/branch workflow, L0–L4 autonomy.
    *Also here (v5): FR-ARCH-07/08 (architecture instance generation/comparison, non-convergent
    handling) alongside the proposal/branch workflow.*

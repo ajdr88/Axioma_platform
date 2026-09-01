@@ -3,9 +3,12 @@
 //! representation (reqs v5 §5.17, FR-ARCH). Same "thin client module in `apps/api`, not inside a
 //! pure package" convention as `fuml_client.rs` — `cem-core` stays zero-I/O.
 //!
-//! This pass proves the sidecar/gRPC plumbing only (see `packages/cem-archspace/README.md` for
-//! the exact spike scope and real numbers observed) — nothing here is wired into `mode_b.rs`'s
-//! real `optimize`/`propose` flow yet, that's P2.1 proper once ADR-011 is ratified.
+//! The Phase 2 spike proved the sidecar/gRPC plumbing only (see `packages/cem-archspace/
+//! README.md` for the exact spike scope and real numbers observed); `connect`/
+//! `define_design_space`/`get_design_space_stats`/`decode_instance` are now real, non-test
+//! callers via `archspace.rs`'s HTTP handlers (FR-ARCH-01…06's real build-out). `run_optimization`
+//! stays test-only for now — wiring it into a real optimize/propose flow is FR-ARCH-07/08, not
+//! this pass.
 
 use crate::env_or;
 
@@ -24,12 +27,6 @@ use proto::{DecodeRequest, DesignSpaceDefinition, OptimizeRequest};
 
 pub(crate) use proto::{ArchitectureInstance, DesignSpaceStats, OptimizeResult};
 
-/// `#[allow(dead_code)]` on this module's public functions: this pass (docs/IMPLEMENTATION_KICKOFF.md
-/// Phase 2) proves the sidecar/gRPC plumbing via a direct integration test only — nothing here is
-/// wired into `mode_b.rs`'s real `optimize`/`propose` flow yet (P2.1 proper), so the non-test
-/// build genuinely has no caller. Same reasoning `neo4j.rs::bulk_upsert_elements` and
-/// `versioning.rs::list_audit_log` already use for the same shape of "verified, not yet wired in."
-#[allow(dead_code)]
 async fn connect() -> anyhow::Result<CemArchspaceClient<tonic::transport::Channel>> {
     let addr = env_or("ARCHSPACE_ADDR", "http://localhost:50052");
     Ok(CemArchspaceClient::connect(addr).await?)
@@ -39,7 +36,6 @@ async fn connect() -> anyhow::Result<CemArchspaceClient<tonic::transport::Channe
 /// Fails if `adsg-core` itself rejects the definition as infeasible (surfaced by the sidecar as
 /// `INVALID_ARGUMENT`) — propagated here as a plain `anyhow::Error`, same as every other gRPC
 /// call site in this codebase (`fuml_client.rs` does the same, no bespoke error type).
-#[allow(dead_code)]
 pub(crate) async fn define_design_space(
     definition: DesignSpaceDefinition,
 ) -> anyhow::Result<String> {
@@ -48,7 +44,6 @@ pub(crate) async fn define_design_space(
     Ok(handle.id)
 }
 
-#[allow(dead_code)]
 pub(crate) async fn get_design_space_stats(handle_id: &str) -> anyhow::Result<DesignSpaceStats> {
     let mut client = connect().await?;
     let stats = client
@@ -61,7 +56,6 @@ pub(crate) async fn get_design_space_stats(handle_id: &str) -> anyhow::Result<De
 }
 
 /// `design_vector` empty asks the sidecar to sample a random valid vector before decoding.
-#[allow(dead_code)]
 pub(crate) async fn decode_instance(
     handle_id: &str,
     design_vector: Vec<f64>,
