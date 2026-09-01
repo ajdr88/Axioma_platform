@@ -18,27 +18,33 @@
 
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, PartialEq)]
+// Tier 1 pass (item 6, real design-space handle persistence) — every `*Input` type below gained
+// `serde::Serialize`/`Deserialize` so `DesignSpaceDefinitionInput` can round-trip through Postgres
+// JSONB. Pure data-shape derives, no I/O added — this module's own "no I/O, no protobuf" doc
+// comment above is about network/gRPC concerns specifically, not serialization in general
+// (`SelectionChoiceElement.options` below already uses `serde_json::Value`).
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DesignVariableInput {
     pub name: String,
     pub lower_bound: f64,
     pub upper_bound: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SelectionChoiceInput {
     pub choice_id: String,
     pub option_names: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConnectionChoiceInput {
     pub choice_id: String,
     pub source_connector_names: Vec<String>,
     pub target_connector_names: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IncompatibilityConstraintInput {
     pub node_names: Vec<String>,
 }
@@ -46,7 +52,7 @@ pub struct IncompatibilityConstraintInput {
 /// Mirrors `cem_archspace.proto`'s `ChoiceConstraintKind` exactly (see
 /// `apps/api/src/archspace_client.rs`'s own doc comment for where that enum itself was confirmed
 /// against the real `adsg_core.graph.choice_constraints.ChoiceConstraintType`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChoiceConstraintKindInput {
     Linked,
     Permutation,
@@ -54,7 +60,7 @@ pub enum ChoiceConstraintKindInput {
     UnorderedNorepl,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChoiceConstraintInput {
     pub kind: ChoiceConstraintKindInput,
     pub node_names: Vec<String>,
@@ -66,13 +72,13 @@ pub struct ChoiceConstraintInput {
 /// it encodes anything at all, mirroring the sidecar's own spike fixture convention exactly
 /// (`archspace_client::spike_compressor_design_space`'s `Objective { direction: -1, .. }` —
 /// minimize, matching that same precedent, not re-derived).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ObjectiveInput {
     pub name: String,
     pub direction: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DesignSpaceDefinitionInput {
     pub root_name: String,
     pub connector_names: Vec<String>,

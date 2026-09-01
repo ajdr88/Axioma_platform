@@ -14,6 +14,13 @@ interface DesignSpaceStats {
   nDeclared: number;
   nValid: number;
   imputationRatio: number;
+  /** FR-ARCH-06's other three real metrics — absent (not 0) when this design space has no
+   * objective, same "real absence, not a fake zero" precedent as the backend's own DTO. */
+  correctionRatio?: number;
+  discreteCorrectionRatio?: number;
+  continuousCorrectionRatio?: number;
+  correctionFraction?: number;
+  maxRateDiversity?: number;
 }
 
 interface DefineResponse {
@@ -33,6 +40,7 @@ interface DecodeResponse {
   presentNodeNames: string[];
   choices: DecodedChoice[];
   otherPresentNodes: string[];
+  refreshedHandleId?: string;
 }
 
 interface Viability {
@@ -49,10 +57,19 @@ interface GeneratedInstance {
   viability: Viability;
 }
 
+/** Tier 1 pass (item 6) — `refreshedHandleId` is set only when the handle sent in the request had
+ * gone stale (e.g. a sidecar restart) and was transparently recovered server-side; present on
+ * every archspace response that takes a `handleId`, per its own backend DTO. */
+interface GenerateInstancesResponse {
+  instances: GeneratedInstance[];
+  refreshedHandleId?: string;
+}
+
 interface ProposeResponse {
   proposalId: string;
   branchId: string;
   viability: Viability;
+  refreshedHandleId?: string;
 }
 
 interface DerivedExistenceResponse {
@@ -131,6 +148,14 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
     }
   }
 
+  /** Tier 1 pass (item 6) — a stale handle (e.g. a sidecar restart) is transparently recovered
+   * server-side; this keeps the panel's own `defineResult.handleId` pointed at the fresh one so
+   * the *next* call in this session doesn't have to pay the recovery cost again. */
+  function updateHandleIfRefreshed(refreshedHandleId?: string) {
+    if (!refreshedHandleId) return;
+    setDefineResult((prev) => (prev ? { ...prev, handleId: refreshedHandleId } : prev));
+  }
+
   async function handleDecode() {
     if (!defineResult) return;
     setDecoding(true);
@@ -148,7 +173,9 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
         const err = await res.json().catch(() => null);
         throw new Error(err?.error ?? `request failed with status ${res.status}`);
       }
-      setDecodeResult(await res.json());
+      const decoded: DecodeResponse = await res.json();
+      updateHandleIfRefreshed(decoded.refreshedHandleId);
+      setDecodeResult(decoded);
     } catch (err) {
       setDecodeError(err instanceof Error ? err.message : "failed to decode instance");
     } finally {
@@ -175,7 +202,9 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
         const err = await res.json().catch(() => null);
         throw new Error(err?.error ?? `request failed with status ${res.status}`);
       }
-      setGeneratedInstances(await res.json());
+      const generated: GenerateInstancesResponse = await res.json();
+      updateHandleIfRefreshed(generated.refreshedHandleId);
+      setGeneratedInstances(generated.instances);
     } catch (err) {
       setGenerateError(err instanceof Error ? err.message : "failed to generate instances");
     } finally {
@@ -201,6 +230,7 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
         throw new Error(err?.error ?? `request failed with status ${res.status}`);
       }
       const proposed: ProposeResponse = await res.json();
+      updateHandleIfRefreshed(proposed.refreshedHandleId);
       setProposedByIndex((prev) => ({ ...prev, [index]: proposed }));
     } catch (err) {
       setProposeError(err instanceof Error ? err.message : "failed to propose instance");
@@ -334,6 +364,15 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
                   {defineResult.stats.nDeclared} · valid: {defineResult.stats.nValid} · imputation
                   ratio: {defineResult.stats.imputationRatio.toFixed(3)}
                 </p>
+                {defineResult.stats.correctionRatio !== undefined && (
+                  <p className="text-[11px] text-white/70">
+                    correction ratio: {defineResult.stats.correctionRatio.toFixed(3)} (discrete{" "}
+                    {defineResult.stats.discreteCorrectionRatio?.toFixed(3)} · continuous{" "}
+                    {defineResult.stats.continuousCorrectionRatio?.toFixed(3)}) · correction
+                    fraction: {defineResult.stats.correctionFraction?.toFixed(3)} · max rate
+                    diversity: {defineResult.stats.maxRateDiversity?.toFixed(3)}
+                  </p>
+                )}
               </div>
 
               {defineResult.skipped.length > 0 && (

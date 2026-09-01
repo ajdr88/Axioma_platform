@@ -272,6 +272,13 @@ pub enum EdgeKind {
     /// subject to `is_acyclicity_scoped` — SysML Activity flows legitimately loop (a retry/repeat
     /// branch), the same NFR-REL-02 discipline `ArchDerives`/`Allocate` already follow.
     Flow,
+    /// Tier 1 pass (FR-COMP-02, reqs v5 §5.15) — a `Constraint`'s real link to the `Parameter`(s)
+    /// its formula/curve reads, replacing the seed's own former `usesParameterIds` JSON-array
+    /// stand-in with a real graph edge. Kind-constrained (source must be `Constraint`, target
+    /// must be `Parameter`) — the mirror-image direction of `Bound`'s existing rule (`Bound`:
+    /// `Parameter -> structural element`; `Uses`: `Constraint -> Parameter`), a real, testable
+    /// endpoint-legality rule, not left kind-unconstrained.
+    Uses,
 }
 
 impl EdgeKind {
@@ -302,6 +309,7 @@ impl EdgeKind {
             EdgeKind::ChoiceConstraint => "CHOICE_CONSTRAINT",
             EdgeKind::Allocate => "ALLOCATE",
             EdgeKind::Flow => "FLOW",
+            EdgeKind::Uses => "USES",
         }
     }
 
@@ -327,6 +335,7 @@ impl EdgeKind {
             "CHOICE_CONSTRAINT" => Some(EdgeKind::ChoiceConstraint),
             "ALLOCATE" => Some(EdgeKind::Allocate),
             "FLOW" => Some(EdgeKind::Flow),
+            "USES" => Some(EdgeKind::Uses),
             _ => None,
         }
     }
@@ -688,6 +697,9 @@ pub fn check_relationship_endpoints(
         // dedicated node kind existed yet for their targets, which no longer applies here now
         // that `Action` is real.
         EdgeKind::Flow => source_kind == NodeKind::Action && target_kind == NodeKind::Action,
+        // Tier 1 pass — mirror-image direction of `Bound`'s own rule just above (`Parameter ->
+        // structural element` there, `Constraint -> Parameter` here).
+        EdgeKind::Uses => source_kind == NodeKind::Constraint && target_kind == NodeKind::Parameter,
         _ => true,
     };
     if legal {
@@ -1390,6 +1402,31 @@ mod tests {
             NodeKind::Action,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn accepts_legal_uses_endpoint_from_constraint_to_parameter() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Uses,
+            "FanPerformanceMapConstraint",
+            NodeKind::Constraint,
+            "FanWeightFlowParam",
+            NodeKind::Parameter,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_illegal_uses_endpoint_wrong_direction() {
+        // The Bound-mirroring direction check: Uses is Constraint -> Parameter, not the reverse.
+        assert!(check_relationship_endpoints(
+            EdgeKind::Uses,
+            "FanWeightFlowParam",
+            NodeKind::Parameter,
+            "FanPerformanceMapConstraint",
+            NodeKind::Constraint,
+        )
+        .is_err());
     }
 
     #[test]

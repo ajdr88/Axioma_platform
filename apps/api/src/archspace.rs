@@ -11,8 +11,12 @@
 //! explicitly `propose`s one specific instance, which lands a real, review-gated `proposals` row
 //! (`origin: "archspace-instance"`); only accepting that proposal (`mode_b.rs::accept_proposal`,
 //! dispatching to this module's own `materialize_proposal`) actually writes new graph elements.
-//! Design-space handles stay process-lifetime/in-memory sidecar-side, exactly as
-//! `cem_archspace.proto`'s own doc comment already scopes the spike.
+//! The sidecar's own live constructed graph object stays process-lifetime/in-memory
+//! sidecar-side, exactly as `cem_archspace.proto`'s own doc comment scopes it — but **the
+//! definition that produced it is now really persisted** (Tier 1 pass, item 6,
+//! `VersioningStore::persist_archspace_definition`), so a stale `handle_id` after a sidecar
+//! restart is transparently recovered rather than just 404ing forever — see
+//! `ensure_live_handle`'s own doc comment for the exact recovery flow.
 
 use anyhow::Context;
 use axum::{
@@ -296,6 +300,18 @@ pub(crate) struct DesignSpaceStatsDto {
     pub(crate) n_declared: i64,
     pub(crate) n_valid: i64,
     pub(crate) imputation_ratio: f64,
+    /// FR-ARCH-06's other three real metrics — real sb_arch_opt properties (`Option::None`, not a
+    /// fake `0.0`, when this design space has no objective — see the proto's own doc comment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) correction_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) discrete_correction_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) continuous_correction_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) correction_fraction: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_rate_diversity: Option<f64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -340,10 +356,18 @@ pub(crate) async fn define(
     let handle_id = archspace_client::define_design_space(definition).await?;
     let stats = archspace_client::get_design_space_stats(&handle_id).await?;
 
-    // Cached so a later `decode` call for this same handle can group its result by choice
-    // (`DecodeResponse::choices`) instead of always reporting an empty summary -- see
-    // `AppState::archspace_definitions`'s own doc comment for why this is in-process bookkeeping,
-    // not new handle persistence.
+    // Tier 1 pass (item 6) — real, durable persistence of the definition itself (not the
+    // sidecar's own live constructed graph object), so a stale handle after a sidecar restart can
+    // be transparently recovered — see `resolve_or_redefine`'s own doc comment.
+    state
+        .versioning
+        .persist_archspace_definition(&handle_id, &project_id, &subsystem_id, &result.definition)
+        .await?;
+
+    // Also cached in-process so a later `decode` call for this same handle can group its result
+    // by choice (`DecodeResponse::choices`) instead of always reporting an empty summary --
+    // `AppState::archspace_definitions` stays a same-process fast path now that Postgres is the
+    // real durable copy, not a replacement for it.
     state
         .archspace_definitions
         .lock()
@@ -357,6 +381,11 @@ pub(crate) async fn define(
             n_declared: stats.n_declared,
             n_valid: stats.n_valid,
             imputation_ratio: stats.imputation_ratio,
+            correction_ratio: stats.correction_ratio,
+            discrete_correction_ratio: stats.discrete_correction_ratio,
+            continuous_correction_ratio: stats.continuous_correction_ratio,
+            correction_fraction: stats.correction_fraction,
+            max_rate_diversity: stats.max_rate_diversity,
         },
         skipped: result
             .skipped
@@ -367,6 +396,86 @@ pub(crate) async fn define(
             })
             .collect(),
     }))
+}
+
+/// Tier 1 pass (item 6) — probes whether the sidecar still recognizes `handle_id` (a lightweight
+/// `GetDesignSpaceStats` call), and if not (`NotFound` — e.g. after a sidecar restart wiped its
+/// in-memory `_design_spaces` dict), transparently re-defines the design space from its real,
+/// persisted `DesignSpaceDefinitionInput` (`VersioningStore::persist_archspace_definition`) and
+/// returns the fresh handle instead. Checked **once per request**, not once per individual RPC
+/// call — a handler that makes several sidecar calls in one request (`generate_instances`'s loop)
+/// only pays the redefinition cost once, not once per call inside it. Any other error (including
+/// "no persisted definition to recover from" — a handle from before this pass, or a genuinely
+/// unknown one) propagates unchanged. Returns `(effective_handle_id, refreshed)` — `refreshed` is
+/// `Some(fresh_handle_id)` only when recovery actually happened, so callers can tell their own
+/// client which handle to use from now on (`None` on the normal, no-recovery path).
+async fn ensure_live_handle(
+    state: &AppState,
+    handle_id: &str,
+) -> anyhow::Result<(String, Option<String>)> {
+    match archspace_client::get_design_space_stats(handle_id).await {
+        Ok(_) => Ok((handle_id.to_string(), None)),
+        Err(err) => {
+            let is_not_found = err
+                .downcast_ref::<tonic::Status>()
+                .is_some_and(|status| status.code() == tonic::Code::NotFound);
+            if !is_not_found {
+                return Err(err);
+            }
+            let Some((project_id, subsystem_id, definition)) =
+                state.versioning.get_archspace_definition(handle_id).await?
+            else {
+                return Err(err.context(format!(
+                    "handle {handle_id} not found and no persisted definition to recover from"
+                )));
+            };
+            let fresh_handle =
+                archspace_client::define_design_space(to_proto_definition(&definition)).await?;
+            state
+                .versioning
+                .persist_archspace_definition(
+                    &fresh_handle,
+                    &project_id,
+                    &subsystem_id,
+                    &definition,
+                )
+                .await?;
+            state
+                .archspace_definitions
+                .lock()
+                .expect("archspace_definitions mutex poisoned")
+                .insert(fresh_handle.clone(), definition);
+            Ok((fresh_handle.clone(), Some(fresh_handle)))
+        }
+    }
+}
+
+/// A definition for `handle_id`, checked in-process first (the common-case fast path), falling
+/// back to the real persisted copy (Tier 1 pass, item 6) — so choice-grouping (`decode`/
+/// `generate_instances`/`propose`'s own `summarize_instance` calls) stays accurate even after an
+/// apps/api restart alone (no sidecar restart, so `handle_id` itself is still valid, but this
+/// process's own in-memory cache is empty). Falls back to `Default` only when truly nothing is
+/// known about this handle anywhere — same graceful "report present nodes as ungrouped" behavior
+/// as before this pass.
+async fn definition_for_handle(
+    state: &AppState,
+    handle_id: &str,
+) -> anyhow::Result<cem_core::archspace::DesignSpaceDefinitionInput> {
+    if let Some(definition) = state
+        .archspace_definitions
+        .lock()
+        .expect("archspace_definitions mutex poisoned")
+        .get(handle_id)
+        .cloned()
+    {
+        return Ok(definition);
+    }
+    Ok(state
+        .versioning
+        .get_archspace_definition(handle_id)
+        .await?
+        .map(|(_, _, definition)| definition)
+        .unwrap_or_default())
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -391,31 +500,26 @@ pub(crate) struct DecodeResponse {
     pub(crate) present_node_names: Vec<String>,
     pub(crate) choices: Vec<DecodedChoiceDto>,
     pub(crate) other_present_nodes: Vec<String>,
+    /// Tier 1 pass (item 6) — set only when `handleId` had gone stale (e.g. a sidecar restart)
+    /// and was transparently recovered; the caller should use this handle for any further calls
+    /// in this session instead of the one it sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) refreshed_handle_id: Option<String>,
 }
 
 /// `POST /api/v0/projects/:projectId/cem/archspace/:handleId/decode` — FR-ARCH-05's decode half.
 /// An empty/omitted `designVector` asks the sidecar to sample a random valid vector first
-/// (matches `cem_archspace.proto`'s own documented `DecodeInstance` behavior). The `handleId`
-/// must come from a prior `define` call in this pass -- the sidecar holds it process-lifetime,
-/// in-memory only (deliberately not persisted, see this module's own doc comment).
+/// (matches `cem_archspace.proto`'s own documented `DecodeInstance` behavior). `handleId` no
+/// longer has to come from a still-live sidecar handle — `ensure_live_handle` transparently
+/// recovers a stale one from its real persisted definition (Tier 1 pass, item 6).
 pub(crate) async fn decode(
     State(state): State<AppState>,
     Path((_project_id, handle_id)): Path<(String, String)>,
     Json(payload): Json<DecodeRequestDto>,
 ) -> Result<Json<DecodeResponse>, ApiError> {
+    let (handle_id, refreshed_handle_id) = ensure_live_handle(&state, &handle_id).await?;
     let instance = archspace_client::decode_instance(&handle_id, payload.design_vector).await?;
-    // Grouping the result by choice needs the same definition `define` encoded for this handle --
-    // `AppState::archspace_definitions` caches it (in-process only, not new handle persistence,
-    // see its own doc comment). A handle this process never `define`d (e.g. from a restart, or
-    // one built by a different caller) falls back to an empty definition, same as before this
-    // cache existed -- every present node just reports as "other" rather than grouped.
-    let definition = state
-        .archspace_definitions
-        .lock()
-        .expect("archspace_definitions mutex poisoned")
-        .get(&handle_id)
-        .cloned()
-        .unwrap_or_default();
+    let definition = definition_for_handle(&state, &handle_id).await?;
     let summary = core_archspace::summarize_instance(
         &definition,
         &instance.design_vector,
@@ -434,6 +538,7 @@ pub(crate) async fn decode(
             })
             .collect(),
         other_present_nodes: summary.other_present_nodes,
+        refreshed_handle_id,
     }))
 }
 
@@ -479,15 +584,29 @@ async fn evaluate_viability_typed(
     })
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EvaluateResponseDto {
+    #[serde(flatten)]
+    pub(crate) viability: ViabilityDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) refreshed_handle_id: Option<String>,
+}
+
 /// `POST /api/v0/projects/:projectId/cem/archspace/:handleId/evaluate` — FR-ARCH-08's own direct
-/// HTTP surface: evaluate one specific candidate's typed viability outcome.
+/// HTTP surface: evaluate one specific candidate's typed viability outcome. `handleId` recovery —
+/// see `ensure_live_handle`'s own doc comment (Tier 1 pass, item 6).
 pub(crate) async fn evaluate(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path((_project_id, handle_id)): Path<(String, String)>,
     Json(payload): Json<DecodeRequestDto>,
-) -> Result<Json<ViabilityDto>, ApiError> {
+) -> Result<Json<EvaluateResponseDto>, ApiError> {
+    let (handle_id, refreshed_handle_id) = ensure_live_handle(&state, &handle_id).await?;
     let viability = evaluate_viability_typed(&handle_id, payload.design_vector, 0, 0).await?;
-    Ok(Json(viability))
+    Ok(Json(EvaluateResponseDto {
+        viability,
+        refreshed_handle_id,
+    }))
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -506,23 +625,27 @@ pub(crate) struct GenerateInstancesRequest {
     pub(crate) count: Option<u32>,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GenerateInstancesResponseDto {
+    pub(crate) instances: Vec<GeneratedInstanceDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) refreshed_handle_id: Option<String>,
+}
+
 /// `POST /api/v0/projects/:projectId/cem/archspace/:handleId/generate-instances` — FR-ARCH-07's
 /// "browsable, comparable set of architecture instances" half, literally: decodes `count` (default
 /// 5) random instances and evaluates each one's real FR-ARCH-08 viability, so a caller can compare
-/// them before proposing any one of them (`propose`, below).
+/// them before proposing any one of them (`propose`, below). `handleId` recovery happens once, up
+/// front (Tier 1 pass, item 6, `ensure_live_handle`) — not once per instance in the loop below.
 pub(crate) async fn generate_instances(
     State(state): State<AppState>,
     Path((_project_id, handle_id)): Path<(String, String)>,
     Json(payload): Json<GenerateInstancesRequest>,
-) -> Result<Json<Vec<GeneratedInstanceDto>>, ApiError> {
+) -> Result<Json<GenerateInstancesResponseDto>, ApiError> {
     let count = payload.count.unwrap_or(5).clamp(1, 20);
-    let definition = state
-        .archspace_definitions
-        .lock()
-        .expect("archspace_definitions mutex poisoned")
-        .get(&handle_id)
-        .cloned()
-        .unwrap_or_default();
+    let (handle_id, refreshed_handle_id) = ensure_live_handle(&state, &handle_id).await?;
+    let definition = definition_for_handle(&state, &handle_id).await?;
 
     let mut instances = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -548,7 +671,10 @@ pub(crate) async fn generate_instances(
             viability,
         });
     }
-    Ok(Json(instances))
+    Ok(Json(GenerateInstancesResponseDto {
+        instances,
+        refreshed_handle_id,
+    }))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -564,6 +690,8 @@ pub(crate) struct ProposeInstanceResponse {
     pub(crate) proposal_id: String,
     pub(crate) branch_id: String,
     pub(crate) viability: ViabilityDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) refreshed_handle_id: Option<String>,
 }
 
 /// `POST /api/v0/projects/:projectId/cem/archspace/:handleId/propose` — FR-ARCH-07's "enterable
@@ -588,15 +716,10 @@ pub(crate) async fn propose(
         return Err(BadRequest(format!("no such subsystem {}", payload.subsystem_id)).into());
     }
 
+    let (handle_id, refreshed_handle_id) = ensure_live_handle(&state, &handle_id).await?;
     let instance =
         archspace_client::decode_instance(&handle_id, payload.design_vector.clone()).await?;
-    let definition = state
-        .archspace_definitions
-        .lock()
-        .expect("archspace_definitions mutex poisoned")
-        .get(&handle_id)
-        .cloned()
-        .unwrap_or_default();
+    let definition = definition_for_handle(&state, &handle_id).await?;
     let summary = core_archspace::summarize_instance(
         &definition,
         &instance.design_vector,
@@ -653,6 +776,7 @@ pub(crate) async fn propose(
         proposal_id: proposal.id,
         branch_id: branch.id,
         viability,
+        refreshed_handle_id,
     }))
 }
 

@@ -21,11 +21,17 @@ service CemArchspace {
   // layer already follows for the rest of the graph.
   rpc DefineDesignSpace(DesignSpaceDefinition) returns (DesignSpaceHandle);
 
-  // FR-ARCH-06 (Design-Space Health Metrics). Only the metrics adsg_core.GraphProcessor exposes
-  // as plain numbers are populated this pass (n_declared/n_valid/imputation_ratio) -- Correction
-  // Ratio, Correction Fraction, and Max Rate Diversity are real adsg-core concepts but reading
-  // them out requires its own pandas-DataFrame-shaped `get_statistics()` call, deliberately not
-  // wired into this spike's proto surface; see README.md for the honest scope note.
+  // FR-ARCH-06 (Design-Space Health Metrics) -- all four real metrics reqs v5 names.
+  // n_declared/n_valid/imputation_ratio come straight off adsg_core.GraphProcessor. Correction
+  // Ratio/Discrete/Continuous Correction Ratio/Correction Fraction and Max Rate Diversity are
+  // real sb_arch_opt concepts, not adsg_core (a prior doc-comment misattribution, corrected here)
+  // -- ArchOptProblemBase.get_correction_ratio()/get_discrete_correction_ratio()/
+  // get_continuous_correction_ratio(), .design_space.correction_fraction, and the
+  // 'active-diversity' row's own precomputed 'max' from get_discrete_rates()'s DataFrame, all
+  // read off the same DSGArchOptProblem RunOptimization/EvaluateViability already build. Only
+  // populated (proto3 `optional`, a real absence not a fake zero) when the design space has an
+  // objective -- the same precondition those two RPCs already gate on, since these live on that
+  // same object.
   rpc GetDesignSpaceStats(DesignSpaceHandle) returns (DesignSpaceStats);
 
   // FR-ARCH-05 (Design Vector Encode/Decode). An empty `design_vector` asks the server to sample
@@ -124,6 +130,14 @@ message DesignSpaceStats {
   int64 n_declared = 2;
   int64 n_valid = 3;
   double imputation_ratio = 4;
+  // FR-ARCH-06's other three real metrics -- see the RPC's own doc comment above. `optional` so
+  // a design space with no objective (RunOptimization/EvaluateViability's own precondition) can
+  // omit these as a real absence rather than a fake 0.0.
+  optional double correction_ratio = 5;
+  optional double discrete_correction_ratio = 6;
+  optional double continuous_correction_ratio = 7;
+  optional double correction_fraction = 8;
+  optional double max_rate_diversity = 9;
 }
 
 message DecodeRequest {

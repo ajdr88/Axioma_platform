@@ -43,28 +43,35 @@ Fix first — these undermine guarantees the rest of the platform already relies
 
 High value for CEM specifically; Product 1 is unaffected either way.
 
-5. **`SolverResultState` not retrofitted into `trade_study.rs`/`fuml_client.rs`.** Those still use
-   ad hoc result shapes — the platform-wide "solver results are typed, never blindly trusted" rule
-   (CLAUDE.md non-negotiable #3) isn't actually uniform outside `archspace`. Flagged in impl v5 §22
-   as a real, deliberately-not-attempted follow-up.
-6. **`cem-archspace` design-space state is in-memory, process-lifetime only.** A sidecar restart
-   silently loses in-progress trade studies; nothing persists it or syncs it to Neo4j. Impl v5
-   §10.3 ("still open... it's still open after it").
+5. ~~**`SolverResultState` not retrofitted into `trade_study.rs`/`fuml_client.rs`.**~~ **Closed
+   2026-09-01 (impl v5 §24.1).** `control_sim::run_golden_control_sim` now returns a real
+   `SolverResultState`, classified from the trace stream's own real signal (`fuml_client.rs`
+   itself has no result-classification concept to retrofit — the classification genuinely lives at
+   the one call site with enough context to classify against).
+6. ~~**`cem-archspace` design-space state is in-memory, process-lifetime only.**~~ **Closed
+   2026-09-01 (impl v5 §24.3), per explicit user choice to build real persistence rather than
+   accept this doc's own prior recommendation.** The design-space *definition* (not the sidecar's
+   own live graph object) now persists in Postgres, with transparent recovery — a stale handle
+   after a sidecar restart is re-derived on demand, confirmed by a real integration test.
 7. **Only a single-objective/simple viability search is wired.** SBArchOpt's real multi-objective,
    hierarchical-BO (`ArchSBO`) capability sits unused; Mode B's actual optimization power is well
-   below what the sidecar library can do. Impl v5 §10.3.
-8. **FR-ARCH-06 exposes 1 of 4 real metrics.** Only Imputation Ratio is computed/surfaced via
-   `DesignSpaceStats`; Correction Ratio, Correction Fraction, and Max Rate Diversity were never
-   mapped through, even after the later §20 FR-ARCH-06 build-out (which only wires IR through).
-   Impl v5 §10.3.
-9. **`ChoiceConstraint`'s "uses parameter" relationship is a JSON array, not a graph edge.**
-   Flagged in impl v5 §11.1 as a real schema gap "for whenever Parametrics evaluation actually gets
-   built" — Parametrics was later built (§13) via linear interpolation over tabulated points, never
-   through this edge, so the gap was never actually closed.
+   below what the sidecar library can do. Impl v5 §10.3. **Still open — Tier 1 Batch B/C, not yet
+   started** (per explicit user choice, this batch also attempts genuine hierarchical-BO, not just
+   NSGA-II multi-objective, so it's split out as its own larger pass).
+8. ~~**FR-ARCH-06 exposes 1 of 4 real metrics.**~~ **Closed 2026-09-01 (impl v5 §24.2).** All four
+   real metrics now computed and surfaced — also corrected a real doc misattribution along the way
+   (Correction Ratio/Fraction/Max Rate Diversity are `sb_arch_opt` concepts, not `adsg_core`, as
+   this doc and the proto's own comment previously said).
+9. ~~**`ChoiceConstraint`'s "uses parameter" relationship is a JSON array, not a graph edge.**~~
+   **Closed 2026-09-01 (impl v5 §24.4), per explicit user choice to build it despite zero current
+   consumers.** A real `EdgeKind::Uses` (`Constraint -> Parameter`) replaces the JSON array.
 10. **FR-COMP-02 performance-map data is illustrative, not real.** The seeded
     `sampledPointsAtDesignSpeed` carries `sourceNote: "illustrative shape only -- real constitutive
     equations not yet sourced"` — reqs v5 §5.15 itself says the real off-design equations aren't
     sourced yet. Impl v5 §11.1. A domain-correctness gap for any real trade study run against it.
+    **Still open — its own later batch, not yet started.** Per explicit user choice, this pass
+    attempts a real, cited 0D thermodynamic compressor model rather than external literature
+    sourcing alone — a bigger, physics-modeling undertaking than the rest of Tier 1.
 
 ## Tier 2 — Product 1 feature completeness
 

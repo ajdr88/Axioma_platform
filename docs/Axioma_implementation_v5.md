@@ -2413,3 +2413,140 @@ re-derived from `delete_edge`'s own code before concluding it wasn't.
   correctly wired in every single trial at the data level). Also reconfirmed the sole-edge-removal
   rejection's exact message and the "second edge present → removal succeeds" case, both consistent
   every run. Zero unexpected browser console/page errors across the whole verification.
+
+## 24. Tier 1 Batch A — `SolverResultState` Retrofit, FR-ARCH-06's Full Metrics, Real Handle
+Persistence, `ChoiceConstraint`-uses-`Parameter` Edge
+
+Following `docs/pending_items_2026-09-01.md`'s Tier 1 (Product 2/Mode B maturity), the user chose
+the fuller scope on every open question this tier raised — build real handle persistence (item 6)
+rather than accept the docs' own prior recommendation that it's unneeded, build the real
+`ChoiceConstraint`-uses-`Parameter` edge (item 9) even with zero current consumers, attempt a real
+0D thermodynamic compressor model (item 10, its own later batch), and attempt genuine
+hierarchical-BO in addition to NSGA-II multi-objective search (item 7, its own later batch). This
+section covers **Batch A**: items 5, 6, 8, 9 — backend-only, no new external dependency.
+
+### 24.1 Item 5 — `SolverResultState` retrofitted into `trade_study.rs`
+
+`control_sim::run_golden_control_sim()` returned a bare `(bool, Option<String>)`, `converged`
+computed by a literal string-match against the golden RPM value. Retrofitted to
+`(sysml_core::SolverResultState, Option<String>)`, classified from the only real signal available:
+an `"output"` event matching the golden value → `Converged`; an `"output"` event with a different
+value → `SuspectNumerical` (it ran and produced *a* result, just not the expected one — the real
+"plausibility check" NFR-REL-03 calls for); no `"output"` event at all → `Diverged` (the RPC
+succeeded, the state machine just never reached its final step). A genuine RPC/connection failure
+stays a real `Err`, not folded into the typed vocabulary — conflating "sidecar unreachable" with
+"sidecar ran and diverged" would lose real information. `trade_study.rs::SimulationCheck.converged:
+bool` → `state: SolverResultState`; the one existing test assertion updated to
+`assert_eq!(report.simulation.state, SolverResultState::Converged)`. Passed on its first real run.
+`fuml_client.rs` itself stays untouched — it has no result-classification concept at all, only a
+raw trace-event stream; the classification genuinely lives at the `control_sim.rs` call site, the
+only place with enough context (the golden expected value) to classify against.
+
+### 24.2 Item 8 — FR-ARCH-06's other three real metrics, and a doc misattribution corrected
+
+**Real finding, not previously accurate**: `cem_archspace.proto`'s own doc comment (and this
+implementation doc's own §10.3) attributed Correction Ratio/Fraction/Max Rate Diversity to
+`adsg_core.GraphProcessor.get_statistics()`. Reading the vendored `sb_arch_opt` source directly
+shows these are real `sb_arch_opt` concepts, not `adsg_core` — `ArchOptProblemBase.
+get_correction_ratio()`/`get_discrete_correction_ratio()`/`get_continuous_correction_ratio()`
+(`problem.py:330-354`), `.design_space.correction_fraction` (a `@cached_property`,
+`design_space.py:436-443`), and Max Rate Diversity as the `'active-diversity'` row's own
+already-precomputed `'max'` column from `get_discrete_rates(force=True)`'s DataFrame — no
+post-processing needed beyond reading `df.loc['active-diversity', 'max']`. All live on the exact
+`DSGArchOptProblem` object `RunOptimization`/`EvaluateViability` already build.
+
+- `cem_archspace.proto`: `DesignSpaceStats` gains 5 `optional double` fields — proto3 explicit-
+  optional, so "this design space has no objective" (the same precondition `RunOptimization`
+  already gates on) is a real absence, not a fake `0.0`.
+- `packages/cem-archspace/src/server.py::GetDesignSpaceStats`: if `built.objective_node is not
+  None`, builds the same `_PlaceholderEvaluator`/`DSGArchOptProblem` pair `RunOptimization` builds
+  and reads the 4 scalar properties plus the DataFrame value above.
+- `apps/api/src/archspace.rs::DesignSpaceStatsDto` gains the matching `Option<f64>` fields
+  (`#[serde(skip_serializing_if = "Option::is_none")]`, so the original 4-field exact-JSON test
+  assertions kept passing unchanged). `ArchspacePanel.tsx` shows the new metrics in the Define
+  result box when present.
+- **Real numbers from a live run against the real seeded `CoreHpCompressor` content (2026-09-01)**:
+  `correction_ratio`/`discrete_correction_ratio`/`continuous_correction_ratio` all `1.0`,
+  `correction_fraction`/`max_rate_diversity` both `0.0` — this subsystem's design space is small
+  and clean enough (2 design variables, `imputation_ratio` already `1.0`) that no correction is
+  needed and there's no meaningful rate imbalance to show, the same "small fixture, trivially
+  uniform" honesty note the FR-ARCH-08 viability classifier's own earlier verification already
+  made. Test assertions check real bounds (`>= 1.0` / `[0,1]` / `>= 0.0` and `Some`, not `None`),
+  not exact trivial values, since a richer fixture would produce different real numbers.
+
+### 24.3 Item 6 — real design-space handle persistence, with transparent recovery
+
+**Design, chosen for real durability without persisting the sidecar's own live constructed graph
+object** (which stays complex/non-trivially-serializable, and — before this pass — was the
+implementation doc's own §10.3 recommendation to leave ephemeral; overridden here per explicit user
+choice): persist the small, already-existing **input** (`DesignSpaceDefinitionInput`) in Postgres,
+keyed by `handle_id`, and transparently re-derive a fresh sidecar handle on demand whenever a stale
+one 404s. The durable thing is "the definition," not "the live handle" — genuinely buildable and
+actually durable end to end, without needing to serialize a live `adsg_core.BasicDSG`.
+
+- `cem_core::archspace`'s `*Input` types gained `serde::Serialize`/`Deserialize` — pure data-shape
+  derives (the crate's own "no I/O" doc-comment rule is about protobuf/gRPC specifically).
+- New Postgres table, `archspace_design_spaces (handle_id PRIMARY KEY, project_id, subsystem_id,
+  definition JSONB, created_at)` — same migration-on-startup pattern as every other table in
+  `store/versioning.rs`. New `VersioningStore::persist_archspace_definition`/
+  `get_archspace_definition`.
+- `archspace.rs::define` persists the row right after a successful `DefineDesignSpace` call.
+- **Simpler than the plan's original design, found while implementing it**: rather than a generic
+  higher-order retry-wrapper around each individual sidecar RPC call (real, but syntactically heavy
+  in Rust, and would trigger redundant redefinitions if a handler makes several sidecar calls in
+  one request — `generate_instances`'s loop, for instance), built `ensure_live_handle(state,
+  handle_id)` — a single lightweight `GetDesignSpaceStats` probe **once per request**, and if it
+  404s, recovers from the persisted definition once, before the handler's real work runs. Simpler,
+  no generics, and avoids the "20 redundant redefinitions in a loop" failure mode the original
+  per-call design would have had. Costs one extra round-trip on the happy path (a fast local gRPC
+  call over the docker-compose network) — an acceptable, deliberate tradeoff for the simplicity.
+- `decode`/`evaluate`/`generate_instances`/`propose` all route through `ensure_live_handle`.
+  `evaluate`'s response gained `#[serde(flatten)]`-wrapped `refreshed_handle_id`;
+  `generate_instances`'s response shape changed from a bare `Vec<GeneratedInstanceDto>` to
+  `{instances, refreshedHandleId?}` (a real, necessary breaking shape change — a bare array can't
+  carry a sibling metadata field — `ArchspacePanel.tsx` and the one existing Rust test both
+  updated); `decode`/`propose` gained the same optional field on their existing object responses
+  (backward-compatible, `skip_serializing_if`). A new `definition_for_handle` helper checks the
+  in-process cache first (fast path), falling back to the real persisted copy — so choice-grouping
+  stays accurate even after an apps/api-only restart (no sidecar restart), not just full recovery.
+- `ArchspacePanel.tsx` gained `updateHandleIfRefreshed` — any response carrying a real
+  `refreshedHandleId` updates the panel's own `defineResult.handleId` so the *next* call in the
+  same session doesn't pay the recovery cost again.
+- **New integration test, `decode_recovers_a_stale_handle_from_its_real_persisted_definition`** —
+  persists a real definition under a `handle_id` that was **never** given to the sidecar
+  (guaranteed `NotFound`, the same real shape a sidecar restart produces), confirms `decode`
+  transparently recovers it, returns a real different `refreshedHandleId`, and confirms a
+  *second* call against the fresh handle needs no further recovery. Passed on its first real run.
+  Full `apps/api --ignored` suite re-run: 79/79, zero regressions.
+
+### 24.4 Item 9 — real `ChoiceConstraint`-uses-`Parameter` graph edge
+
+New `EdgeKind::Uses` (`Constraint -> Parameter`, kind-constrained — the mirror-image direction of
+`Bound`'s existing rule) replaces the seed's former `usesParameterIds` JSON-array stand-in on
+`FanPerformanceMapConstraint`/`CorePerformanceMapConstraint` — real edges to their weight-flow/
+speed Parameter ids, created once those Parameter elements exist. The JSON property is removed
+entirely, not kept redundantly — confirmed via a repo-wide grep that nothing ever read it (built
+per explicit user choice despite this; a real, honestly-flagged schema-purity improvement with no
+functional payoff *yet*, matching the pending-items audit's own framing of this item).
+`packages/shared-types` updated for the new `EdgeKind`; confirmed via a full `cargo build
+--workspace` that no exhaustive-match site elsewhere needed a new arm this time (unlike `Action`'s
+own addition in the Tier 0 pass, which needed one in `sysml-textual`).
+
+### 24.5 Verification
+
+`cargo test -p sysml-core`: 51/51 (2 new `Uses` endpoint-legality tests). `apps/api --ignored`:
+79/79 (78 prior + 1 new: the handle-recovery test; 3 existing tests updated in place for the new
+response shapes). `cargo build/clippy/fmt --workspace`, `pnpm biome check .`, `pnpm --filter
+@axioma/web build`: all clean.
+
+**Live browser verification (Playwright, real running dev stack, Turbofan-Ref project) — all
+checks passed.** Defining `Core (HP) Compressor`'s design space rendered both stats lines exactly
+as designed: `design variables: 2 · declared: 6 · valid: 6 · imputation ratio: 1.000` and the new
+`correction ratio: 1.000 (discrete 1.000 · continuous 1.000) · correction fraction: 0.000 · max
+rate diversity: 0.000` — matching the same real numbers confirmed earlier by the backend
+integration test. "Generate & Compare (5)" still rendered exactly 5 real instance cards with no
+visible change (the `.instances` unwrap works correctly); the raw network response confirmed the
+real new shape, `{"instances": [...]}`, not a bare array, with `refreshedHandleId` genuinely absent
+in this normal (no-recovery-needed) session. "Propose" on the first card produced a real accepted
+proposal id with no error. Zero browser console/page errors throughout. This closes Tier 1 Batch A
+in full.

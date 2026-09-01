@@ -73,7 +73,7 @@ pub(crate) struct ThrustDelta {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SimulationCheck {
-    pub(crate) converged: bool,
+    pub(crate) state: sysml_core::SolverResultState,
     pub(crate) final_rpm: Option<String>,
     pub(crate) note: &'static str,
 }
@@ -139,7 +139,7 @@ pub(crate) async fn compare(
     let variant_thrust = estimate_thrust_lbf(variant_ratio);
     let delta_thrust = variant_thrust - baseline_thrust;
 
-    let (converged, final_rpm) = control_sim::run_golden_control_sim().await?;
+    let (state, final_rpm) = control_sim::run_golden_control_sim().await?;
 
     Ok(Json(TradeStudyReport {
         branch: payload.branch,
@@ -158,7 +158,7 @@ pub(crate) async fn compare(
             percent: (delta_thrust / baseline_thrust) * 100.0,
         },
         simulation: SimulationCheck {
-            converged,
+            state,
             final_rpm,
             note: "the pilot's Control state machine has no dependency on this property; this \
                    confirms the branch edit didn't break simulated behavior, it isn't the \

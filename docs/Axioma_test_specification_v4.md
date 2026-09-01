@@ -502,12 +502,18 @@ before launching an optimization run.
 or `0.0` as a stub).
 **FAIL:** Placeholder/stub values, or metrics only available after a full optimization run
 completes (defeating their "before an expensive run" purpose).
-**Landed status:** built and covered — same test as T-ARCH-05; a real Imputation Ratio (`1.333` on
-the spike's own test problem, per impl v5 §10) comes back from the real sidecar. The FR-ARCH-01…06
-real build-out pass bundles this into the same `/define` HTTP call that builds the design space
-(one round trip, not a second user action) — real, non-zero `nDeclared`/`nValid`/
-`imputationRatio` confirmed against the real seeded Core (HP) Compressor subsystem, not just the
-spike's synthetic problem.
+**Landed status (updated 2026-09-01, impl v5 §24.2):** **built and covered — all four named
+metrics, not just Imputation Ratio.** The FR-ARCH-01…06 real build-out pass bundled Imputation
+Ratio into the same `/define` HTTP call that builds the design space (one round trip, not a second
+user action) — real, non-zero `nDeclared`/`nValid`/`imputationRatio` confirmed against the real
+seeded Core (HP) Compressor subsystem. Correction Ratio/Discrete/Continuous Correction Ratio/
+Correction Fraction/Max Rate Diversity (real `sb_arch_opt` properties, not `adsg_core` as this
+row's own earlier note and the proto's own comment previously — incorrectly — attributed them)
+were added in the Tier 1 pass, read off the same `DSGArchOptProblem` `RunOptimization`/
+`EvaluateViability` already build. Real numbers against the same real fixture: correction ratios
+all `1.0`, correction fraction/max rate diversity both `0.0` — this subsystem's design space is
+small/clean enough that no correction is needed, the same "small fixture, trivially uniform"
+honesty note FR-ARCH-08's own viability classifier already required.
 
 ### T-ARCH-07 — Architecture instance generation & comparison
 **Verifies:** FR-ARCH-07

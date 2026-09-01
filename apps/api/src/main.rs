@@ -79,11 +79,12 @@ struct AppState {
     /// FR-ARCH-01…06 real build-out — an in-process-only cache from a `cem-archspace` design-space
     /// handle id to the `DesignSpaceDefinitionInput` it was built from, so `archspace::decode` can
     /// group a decoded instance's present nodes by choice (`archspace::DecodeResponse::choices`)
-    /// instead of always reporting an empty per-choice summary. Deliberately *not* the "handle
-    /// persistence" the design-space handles themselves still explicitly lack (see
-    /// `archspace.rs`'s own doc comment) — this is apps/api-side bookkeeping only, lost on
-    /// restart exactly like the sidecar's own in-memory handles are, not a new durability
-    /// guarantee.
+    /// instead of always reporting an empty per-choice summary. **Real handle persistence now
+    /// exists** (Tier 1 pass, item 6) — `VersioningStore::persist_archspace_definition`/
+    /// `get_archspace_definition`, a Postgres-backed durable copy `archspace::resolve_or_redefine`
+    /// reads from to recover a stale handle after a sidecar restart. This in-process map stays a
+    /// same-process fast path on top of that durable copy, not a replacement for it — lost on
+    /// restart same as before, which is fine now that Postgres is the real source of truth.
     archspace_definitions:
         Arc<std::sync::Mutex<HashMap<String, cem_core::archspace::DesignSpaceDefinitionInput>>>,
 }
@@ -1925,10 +1926,9 @@ async fn seed_fr_comp_content(
                     properties: serde_json::json!({
                         "description": "Pressure ratio vs. equivalent weight flow, parametrized by equivalent speed, with a stall/surge limit line",
                         // Illustrative shape only, at one fixed equivalent speed -- not a real
-                        // constitutive relation. There's no dedicated "constraint uses parameter"
-                        // edge in the Phase 1 schema yet, so this plain id list is the honest
-                        // stand-in until Parametrics evaluation (Phase 5) needs a real one.
-                        "usesParameterIds": [seed.weight_flow_param_id, seed.speed_param_id],
+                        // constitutive relation. Which Parameters this Constraint uses is now a
+                        // real EdgeKind::Uses edge (Tier 1 pass), created below once the
+                        // Parameter elements themselves exist -- no longer a JSON id list here.
                         "sampledPointsAtDesignSpeed": [
                             { "equivalentWeightFlowLbPerSec": seed.inlet_port.2["equivalentWeightFlowLbPerSec"].clone(), "pressureRatio": 1.30 },
                             { "equivalentWeightFlowLbPerSec": design_weight_flow.clone(), "pressureRatio": 1.40 },
@@ -1987,6 +1987,25 @@ async fn seed_fr_comp_content(
                 source: param_id.to_string(),
                 target: seed.subsystem_id.to_string(),
                 kind: EdgeKind::Bound,
+            });
+            // Tier 1 pass (FR-COMP-02) -- the real "this Constraint uses this Parameter"
+            // relationship, replacing the former usesParameterIds JSON stand-in above.
+            state
+                .neo4j
+                .create_edge(
+                    project_id,
+                    &Edge {
+                        source: seed.constraint_id.to_string(),
+                        target: param_id.to_string(),
+                        kind: EdgeKind::Uses,
+                        metadata: None,
+                    },
+                )
+                .await?;
+            diff_entries.push(DiffEntry::EdgeCreated {
+                source: seed.constraint_id.to_string(),
+                target: param_id.to_string(),
+                kind: EdgeKind::Uses,
             });
         }
 
@@ -3642,8 +3661,9 @@ mod tests {
             "a higher bypass ratio should reduce estimated thrust, got {:?}",
             report.delta
         );
-        assert!(
-            report.simulation.converged,
+        assert_eq!(
+            report.simulation.state,
+            sysml_core::SolverResultState::Converged,
             "the pilot sim should still converge after the branch edit, got {:?}",
             report.simulation
         );
@@ -5716,6 +5736,28 @@ mod tests {
                 && response.stats.n_valid > 0
                 && response.stats.n_valid <= response.stats.n_declared
         );
+        // FR-ARCH-06's other three real metrics — real numbers confirmed by a live run against
+        // this exact fixture (2026-09-01): correction_ratio/discrete/continuous all 1.0 and
+        // correction_fraction/max_rate_diversity both 0.0 — CoreHpCompressor's design space is
+        // small and clean enough (2 design variables, imputation_ratio already 1.0) that no
+        // correction is needed and there's no meaningful rate imbalance to show, the same "small
+        // fixture, trivially uniform" honesty note the FR-ARCH-08 viability classifier's own
+        // verification already made. `Some(_)` (not `None`) is the real assertion here — this
+        // subsystem has a real objective, so the metrics must be genuinely computed, not omitted.
+        assert!(response.stats.correction_ratio.is_some_and(|v| v >= 1.0));
+        assert!(response
+            .stats
+            .discrete_correction_ratio
+            .is_some_and(|v| v >= 1.0));
+        assert!(response
+            .stats
+            .continuous_correction_ratio
+            .is_some_and(|v| v >= 1.0));
+        assert!(response
+            .stats
+            .correction_fraction
+            .is_some_and(|v| (0.0..=1.0).contains(&v)));
+        assert!(response.stats.max_rate_diversity.is_some_and(|v| v >= 0.0));
 
         let decoded = archspace::decode(
             State(state.clone()),
@@ -5811,7 +5853,8 @@ mod tests {
         )
         .await
         .expect("generating instances")
-        .0;
+        .0
+        .instances;
         assert_eq!(instances.len(), 3);
         for instance in &instances {
             assert!(!instance.design_vector.is_empty());
@@ -5998,10 +6041,76 @@ mod tests {
         .expect("evaluating viability")
         .0;
         assert_eq!(
-            viability.state, "Diverged",
+            viability.viability.state, "Diverged",
             "a design space with zero design variables should always diverge, got {viability:?}"
         );
-        assert!(viability.objective_value.is_none());
+        assert!(viability.viability.objective_value.is_none());
+    }
+
+    /// Tier 1 pass (item 6) — a genuinely stale `handle_id` (persisted in Postgres, but never
+    /// given to the sidecar via `DefineDesignSpace`, so it's guaranteed to 404 the first time
+    /// anything uses it — the same real-world shape a sidecar restart produces) is transparently
+    /// recovered by `ensure_live_handle`: re-defined fresh, and the call it was blocking retried
+    /// with the new handle, surfaced to the caller as `refreshedHandleId`.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn decode_recovers_a_stale_handle_from_its_real_persisted_definition() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-handle-recovery").await;
+
+        let stale_handle_id = format!("stale-{}", uuid::Uuid::new_v4());
+        let definition = cem_core::archspace::DesignSpaceDefinitionInput {
+            root_name: "RecoveryRoot".to_string(),
+            selection_choices: vec![cem_core::archspace::SelectionChoiceInput {
+                choice_id: "OnlyChoice".to_string(),
+                option_names: vec!["A".to_string(), "B".to_string()],
+            }],
+            objective: Some(cem_core::archspace::ObjectiveInput {
+                name: "RecoveryObjective".to_string(),
+                direction: -1,
+            }),
+            ..Default::default()
+        };
+        state
+            .versioning
+            .persist_archspace_definition(
+                &stale_handle_id,
+                &project.id,
+                "RecoveryRoot",
+                &definition,
+            )
+            .await
+            .expect("persisting a design-space definition directly, simulating a prior `define`");
+
+        let response = archspace::decode(
+            State(state.clone()),
+            Path((project.id.clone(), stale_handle_id.clone())),
+            Json(archspace::DecodeRequestDto::default()),
+        )
+        .await
+        .expect("decode should transparently recover the stale handle, not just 404")
+        .0;
+
+        let refreshed = response
+            .refreshed_handle_id
+            .expect("a genuinely stale handle must trigger real recovery, not a lucky pass");
+        assert_ne!(
+            refreshed, stale_handle_id,
+            "recovery must mint a real, different sidecar handle"
+        );
+        assert!(!response.design_vector.is_empty());
+
+        // The fresh handle is now the durable one -- a *second* call against it should succeed
+        // with no further recovery needed.
+        let second_response = archspace::decode(
+            State(state.clone()),
+            Path((project.id.clone(), refreshed)),
+            Json(archspace::DecodeRequestDto::default()),
+        )
+        .await
+        .expect("the freshly-recovered handle should work directly")
+        .0;
+        assert!(second_response.refreshed_handle_id.is_none());
     }
 
     /// The genuinely-unencodable half: `TurbineHpLp`'s scope includes `MixedNozzle` (a real
@@ -6431,6 +6540,19 @@ mod tests {
                 .any(|e| e.source == "FanEquivalentWeightFlowParam"
                     && e.target == "FanLpCompression"),
             "expected FanEquivalentWeightFlowParam -Bound-> FanLpCompression, got {bound_edges:?}"
+        );
+
+        // Tier 1 pass — the real Constraint-uses-Parameter edge, replacing the former
+        // usesParameterIds JSON stand-in.
+        let uses_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::Uses)
+            .await
+            .unwrap();
+        assert!(
+            uses_edges.iter().any(|e| e.source == "FanPerformanceMapConstraint"
+                && e.target == "FanEquivalentWeightFlowParam"),
+            "expected FanPerformanceMapConstraint -Uses-> FanEquivalentWeightFlowParam, got {uses_edges:?}"
         );
 
         // Interface Contract worked examples merged onto the subsystem's body, alongside (not

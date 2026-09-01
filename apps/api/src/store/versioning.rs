@@ -303,6 +303,27 @@ async fn create_versioning_tables(conn: &mut sqlx::PgConnection) -> Result<()> {
         .await
         .context("adding proposals.origin column")?;
 
+    // Tier 1 pass (item 6, FR-ARCH-05-adjacent) — real persistence for a Mode B design-space
+    // *definition* (small, serializable — everything `cem_core::archspace::encode_design_space`
+    // produced), keyed by the sidecar's own `handle_id`. This is deliberately NOT an attempt to
+    // persist the sidecar's own live constructed `BasicDSG` graph object (which stays process-
+    // lifetime/in-memory, per `cem-archspace/README.md`'s own recommendation) — the durable thing
+    // here is "the input," which `archspace::resolve_or_redefine` uses to transparently rebuild a
+    // fresh sidecar handle whenever a stale one 404s (e.g. after a sidecar restart). See
+    // `apps/api/src/archspace.rs`'s own doc comment for the full recovery flow.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS archspace_design_spaces (\
+            handle_id TEXT PRIMARY KEY, \
+            project_id TEXT NOT NULL, \
+            subsystem_id TEXT NOT NULL, \
+            definition JSONB NOT NULL, \
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+        )",
+    )
+    .execute(&mut *conn)
+    .await
+    .context("creating archspace_design_spaces table")?;
+
     Ok(())
 }
 
@@ -868,6 +889,67 @@ impl VersioningStore {
             .await
             .context("updating proposal status")?;
         Ok(())
+    }
+
+    /// Tier 1 pass (item 6) — persists a Mode B design-space definition, keyed by the sidecar's
+    /// own `handle_id`. Called once, right after a successful `DefineDesignSpace` (`archspace.rs`
+    /// `define`) and again whenever `resolve_or_redefine` recovers a stale handle (a fresh row for
+    /// the fresh handle, the stale row left in place — harmless, unreachable dead history rather
+    /// than something worth a delete path for).
+    pub async fn persist_archspace_definition(
+        &self,
+        handle_id: &str,
+        project_id: &str,
+        subsystem_id: &str,
+        definition: &cem_core::archspace::DesignSpaceDefinitionInput,
+    ) -> Result<()> {
+        let definition_json =
+            serde_json::to_value(definition).context("serializing design-space definition")?;
+        sqlx::query(
+            "INSERT INTO archspace_design_spaces (handle_id, project_id, subsystem_id, definition) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (handle_id) DO UPDATE SET \
+                project_id = EXCLUDED.project_id, subsystem_id = EXCLUDED.subsystem_id, \
+                definition = EXCLUDED.definition",
+        )
+        .bind(handle_id)
+        .bind(project_id)
+        .bind(subsystem_id)
+        .bind(&definition_json)
+        .execute(&self.pool)
+        .await
+        .context("persisting archspace design-space definition")?;
+        Ok(())
+    }
+
+    /// The read half of [`Self::persist_archspace_definition`] — `None` if this `handle_id` was
+    /// never persisted (e.g. a handle from before this pass, or a genuinely unknown id), not an
+    /// error; the caller (`resolve_or_redefine`) treats that as "nothing to recover from."
+    pub async fn get_archspace_definition(
+        &self,
+        handle_id: &str,
+    ) -> Result<
+        Option<(
+            String,
+            String,
+            cem_core::archspace::DesignSpaceDefinitionInput,
+        )>,
+    > {
+        let row: Option<(String, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT project_id, subsystem_id, definition FROM archspace_design_spaces \
+             WHERE handle_id = $1",
+        )
+        .bind(handle_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetching archspace design-space definition")?;
+        let Some((project_id, subsystem_id, definition_json)) = row else {
+            return Ok(None);
+        };
+        let definition: cem_core::archspace::DesignSpaceDefinitionInput =
+            serde_json::from_value(definition_json)
+                .context("deserializing design-space definition")?;
+        Ok(Some((project_id, subsystem_id, definition)))
     }
 }
 

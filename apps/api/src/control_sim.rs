@@ -8,6 +8,7 @@
 //! `packages/alf-lite/README.md` for the full scope note.
 
 use axum::Json;
+use sysml_core::SolverResultState;
 
 use crate::{alf_ir, fuml_client, import::BadRequest, ApiError};
 
@@ -84,11 +85,24 @@ pub(crate) fn golden_signals() -> Vec<String> {
     ]
 }
 
-/// Runs `golden_alf_transitions` end to end through `fuml-runtime` and returns whether it reached
-/// the golden final state (`Turbine.rpm` set to 3500.0, read back and printed — see
-/// `StateMachineActivityBuilder.appendFinalRpmOutput`'s doc comment) plus that value, for callers
-/// (e.g. `trade_study`) that just need a pass/fail + final reading, not the full trace.
-pub(crate) async fn run_golden_control_sim() -> Result<(bool, Option<String>), ApiError> {
+/// Runs `golden_alf_transitions` end to end through `fuml-runtime` and returns FR-CEM-13's typed
+/// `SolverResultState` (reused here rather than a bespoke bool, the "one shared typed-outcome
+/// vocabulary" this pass retrofits) plus the final reading, for callers (e.g. `trade_study`) that
+/// just need a real result state + final reading, not the full trace.
+///
+/// Classified from the only real signal `fuml_client`'s trace stream actually gives us — a
+/// genuine RPC/connection failure stays a real `Err` (infrastructural, not one of the six typed
+/// solver outcomes; conflating "sidecar unreachable" with "sidecar ran and diverged" would lose
+/// real information):
+/// - An `"output"` event with the golden expected value (`Turbine.rpm` = 3500.0) → `Converged`.
+/// - An `"output"` event with any other value → `SuspectNumerical` — it ran and produced *a*
+///   result, just not the expected one, exactly the "plausibility pass... before any graph write"
+///   NFR-REL-03 already calls for.
+/// - No `"output"` event at all → `Diverged` — the RPC itself succeeded (events came back), but
+///   the state machine never reached its final send/output step; a real non-convergence, distinct
+///   from an infra failure.
+pub(crate) async fn run_golden_control_sim() -> Result<(SolverResultState, Option<String>), ApiError>
+{
     let request = ControlStateMachineRequest {
         transitions: golden_alf_transitions()
             .into_iter()
@@ -108,6 +122,10 @@ pub(crate) async fn run_golden_control_sim() -> Result<(bool, Option<String>), A
         .rev()
         .find(|e| e.kind == "output")
         .map(|e| e.detail.clone());
-    let converged = final_rpm.as_deref() == Some("3500.0");
-    Ok((converged, final_rpm))
+    let state = match final_rpm.as_deref() {
+        Some("3500.0") => SolverResultState::Converged,
+        Some(_) => SolverResultState::SuspectNumerical,
+        None => SolverResultState::Diverged,
+    };
+    Ok((state, final_rpm))
 }

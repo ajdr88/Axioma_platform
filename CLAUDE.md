@@ -113,9 +113,24 @@ visited-set, a real violation of this file's own traversal rule that simply neve
 genuinely cyclic edge existed in seed data. Fixed at the root (edges now carry a real `kind` field,
 clustering filters to `Contains` only) and with defense-in-depth (the traversal itself gained a
 visited-set guard). **All four Tier 0 items from `docs/pending_items_2026-09-01.md` are now
-closed** — Tier 1 (Product 2/Mode B maturity) is the natural next tier, not yet started. `apps/docs`
-was also stood up for real this session as an MkDocs + Material site (renders `docs/` directly,
-no copy).
+closed.** `apps/docs` was also stood up for real this session as an MkDocs + Material site (renders
+`docs/` directly, no copy).
+
+**Tier 1 Batch A (2026-09-01, impl v5 §24)** — the user chose the fuller scope on every open
+question Tier 1 raised (build real handle persistence rather than accept this doc's own prior
+recommendation; build the real `ChoiceConstraint`-uses-`Parameter` edge despite zero current
+consumers; attempt a real 0D compressor model and genuine hierarchical-BO in later batches, not
+just the smaller options). Batch A closes items 5/6/8/9: `SolverResultState` retrofitted into
+`trade_study.rs` (real classification from `fuml_client`'s trace stream — Converged/
+SuspectNumerical/Diverged); FR-ARCH-06's other three real metrics (Correction Ratio/Discrete/
+Continuous/Fraction, Max Rate Diversity — also corrected a real doc misattribution, these are
+`sb_arch_opt` properties, not `adsg_core`); real design-space handle persistence
+(`archspace_design_spaces` Postgres table + `ensure_live_handle`'s transparent recovery of a stale
+handle from its persisted definition, confirmed by a real integration test forcing a genuine
+`NotFound`); and a real `EdgeKind::Uses` (`Constraint -> Parameter`) replacing the old
+`usesParameterIds` JSON stand-in. `apps/api --ignored` now stands at 79/79. Items 7 (multi-
+objective + hierarchical-BO) and 10 (a real 0D thermodynamic compressor model) remain as their own
+later, larger batches — not started yet.
 
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2

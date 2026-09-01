@@ -74,12 +74,34 @@ class CemArchspaceServicer(cem_archspace_pb2_grpc.CemArchspaceServicer):
     def GetDesignSpaceStats(self, request, context):
         built = self._get(request.id, context)
         gp = GraphProcessor(built.dsg)
-        return cem_archspace_pb2.DesignSpaceStats(
+        stats_kwargs = dict(
             n_design_variables=len(gp.des_vars),
             n_declared=gp.get_n_design_space(include_cont=True),
             n_valid=gp.get_n_valid_designs(include_cont=True),
             imputation_ratio=gp.get_imputation_ratio(),
         )
+
+        # FR-ARCH-06's other three real metrics -- live on the same DSGArchOptProblem
+        # RunOptimization/EvaluateViability already build, which needs a real objective (same
+        # precondition those two RPCs already gate on) -- omitted (proto3 `optional`, a real
+        # absence) rather than faked as 0.0 when this design space has none.
+        if built.objective_node is not None:
+            objective_dv_node = next(iter(built.dv_nodes.values()), None)
+            evaluator = _PlaceholderEvaluator(built.dsg, built.objective_node, objective_dv_node)
+            problem = DSGArchOptProblem(evaluator)
+            stats_kwargs.update(
+                correction_ratio=problem.get_correction_ratio(),
+                discrete_correction_ratio=problem.get_discrete_correction_ratio(),
+                continuous_correction_ratio=problem.get_continuous_correction_ratio(),
+                correction_fraction=problem.design_space.correction_fraction,
+            )
+            rates_df = problem.get_discrete_rates(force=True)
+            if rates_df is not None and "active-diversity" in rates_df.index:
+                max_rate_diversity = float(rates_df.loc["active-diversity", "max"])
+                if not np.isnan(max_rate_diversity):
+                    stats_kwargs["max_rate_diversity"] = max_rate_diversity
+
+        return cem_archspace_pb2.DesignSpaceStats(**stats_kwargs)
 
     def DecodeInstance(self, request, context):
         built = self._get(request.handle_id, context)
