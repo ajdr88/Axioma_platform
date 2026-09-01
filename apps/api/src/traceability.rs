@@ -654,3 +654,35 @@ pub async fn get_mission_coverage(
         orphaned,
     }))
 }
+
+#[derive(Debug, serde::Serialize)]
+pub struct OrphanActionsReport {
+    #[serde(rename = "totalActions")]
+    pub(crate) total_actions: usize,
+    #[serde(rename = "orphanedIds")]
+    pub(crate) orphaned_ids: Vec<String>,
+}
+
+/// `GET /api/v0/projects/:projectId/validation/orphan-actions` (FR-CORE-13 real build-out) — the
+/// same "computed report, not a write-time reject" shape as `get_mission_coverage` above, applied
+/// to `sysml_core::check_orphan_actions`. Unbounded by user-controlled depth, same reasoning as
+/// `get_mission_coverage`.
+pub async fn get_orphan_actions(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<OrphanActionsReport>, ApiError> {
+    let elements = state.neo4j.list_elements(&project_id).await?;
+    let flow_edges = state
+        .neo4j
+        .edges_of_kind(&project_id, EdgeKind::Flow)
+        .await?;
+    let total_actions = elements
+        .iter()
+        .filter(|e| e.kind == NodeKind::Action)
+        .count();
+    let orphaned_ids = sysml_core::check_orphan_actions(&elements, &flow_edges);
+    Ok(Json(OrphanActionsReport {
+        total_actions,
+        orphaned_ids,
+    }))
+}

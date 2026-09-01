@@ -96,14 +96,22 @@ export function computeClusteredNodes(
     }
   }
 
+  // Visited-set guard (CLAUDE.md's own rule: "all traversal must use visited-set cycle
+  // detection, never assume global acyclicity") — real, previously-latent defense-in-depth. This
+  // function's `containsEdges` param is meant to be Contains-only (genuinely acyclic, NFR-REL-02),
+  // so this never used to matter; a real live-browser bug (a caller passing a non-Contains,
+  // genuinely cyclic edge in by mistake) crashed the whole canvas with an unbounded stack before
+  // this guard existed — fixed at the caller too, this is the belt to that fix's suspenders.
   function collectDescendants(id: string): string[] {
     const result: string[] = [];
+    const visited = new Set<string>();
     const stack = [...(childrenOf.get(id) ?? [])];
     while (stack.length > 0) {
       const next = stack.pop();
-      if (!next) {
+      if (!next || visited.has(next)) {
         continue;
       }
+      visited.add(next);
       result.push(next);
       stack.push(...(childrenOf.get(next) ?? []));
     }

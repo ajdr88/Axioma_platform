@@ -4,6 +4,11 @@ export interface AxiomaEdgeData extends Record<string, unknown> {
   /** Whether Edit Mode is on — gates the hover disconnect button below. */
   editable?: boolean;
   onDisconnect?: () => void;
+  /** The real `EdgeKind` this canvas edge was built from — lets a caller distinguish `Contains`
+   * (the only kind clustering's containment walk may ever treat as parent/child) from the other
+   * kinds now also rendered on the main canvas (`ArchDerives`/`IncompatibleWith`/
+   * `ChoiceConstraint`), without parsing the edge's `id` string. */
+  kind?: string;
 }
 
 /**

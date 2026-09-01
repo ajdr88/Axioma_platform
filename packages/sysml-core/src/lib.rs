@@ -47,6 +47,15 @@ pub enum NodeKind {
     Function,
     SelectionChoice,
     ConnectionChoice,
+    /// FR-CORE-13 real build-out (reqs v5 §5.1/§5.11) — a behavioral Activity-diagram Action.
+    /// Blocked since Phase 1 on this exact decision (no merged doc named an Action/Activity
+    /// `NodeKind`; reusing `:Structure` was tried and rejected — no way to distinguish an orphan
+    /// Action from a legitimate unconnected top-level Block). **Deliberately distinct from
+    /// `Function`** (FR-ARCH-01's Mode B architecture-synthesis concept) — reqs v5 §5.17 itself
+    /// draws this line: `Function` is explicitly *not* "fUML Actions used for behavioral
+    /// execution (FR-CORE-04)." No `Activity` container `NodeKind` yet — nothing in the merged
+    /// docs asks for one; only individual Actions and the `Flow` edges between them.
+    Action,
 }
 
 /// Provenance origin (FR-CORE-08, impl §6.3) — who/what created an element. Scaffolding only:
@@ -151,6 +160,7 @@ impl NodeKind {
             NodeKind::Function => "Function",
             NodeKind::SelectionChoice => "SelectionChoice",
             NodeKind::ConnectionChoice => "ConnectionChoice",
+            NodeKind::Action => "Action",
         }
     }
 
@@ -176,6 +186,7 @@ impl NodeKind {
             "Function" => Some(NodeKind::Function),
             "SelectionChoice" => Some(NodeKind::SelectionChoice),
             "ConnectionChoice" => Some(NodeKind::ConnectionChoice),
+            "Action" => Some(NodeKind::Action),
             _ => None,
         }
     }
@@ -251,6 +262,16 @@ pub enum EdgeKind {
     /// guessing ahead of the spec, same discipline already applied to `ArchDerives`/
     /// `IncompatibleWith`/`ChoiceConstraint`.
     Allocate,
+    /// FR-CORE-13 real build-out (reqs v5 §5.1, "orphan Action" well-formedness) — a control/
+    /// object-flow edge between two `Action`s. **Kind-constrained** (both endpoints must be
+    /// `Action` — a real, testable endpoint-legality rule in `check_relationship_endpoints`,
+    /// joining `Satisfy`/`Concerns` as the third), unlike `ArchDerives`/`IncompatibleWith`/
+    /// `ChoiceConstraint`/`Allocate` above, which all stayed kind-unconstrained specifically
+    /// because no dedicated node kind existed yet for their targets — `Action` now does, so there's
+    /// no "guessing ahead of the spec" reason to leave this one open. **Cycle-permitted**, not
+    /// subject to `is_acyclicity_scoped` — SysML Activity flows legitimately loop (a retry/repeat
+    /// branch), the same NFR-REL-02 discipline `ArchDerives`/`Allocate` already follow.
+    Flow,
 }
 
 impl EdgeKind {
@@ -280,6 +301,7 @@ impl EdgeKind {
             EdgeKind::IncompatibleWith => "INCOMPATIBLE_WITH",
             EdgeKind::ChoiceConstraint => "CHOICE_CONSTRAINT",
             EdgeKind::Allocate => "ALLOCATE",
+            EdgeKind::Flow => "FLOW",
         }
     }
 
@@ -304,6 +326,7 @@ impl EdgeKind {
             "INCOMPATIBLE_WITH" => Some(EdgeKind::IncompatibleWith),
             "CHOICE_CONSTRAINT" => Some(EdgeKind::ChoiceConstraint),
             "ALLOCATE" => Some(EdgeKind::Allocate),
+            "FLOW" => Some(EdgeKind::Flow),
             _ => None,
         }
     }
@@ -395,6 +418,14 @@ pub enum ValidationError {
         value: f64,
         bound: f64,
     },
+    /// FR-ARCH-03 real build-out — a `:ConnectionChoice` resolution whose connection count
+    /// violates its own structured `cardinality` property. See
+    /// [`check_connection_cardinality`].
+    CardinalityViolation {
+        element_id: ElementId,
+        resolved_count: usize,
+        cardinality: serde_json::Value,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -438,6 +469,15 @@ impl std::fmt::Display for ValidationError {
                 f,
                 "{element_id}: {metric} {value} exceeds the {bound} bound without an \
                  acknowledged override"
+            ),
+            ValidationError::CardinalityViolation {
+                element_id,
+                resolved_count,
+                cardinality,
+            } => write!(
+                f,
+                "{element_id}: resolving {resolved_count} connection(s) violates its \
+                 cardinality rule {cardinality}"
             ),
         }
     }
@@ -512,6 +552,87 @@ pub fn would_create_containment_cycle(existing: &[Edge], parent: &str, child: &s
     false
 }
 
+/// One [`compute_derived_existence`] result: every id reachable from the seed set by following
+/// `ArchDerives` edges ("if selected, these elements exist" — FR-ARCH-02, reqs v5 §5.17), plus
+/// which of those ids sit on a real cycle (a genuine back-edge found during the walk, not a
+/// separate SCC pass). `derived_ids` always includes every seed itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DerivedExistence {
+    pub derived_ids: HashSet<ElementId>,
+    pub within_cycle: HashSet<ElementId>,
+}
+
+/// Evaluates `ArchDerives`' existence-implication semantics from a set of "directly asserted to
+/// exist" seed ids (e.g. resolved `SelectionChoice` ids) — the opposite discipline from
+/// [`would_create_containment_cycle`]: cycles here are legal and expected (NFR-REL-02,
+/// `ArchDerives`'s own doc comment — the spec's own literal example is mutually-dependent
+/// Compressor/Combustor/Turbine existence), so this walks *through* a cycle instead of rejecting
+/// it, using standard white/gray/black DFS coloring (`stack` = the current path/"gray" set,
+/// `finished` = fully-explored/"black") — a back edge to a node still on `stack` is a real cycle;
+/// every id on the stack from that ancestor down to the current node is part of it.
+pub fn compute_derived_existence(seed_ids: &[&str], edges: &[Edge]) -> DerivedExistence {
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in edges {
+        if edge.kind == EdgeKind::ArchDerives {
+            adjacency
+                .entry(edge.source.clone())
+                .or_default()
+                .push(edge.target.clone());
+        }
+    }
+
+    let mut derived_ids: HashSet<String> = HashSet::new();
+    let mut within_cycle: HashSet<String> = HashSet::new();
+    let mut finished: HashSet<String> = HashSet::new();
+
+    for &seed in seed_ids {
+        derived_ids.insert(seed.to_string());
+        if !finished.contains(seed) {
+            let mut stack: Vec<String> = Vec::new();
+            derive_existence_dfs(
+                seed,
+                &adjacency,
+                &mut stack,
+                &mut finished,
+                &mut derived_ids,
+                &mut within_cycle,
+            );
+        }
+    }
+
+    DerivedExistence {
+        derived_ids,
+        within_cycle,
+    }
+}
+
+fn derive_existence_dfs(
+    node: &str,
+    adjacency: &HashMap<String, Vec<String>>,
+    stack: &mut Vec<String>,
+    finished: &mut HashSet<String>,
+    derived_ids: &mut HashSet<String>,
+    within_cycle: &mut HashSet<String>,
+) {
+    stack.push(node.to_string());
+
+    if let Some(neighbors) = adjacency.get(node) {
+        for next in neighbors {
+            derived_ids.insert(next.clone());
+            if let Some(cycle_start) = stack.iter().position(|id| id == next) {
+                for id in &stack[cycle_start..] {
+                    within_cycle.insert(id.clone());
+                }
+            } else if !finished.contains(next) {
+                derive_existence_dfs(next, adjacency, stack, finished, derived_ids, within_cycle);
+            }
+        }
+    }
+
+    stack.pop();
+    finished.insert(node.to_string());
+}
+
 /// Rejects re-importing an element id under a different `NodeKind` than it already has.
 /// `existing_kind` is the id's current kind, if it exists at all — pass `None` for a new id.
 pub fn check_kind_conflict(
@@ -561,6 +682,12 @@ pub fn check_relationship_endpoints(
             source_kind == NodeKind::Requirement && target_kind == NodeKind::Requirement
         }
         EdgeKind::Member => source_kind == NodeKind::Collection,
+        // FR-CORE-13 real build-out — the third real endpoint-legality rule (joining Satisfy/
+        // Concerns above), not left in the kind-unconstrained catch-all like ArchDerives/
+        // IncompatibleWith/ChoiceConstraint/Allocate: those stayed open specifically because no
+        // dedicated node kind existed yet for their targets, which no longer applies here now
+        // that `Action` is real.
+        EdgeKind::Flow => source_kind == NodeKind::Action && target_kind == NodeKind::Action,
         _ => true,
     };
     if legal {
@@ -574,6 +701,31 @@ pub fn check_relationship_endpoints(
             target_kind,
         })
     }
+}
+
+/// FR-CORE-13 real build-out (reqs v5 §5.1's "orphan Action" well-formedness rule) — flags every
+/// `Action` with zero `Flow` edges (in or out). **A report, not a write-time reject** — mirrors the
+/// existing "flag a wrong-but-not-illegal-to-create state" precedent this codebase already uses
+/// for orphaned Requirements (`apps/api/src/traceability.rs::get_mission_coverage`'s own
+/// `orphaned` list): a freshly-created Action necessarily has zero `Flow` edges right *after*
+/// creation, so rejecting creation itself would make Actions uncreatable. The complementary
+/// half — rejecting a delete that would orphan a *previously*-connected Action — lives at the
+/// generic edge-deletion call site instead (`apps/api/src/main.rs::delete_edge`), the same
+/// "reject the specific mutation that would produce an illegal state" shape
+/// `would_create_containment_cycle` already uses, just on delete instead of create.
+pub fn check_orphan_actions(elements: &[Element], edges: &[Edge]) -> Vec<ElementId> {
+    let mut connected: HashSet<&str> = HashSet::new();
+    for edge in edges {
+        if edge.kind == EdgeKind::Flow {
+            connected.insert(edge.source.as_str());
+            connected.insert(edge.target.as_str());
+        }
+    }
+    elements
+        .iter()
+        .filter(|e| e.kind == NodeKind::Action && !connected.contains(e.id.as_str()))
+        .map(|e| e.id.clone())
+        .collect()
 }
 
 /// FR-COMP-03 (docs/IMPLEMENTATION_KICKOFF.md Phase 3) — rejects a compressor-subsystem
@@ -683,6 +835,55 @@ pub fn check_compressor_spec_achievability(
     AchievabilityResult {
         implied_velocity_ft_per_sec,
         achievable: implied_velocity_ft_per_sec <= max_outlet_velocity_ft_per_sec,
+    }
+}
+
+/// FR-ARCH-03 real build-out (reqs v5 §5.17) — rejects a `:ConnectionChoice` resolution whose
+/// connection count violates its own structured `cardinality` property. **No doc pins down a
+/// concrete JSON encoding** for the three named categories (list/range/lower-bound-only) — this
+/// crate's own convention, chosen here: `{"type": "range", "min": N, "max": M|null}` covers both
+/// "range" (`max` set) and "lower-bound-only" (`max: null`); `{"type": "list", "allowed": [N, M,
+/// ...]}` covers exact allowed counts. A missing/malformed `cardinality` (no recognized `type`) is
+/// treated as "anything goes" (`Ok`) rather than a hard failure — matching how every other
+/// optional/absent body property in this codebase is treated: absence isn't a violation of a rule
+/// that was never actually stated.
+pub fn check_connection_cardinality(
+    element_id: &str,
+    cardinality: &serde_json::Value,
+    resolved_count: usize,
+) -> Result<(), ValidationError> {
+    let violates = match cardinality.get("type").and_then(|v| v.as_str()) {
+        Some("range") => {
+            let min = cardinality.get("min").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let max = cardinality
+                .get("max")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            resolved_count < min || max.is_some_and(|max| resolved_count > max)
+        }
+        Some("list") => {
+            let allowed: Vec<usize> = cardinality
+                .get("allowed")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
+            !allowed.is_empty() && !allowed.contains(&resolved_count)
+        }
+        _ => false,
+    };
+
+    if violates {
+        Err(ValidationError::CardinalityViolation {
+            element_id: element_id.to_string(),
+            resolved_count,
+            cardinality: cardinality.clone(),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -1177,6 +1378,78 @@ mod tests {
         .is_err());
     }
 
+    /// FR-CORE-13 real build-out: `Flow` is the third real endpoint-legality rule — both ends
+    /// must be `Action`, unlike the FR-ARCH edges above which stay deliberately unconstrained.
+    #[test]
+    fn accepts_legal_flow_endpoint_between_two_actions() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Flow,
+            "Arm",
+            NodeKind::Action,
+            "Ignite",
+            NodeKind::Action,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_illegal_flow_endpoint_touching_a_non_action() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Flow,
+            "Arm",
+            NodeKind::Action,
+            "Turbine",
+            NodeKind::Structure,
+        )
+        .is_err());
+    }
+
+    fn action(id: &str) -> Element {
+        Element {
+            id: id.to_string(),
+            kind: NodeKind::Action,
+            name: id.to_string(),
+            active: true,
+            origin: Origin::Human,
+        }
+    }
+
+    fn flow(source: &str, target: &str) -> Edge {
+        Edge {
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: EdgeKind::Flow,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn check_orphan_actions_flags_only_the_disconnected_action() {
+        let elements = vec![action("Arm"), action("Ignite"), action("Lonely")];
+        let edges = vec![flow("Arm", "Ignite")];
+        let orphans = check_orphan_actions(&elements, &edges);
+        assert_eq!(orphans, vec!["Lonely".to_string()]);
+    }
+
+    #[test]
+    fn check_orphan_actions_finds_none_when_every_action_has_a_flow() {
+        let elements = vec![action("Arm"), action("Ignite"), action("Cutoff")];
+        let edges = vec![flow("Arm", "Ignite"), flow("Ignite", "Cutoff")];
+        assert!(check_orphan_actions(&elements, &edges).is_empty());
+    }
+
+    #[test]
+    fn check_orphan_actions_ignores_non_action_elements_and_non_flow_edges() {
+        let elements = vec![action("Arm"), structure("Turbine")];
+        // A Contains edge shouldn't count as connecting "Arm", and "Turbine" (not an Action)
+        // should never appear in the result even though it has no Flow edges either.
+        let edges = vec![contains("Turbine", "Arm")];
+        assert_eq!(
+            check_orphan_actions(&elements, &edges),
+            vec!["Arm".to_string()]
+        );
+    }
+
     /// Phase 1 (FR-ARCH): `ArchDerives`/`IncompatibleWith`/`ChoiceConstraint` are deliberately
     /// kind-unconstrained — the spec keeps them generic across any DSG-participating node.
     #[test]
@@ -1294,6 +1567,53 @@ mod tests {
     }
 
     #[test]
+    fn connection_cardinality_range_accepts_within_bounds_rejects_outside() {
+        let cardinality = serde_json::json!({"type": "range", "min": 1, "max": 3});
+        assert!(check_connection_cardinality("X", &cardinality, 1).is_ok());
+        assert!(check_connection_cardinality("X", &cardinality, 3).is_ok());
+        assert!(check_connection_cardinality("X", &cardinality, 0).is_err());
+        assert!(check_connection_cardinality("X", &cardinality, 4).is_err());
+    }
+
+    #[test]
+    fn connection_cardinality_lower_bound_only_has_no_upper_limit() {
+        let cardinality = serde_json::json!({"type": "range", "min": 2, "max": null});
+        assert!(check_connection_cardinality("X", &cardinality, 1).is_err());
+        assert!(check_connection_cardinality("X", &cardinality, 2).is_ok());
+        assert!(check_connection_cardinality("X", &cardinality, 1000).is_ok());
+    }
+
+    #[test]
+    fn connection_cardinality_list_only_accepts_exact_counts() {
+        let cardinality = serde_json::json!({"type": "list", "allowed": [1, 3]});
+        assert!(check_connection_cardinality("X", &cardinality, 1).is_ok());
+        assert!(check_connection_cardinality("X", &cardinality, 3).is_ok());
+        assert!(check_connection_cardinality("X", &cardinality, 2).is_err());
+    }
+
+    #[test]
+    fn connection_cardinality_missing_or_unrecognized_type_allows_anything() {
+        assert!(check_connection_cardinality("X", &serde_json::Value::Null, 999).is_ok());
+        assert!(
+            check_connection_cardinality("X", &serde_json::json!({"type": "unknown"}), 999).is_ok()
+        );
+    }
+
+    #[test]
+    fn connection_cardinality_violation_error_carries_the_real_count_and_rule() {
+        let cardinality = serde_json::json!({"type": "range", "min": 1, "max": 1});
+        let err = check_connection_cardinality("BleedAirRouting", &cardinality, 2).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::CardinalityViolation {
+                element_id: "BleedAirRouting".to_string(),
+                resolved_count: 2,
+                cardinality,
+            }
+        );
+    }
+
+    #[test]
     fn element_body_and_geometry_pointer_roundtrip() {
         let body = ElementBody {
             element_id: "REQ-THRUST".to_string(),
@@ -1375,6 +1695,85 @@ mod tests {
         assert_eq!(
             SolverResultState::SuspectNumerical.as_str(),
             "Suspect-Numerical"
+        );
+    }
+
+    fn arch_derives(source: &str, target: &str) -> Edge {
+        Edge {
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: EdgeKind::ArchDerives,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn compute_derived_existence_walks_a_linear_chain_with_no_cycle() {
+        let edges = vec![arch_derives("X", "Y"), arch_derives("Y", "Z")];
+        let result = compute_derived_existence(&["X"], &edges);
+        assert_eq!(
+            result.derived_ids,
+            HashSet::from(["X".to_string(), "Y".to_string(), "Z".to_string()])
+        );
+        assert!(
+            result.within_cycle.is_empty(),
+            "a linear chain has no cycle"
+        );
+    }
+
+    /// FR-ARCH-02's own literal example: mutually-dependent Compressor/Combustor/Turbine
+    /// existence. Confirms the evaluator terminates (doesn't infinite-loop on a real 3-cycle) and
+    /// correctly flags every node on it — the case `would_create_containment_cycle` would reject
+    /// outright, and this function must instead evaluate through.
+    #[test]
+    fn compute_derived_existence_evaluates_through_a_real_three_cycle() {
+        let edges = vec![
+            arch_derives("Compressor", "Combustor"),
+            arch_derives("Combustor", "Turbine"),
+            arch_derives("Turbine", "Compressor"),
+        ];
+        let result = compute_derived_existence(&["Compressor"], &edges);
+        let expected = HashSet::from([
+            "Compressor".to_string(),
+            "Combustor".to_string(),
+            "Turbine".to_string(),
+        ]);
+        assert_eq!(result.derived_ids, expected);
+        assert_eq!(
+            result.within_cycle, expected,
+            "every node on the 3-cycle must be flagged, not just the back-edge's two endpoints"
+        );
+    }
+
+    #[test]
+    fn compute_derived_existence_only_flags_the_nodes_actually_on_the_cycle() {
+        // Seed -> A -> B -> A (a cycle between A/B); Seed itself is upstream of the cycle, not
+        // part of it, and must not be flagged.
+        let edges = vec![
+            arch_derives("Seed", "A"),
+            arch_derives("A", "B"),
+            arch_derives("B", "A"),
+        ];
+        let result = compute_derived_existence(&["Seed"], &edges);
+        assert_eq!(
+            result.derived_ids,
+            HashSet::from(["Seed".to_string(), "A".to_string(), "B".to_string()])
+        );
+        assert_eq!(
+            result.within_cycle,
+            HashSet::from(["A".to_string(), "B".to_string()]),
+            "Seed is upstream of the cycle, not on it"
+        );
+    }
+
+    #[test]
+    fn compute_derived_existence_ignores_non_arch_derives_edges() {
+        let edges = vec![contains("X", "Y"), arch_derives("X", "Z")];
+        let result = compute_derived_existence(&["X"], &edges);
+        assert_eq!(
+            result.derived_ids,
+            HashSet::from(["X".to_string(), "Z".to_string()]),
+            "a Contains edge must not be walked as if it were ArchDerives"
         );
     }
 }

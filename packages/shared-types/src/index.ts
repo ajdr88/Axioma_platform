@@ -26,7 +26,9 @@ export type NodeKind =
   | "CandidateStructureSuggestion"
   | "Function"
   | "SelectionChoice"
-  | "ConnectionChoice";
+  | "ConnectionChoice"
+  // FR-CORE-13 real build-out — mirrors packages/sysml-core/src/lib.rs's NodeKind::Action exactly.
+  | "Action";
 
 export type EdgeKind =
   | "Contains"
@@ -47,7 +49,9 @@ export type EdgeKind =
   | "IncompatibleWith"
   | "ChoiceConstraint"
   // Phase 5 (FR-CORE-12) — mirrors packages/sysml-core/src/lib.rs's EdgeKind::Allocate exactly.
-  | "Allocate";
+  | "Allocate"
+  // FR-CORE-13 real build-out — mirrors packages/sysml-core/src/lib.rs's EdgeKind::Flow exactly.
+  | "Flow";
 
 /** FR-CORE-08 provenance origin — who/what created an element. */
 export type Origin = "Human" | "AiSuggested" | "AiAutoMerged";

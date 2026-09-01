@@ -22,19 +22,22 @@ Fix first — these undermine guarantees the rest of the platform already relies
    CI job seeds the real fixture and runs a new automated assertion (`p95 < 2s` for NFR-PERF-04
    traceability), failing the build on regression. The browser-side "load < 5s; client memory <
    2GB" half is still not covered — flagged, not silently dropped; a separate, heavier follow-up.
-2. **FR-ARCH-02: no cyclic `ArchDerives` derivation graph.** Mode B's design space can't represent
-   genuinely interdependent subsystems (e.g. Compressor/Combustor/Turbine existence depending on
-   each other), even though the schema explicitly permits cycles. Undermines trust in every
-   downstream FR-ARCH capability (generate-instances/propose/viability). Impl v5 §20.3 scope note;
-   test spec T-ARCH-02 (cyclic half unbuilt).
-3. **FR-ARCH-03: no `ConnectionChoice` cardinality enforcement.** The `cardinality` field
-   (list/range/lower-bound-only) is still plain descriptive text with zero enforcement anywhere in
-   `sysml-core`/`apps/api` — the "resolved after selection choices" ordering half is real, the
-   enforcement half is not. Impl v5 §20.3; test spec T-ARCH-03.
-4. **FR-CORE-13: orphan-Action rejection missing.** Blocked on an undecided Action/Activity
-   `NodeKind` — no merged doc makes that decision yet — but until resolved this is a real hole in
-   "every write is validated." `CLAUDE.md` data-model section; impl v5 §16.5/§18.1/§18.3; test spec
-   T-CORE-12-01 orphan half, T-INFO-02 (same blocker).
+2. ~~**FR-ARCH-02: no cyclic `ArchDerives` derivation graph.**~~ **Closed 2026-09-01 (impl v5
+   §23.2).** `sysml_core::compute_derived_existence` evaluates through real cycles; a new
+   `derived-existence` endpoint exposes it; `Turbofan-Ref`'s seed now carries the requirement's own
+   literal Compressor/Combustor/Turbine example as real content, confirmed end to end by a new
+   integration test.
+3. ~~**FR-ARCH-03: no `ConnectionChoice` cardinality enforcement.**~~ **Closed 2026-09-01 (impl v5
+   §23.3).** `sysml_core::check_connection_cardinality` enforces a new structured cardinality shape
+   (this pass's own invented encoding — no doc specifies one); `resolve_choice` now accepts a real
+   `connections` array and validates its count, confirmed end to end against real seeded content.
+4. ~~**FR-CORE-13: orphan-Action rejection missing.**~~ **Closed 2026-09-01 (impl v5 §23.4).** Real
+   `Action`/`Flow` kinds now exist; the "rejection" is a last-Flow-edge deletion guard plus an
+   orphan-Actions report (a hard reject-on-create was structurally impossible — a fresh Action
+   necessarily starts with zero Flow edges). The Decision-node guard-conflict half of FR-CORE-13
+   remains explicitly not built (needs a Decision node + guard expressions + a satisfiability
+   check). Building this also found and fixed a real, previously-latent canvas-crashing bug
+   (`RangeError: Invalid array length`) exposed by FR-ARCH-02's own new cyclic seed content.
 
 ## Tier 1 — Product 2 / Mode B maturity
 
@@ -119,3 +122,6 @@ unstarted future phases.
 
 *Starting point chosen 2026-09-01: Tier 0, in order — item 1 (wire T-P1.4-06 into CI) first as the
 cheapest, highest-leverage fix, then FR-ARCH-02/03 and FR-CORE-13.*
+
+*Update 2026-09-01: all four Tier 0 items closed (impl v5 §23.1–§23.4). Tier 1 (Product 2 / Mode B
+maturity — items 5–10 above) is the natural next tier, not yet started.*

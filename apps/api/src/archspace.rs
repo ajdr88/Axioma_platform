@@ -661,6 +661,17 @@ pub(crate) async fn propose(
 pub(crate) struct ResolveChoiceRequest {
     #[serde(default)]
     pub(crate) selected_option: Option<String>,
+    /// FR-ARCH-03 real build-out — only meaningful for `:ConnectionChoice`. Absent/empty means
+    /// "resolving zero connections," validated against `cardinality` like any other count.
+    #[serde(default)]
+    pub(crate) connections: Vec<ConnectionPair>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConnectionPair {
+    pub(crate) source: String,
+    pub(crate) target: String,
 }
 
 /// `PATCH /api/v0/projects/:projectId/cem/archspace/choices/:id/resolve` — FR-ARCH-02/03's real,
@@ -741,6 +752,21 @@ pub(crate) async fn resolve_choice(
                 }
             }
         }
+
+        // FR-ARCH-03's cardinality-*enforcement* half (the ordering check above is its other
+        // half). `cardinality` stays untouched if absent/malformed (see
+        // `check_connection_cardinality`'s own doc comment) -- this only rejects a genuine,
+        // stated violation.
+        let cardinality = properties
+            .get("cardinality")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        sysml_core::check_connection_cardinality(&id, &cardinality, payload.connections.len())?;
+        properties.insert(
+            "resolvedConnections".to_string(),
+            serde_json::to_value(&payload.connections)
+                .expect("Vec<ConnectionPair> always serializes"),
+        );
     }
 
     let old_state = properties
@@ -932,6 +958,50 @@ pub(crate) async fn resolution_status(
         state: state_label,
         resolved,
         total,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DerivedExistenceQuery {
+    /// Comma-separated element ids "directly asserted to exist" — the DFS's own seed set.
+    pub(crate) seed_ids: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DerivedExistenceResponse {
+    pub(crate) derived_element_ids: Vec<String>,
+    pub(crate) within_cycle: Vec<String>,
+}
+
+/// `GET /api/v0/projects/:projectId/cem/archspace/:subsystemId/derived-existence?seedIds=A,B,C` —
+/// FR-ARCH-02's own direct HTTP surface: given a caller-supplied seed set (e.g. the project's
+/// currently-resolved `SelectionChoice` ids), evaluates `sysml_core::compute_derived_existence`
+/// against the project's real `ArchDerives` edges. `subsystemId` is accepted for URL-shape
+/// consistency with `define`/`resolution-status` above but not otherwise used — `ArchDerives`
+/// derivation genuinely crosses subsystem boundaries (the spec's own literal example is
+/// Compressor/Combustor/Turbine, three different subsystems), so this deliberately evaluates over
+/// every `ArchDerives` edge in the project, not just one subsystem's.
+pub(crate) async fn derived_existence(
+    State(state): State<AppState>,
+    Path((project_id, _subsystem_id)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<DerivedExistenceQuery>,
+) -> Result<Json<DerivedExistenceResponse>, ApiError> {
+    let seed_ids: Vec<&str> = query
+        .seed_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect();
+    let edges = state
+        .neo4j
+        .edges_of_kind(&project_id, EdgeKind::ArchDerives)
+        .await?;
+    let result = sysml_core::compute_derived_existence(&seed_ids, &edges);
+    Ok(Json(DerivedExistenceResponse {
+        derived_element_ids: result.derived_ids.into_iter().collect(),
+        within_cycle: result.within_cycle.into_iter().collect(),
     }))
 }
 

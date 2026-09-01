@@ -58,6 +58,8 @@ const kindAccent: Partial<Record<NodeKind, { dot: string; band: string }>> = {
   Function: { dot: "bg-[#B98CE8]", band: "bg-[#B98CE8]/10" },
   SelectionChoice: { dot: "bg-[#E8A93A]", band: "bg-[#E8A93A]/10" },
   ConnectionChoice: { dot: "bg-[#3AC7E8]", band: "bg-[#3AC7E8]/10" },
+  // FR-CORE-13 real build-out — same extensibility point, one more kind.
+  Action: { dot: "bg-[#6EE89A]", band: "bg-[#6EE89A]/10" },
 };
 
 /** A single-character shape-cue next to the header dot, rendered in the same slot `hasHazard`'s
@@ -67,6 +69,7 @@ const kindGlyph: Partial<Record<NodeKind, string>> = {
   Function: "ƒ",
   SelectionChoice: "◈",
   ConnectionChoice: "⇄",
+  Action: "▶",
 };
 
 /**

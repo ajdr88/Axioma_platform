@@ -267,6 +267,10 @@ async fn main() -> anyhow::Result<()> {
             get(traceability::get_mission_coverage),
         )
         .route(
+            "/api/v0/projects/:projectId/validation/orphan-actions",
+            get(traceability::get_orphan_actions),
+        )
+        .route(
             "/api/v0/projects/:projectId/cem/mode-a/query",
             post(mode_a::query),
         )
@@ -341,6 +345,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v0/projects/:projectId/cem/archspace/:subsystemId/resolution-status",
             get(archspace::resolution_status),
+        )
+        .route(
+            "/api/v0/projects/:projectId/cem/archspace/:subsystemId/derived-existence",
+            get(archspace::derived_existence),
         )
         .route(
             "/api/v0/projects/:projectId/simulate/hello-world",
@@ -1138,7 +1146,13 @@ async fn create_edge(
     Ok(Json(edge))
 }
 
-/// Generic edge removal — no validation gate needed, same reasoning as `delete_contains_edge`.
+/// Generic edge removal — no validation gate needed for most kinds, same reasoning as
+/// `delete_contains_edge`. **Exception, FR-CORE-13 real build-out**: deleting a `Flow` edge is
+/// rejected if it's the last remaining `Flow` edge (in or out) of either endpoint — the same
+/// "reject the specific mutation that would produce an illegal state" shape `create_edge`'s own
+/// dangling-edge/cycle checks already use, just on delete instead of create (see
+/// `sysml_core::check_orphan_actions`'s own doc comment for why this can't be a create-time check
+/// instead).
 async fn delete_edge(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1151,6 +1165,30 @@ async fn delete_edge(
         kind: payload.kind,
         metadata: None,
     };
+
+    if edge.kind == EdgeKind::Flow {
+        let flow_edges = state
+            .neo4j
+            .edges_of_kind(&project_id, EdgeKind::Flow)
+            .await?;
+        for endpoint in [&edge.source, &edge.target] {
+            let remaining_after_delete = flow_edges
+                .iter()
+                .filter(|e| {
+                    (e.source == *endpoint || e.target == *endpoint)
+                        && !(e.source == edge.source && e.target == edge.target)
+                })
+                .count();
+            if remaining_after_delete == 0 {
+                return Err(import::BadRequest(format!(
+                    "cannot delete this Flow edge: it is {endpoint}'s only remaining Flow edge, \
+                     which would leave it orphaned"
+                ))
+                .into());
+            }
+        }
+    }
+
     state.neo4j.delete_edge(&project_id, &edge).await?;
     record_commit(
         &state,
@@ -2354,6 +2392,36 @@ async fn seed_fr_arch_system_model(
         });
     }
 
+    // FR-ARCH-02 real build-out: a genuine cyclic derivation, directly between the real seeded
+    // subsystem Structures rather than a synthetic unit-test-only fixture — the spec's own literal
+    // example (reqs v5 §5.17, FR-ARCH-02): "mutually-dependent Compressor/Combustor/Turbine
+    // existence." Proves `sysml_core::compute_derived_existence` evaluates *through* a real cycle
+    // in this project's own seeded content, not just in isolation.
+    let cyclic_derivations = [
+        ("CoreHpCompressor", "Combustor"),
+        ("Combustor", "TurbineHpLp"),
+        ("TurbineHpLp", "CoreHpCompressor"),
+    ];
+    for (source, target) in cyclic_derivations {
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: source.to_string(),
+                    target: target.to_string(),
+                    kind: EdgeKind::ArchDerives,
+                    metadata: None,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: EdgeKind::ArchDerives,
+        });
+    }
+
     struct ConnectionChoiceSeed {
         id: &'static str,
         name: &'static str,
@@ -2368,6 +2436,9 @@ async fn seed_fr_arch_system_model(
     // the engine System-of-Interest, so no target Port element exists for it") -- there was no
     // real connector-shaped element to reference, so this pass invents one purely as an
     // encode-target name, not a claim that a real `:Port` element for it now exists.
+    // `cardinality` (FR-ARCH-03 real build-out) is now the structured shape
+    // `sysml_core::check_connection_cardinality` actually enforces, not a free-text label --
+    // both of these are genuinely "exactly one connection," `{"type": "range", "min": 1, "max": 1}`.
     let connection_choices = [
         ConnectionChoiceSeed {
             id: "BleedAirRouting",
@@ -2375,7 +2446,7 @@ async fn seed_fr_arch_system_model(
             properties: serde_json::json!({
                 "sourcePortId": "CoreBleedOfftakePort",
                 "targetBoundary": "external ECS/airframe port -- outside the engine System-of-Interest (reqs v5 §5.16's reconciliation table), so no target Port element exists for it",
-                "cardinality": "single connection",
+                "cardinality": {"type": "range", "min": 1, "max": 1},
                 "sourceConnectorNames": ["CoreBleedOfftakePort"],
                 "targetConnectorNames": ["EcsExternalConnector"],
             }),
@@ -2386,7 +2457,7 @@ async fn seed_fr_arch_system_model(
             properties: serde_json::json!({
                 "sourceSelectionChoiceId": "PowerOfftake",
                 "targetPortId": "ControlAccessoryPort",
-                "cardinality": "single connection, resolved after the PowerOfftake selection choice",
+                "cardinality": {"type": "range", "min": 1, "max": 1},
                 "sourceConnectorNames": ["PowerOfftake"],
                 "targetConnectorNames": ["ControlAccessoryPort"],
             }),
@@ -5671,6 +5742,51 @@ mod tests {
         );
     }
 
+    /// FR-ARCH-02's real build-out — confirms `derived_existence` evaluates through the real,
+    /// genuinely cyclic seed content (`main.rs`'s own `cyclic_derivations`:
+    /// CoreHpCompressor->Combustor->TurbineHpLp->CoreHpCompressor), not just a unit-test-only
+    /// fixture. No sidecar needed — this is a pure Neo4j read + `sysml_core::
+    /// compute_derived_existence`, unlike `define`/`decode`/`evaluate` above.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn derived_existence_evaluates_through_the_real_seeded_cycle() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-derived-existence").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let response = archspace::derived_existence(
+            State(state.clone()),
+            Path((project.id.clone(), "CoreHpCompressor".to_string())),
+            axum::extract::Query(archspace::DerivedExistenceQuery {
+                seed_ids: "CoreHpCompressor".to_string(),
+            }),
+        )
+        .await
+        .expect("evaluating derived existence against real seeded content")
+        .0;
+
+        let derived: std::collections::HashSet<&str> = response
+            .derived_element_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            derived.contains("CoreHpCompressor")
+                && derived.contains("Combustor")
+                && derived.contains("TurbineHpLp"),
+            "expected the real 3-cycle's full closure, got {:?}",
+            response.derived_element_ids
+        );
+
+        let within_cycle: std::collections::HashSet<&str> =
+            response.within_cycle.iter().map(String::as_str).collect();
+        assert_eq!(
+            within_cycle,
+            std::collections::HashSet::from(["CoreHpCompressor", "Combustor", "TurbineHpLp"]),
+            "expected every node on the real cycle flagged, none extra"
+        );
+    }
+
     /// FR-ARCH-07's "browsable, comparable set" half — `generate_instances` decodes real instances
     /// from real seeded content, each carrying a real FR-ARCH-08 viability signal.
     #[tokio::test]
@@ -5946,6 +6062,7 @@ mod tests {
             Path((project.id.clone(), "BleedOfftakeStage".to_string())),
             Json(archspace::ResolveChoiceRequest {
                 selected_option: Some("Stage 2".to_string()),
+                connections: vec![],
             }),
         )
         .await
@@ -5973,6 +6090,7 @@ mod tests {
             Path((project.id.clone(), "MixedNozzle".to_string())),
             Json(archspace::ResolveChoiceRequest {
                 selected_option: Some("not-a-real-option".to_string()),
+                connections: vec![],
             }),
         )
         .await;
@@ -5983,10 +6101,86 @@ mod tests {
             Path((project.id.clone(), "MixedNozzle".to_string())),
             Json(archspace::ResolveChoiceRequest {
                 selected_option: Some("mixed".to_string()),
+                connections: vec![],
             }),
         )
         .await
         .expect("resolving MixedNozzle to a real option should succeed");
+    }
+
+    /// FR-ARCH-03's cardinality-*enforcement* half, against the real seeded `BleedAirRouting`
+    /// `:ConnectionChoice` (`{"type": "range", "min": 1, "max": 1}`, no ordering prerequisite, so
+    /// it's directly resolvable). Confirms: 0 connections is rejected (below `min`), 2 is rejected
+    /// (above `max`), exactly 1 succeeds and is genuinely persisted as `resolvedConnections`.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn resolve_choice_enforces_connection_choice_cardinality() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-cardinality").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let too_few = archspace::resolve_choice(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), "BleedAirRouting".to_string())),
+            Json(archspace::ResolveChoiceRequest {
+                selected_option: None,
+                connections: vec![],
+            }),
+        )
+        .await;
+        assert!(too_few.is_err(), "0 connections violates min:1");
+
+        let too_many = archspace::resolve_choice(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), "BleedAirRouting".to_string())),
+            Json(archspace::ResolveChoiceRequest {
+                selected_option: None,
+                connections: vec![
+                    archspace::ConnectionPair {
+                        source: "CoreBleedOfftakePort".to_string(),
+                        target: "EcsExternalConnector".to_string(),
+                    },
+                    archspace::ConnectionPair {
+                        source: "CoreBleedOfftakePort".to_string(),
+                        target: "SomeOtherConnector".to_string(),
+                    },
+                ],
+            }),
+        )
+        .await;
+        assert!(too_many.is_err(), "2 connections violates max:1");
+
+        let just_right = archspace::resolve_choice(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project.id.clone(), "BleedAirRouting".to_string())),
+            Json(archspace::ResolveChoiceRequest {
+                selected_option: None,
+                connections: vec![archspace::ConnectionPair {
+                    source: "CoreBleedOfftakePort".to_string(),
+                    target: "EcsExternalConnector".to_string(),
+                }],
+            }),
+        )
+        .await;
+        assert_eq!(just_right.unwrap(), StatusCode::NO_CONTENT);
+
+        let body = state
+            .postgres
+            .get_body(&project.id, "BleedAirRouting")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body["properties"]["resolvedConnections"],
+            serde_json::json!([{"source": "CoreBleedOfftakePort", "target": "EcsExternalConnector"}])
+        );
+        assert_eq!(
+            body["properties"]["resolutionState"].as_str(),
+            Some("resolved")
+        );
     }
 
     /// FR-ARCH-04 enforcement, isolated from any particular seed content: a three-choice fixture
@@ -6061,6 +6255,7 @@ mod tests {
             Path((project.id.clone(), "ChoiceA".to_string())),
             Json(archspace::ResolveChoiceRequest {
                 selected_option: Some("red".to_string()),
+                connections: vec![],
             }),
         )
         .await
@@ -6073,6 +6268,7 @@ mod tests {
             Path((project.id.clone(), "ChoiceB".to_string())),
             Json(archspace::ResolveChoiceRequest {
                 selected_option: Some("square".to_string()),
+                connections: vec![],
             }),
         )
         .await;
@@ -6089,6 +6285,7 @@ mod tests {
             Path((project.id.clone(), "ChoiceC".to_string())),
             Json(archspace::ResolveChoiceRequest {
                 selected_option: Some("north".to_string()),
+                connections: vec![],
             }),
         )
         .await
@@ -7578,6 +7775,197 @@ mod tests {
         assert!(allocate_edges
             .iter()
             .any(|e| e.source == "SomeAction" && e.target == "OwningLane"));
+    }
+
+    async fn make_action(neo4j: &Neo4jStore, project_id: &str, id: &str) {
+        neo4j
+            .upsert_element(
+                project_id,
+                &Element {
+                    id: id.to_string(),
+                    kind: NodeKind::Action,
+                    name: id.to_string(),
+                    active: true,
+                    origin: Origin::Human,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// FR-CORE-13 real build-out: `Flow` round-trips through the generic edge endpoint like
+    /// `Allocate` above, and its real endpoint-legality rule (both ends must be `Action`) is
+    /// actually enforced through `create_edge` -> `Neo4jStore::create_edge` ->
+    /// `sysml_core::check_relationship_endpoints`, not just unit-tested in isolation.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn flow_edge_round_trips_and_rejects_a_non_action_endpoint() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "flow-edge").await;
+        make_action(&state.neo4j, &project.id, "Arm").await;
+        make_action(&state.neo4j, &project.id, "Ignite").await;
+        make_structure(&state.neo4j, &project.id, "NotAnAction").await;
+
+        let _ = create_edge(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(CreateEdgeRequest {
+                source: "Arm".to_string(),
+                target: "Ignite".to_string(),
+                kind: EdgeKind::Flow,
+                metadata: None,
+            }),
+        )
+        .await
+        .expect("Action -> Action Flow edge should be legal");
+
+        let flow_edges = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::Flow)
+            .await
+            .unwrap();
+        assert!(flow_edges
+            .iter()
+            .any(|e| e.source == "Arm" && e.target == "Ignite"));
+
+        let illegal = create_edge(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(CreateEdgeRequest {
+                source: "Arm".to_string(),
+                target: "NotAnAction".to_string(),
+                kind: EdgeKind::Flow,
+                metadata: None,
+            }),
+        )
+        .await;
+        assert!(
+            illegal.is_err(),
+            "Flow to a non-Action endpoint must be rejected"
+        );
+    }
+
+    /// FR-CORE-13's actual "rejection," designed around two precedents (see
+    /// `sysml_core::check_orphan_actions`'s own doc comment): deleting a `Flow` edge is rejected
+    /// if it's the last one either endpoint has, but a delete that leaves both endpoints with at
+    /// least one remaining `Flow` edge succeeds normally.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn delete_edge_rejects_orphaning_an_action_via_its_last_flow_edge() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "flow-delete-guard").await;
+        make_action(&state.neo4j, &project.id, "Arm").await;
+        make_action(&state.neo4j, &project.id, "Ignite").await;
+        make_action(&state.neo4j, &project.id, "Cutoff").await;
+
+        for (source, target) in [("Arm", "Ignite"), ("Ignite", "Cutoff")] {
+            state
+                .neo4j
+                .create_edge(
+                    &project.id,
+                    &Edge {
+                        source: source.to_string(),
+                        target: target.to_string(),
+                        kind: EdgeKind::Flow,
+                        metadata: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // Deleting Arm->Ignite would leave "Arm" with zero Flow edges -- rejected.
+        let rejected = delete_edge(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(CreateEdgeRequest {
+                source: "Arm".to_string(),
+                target: "Ignite".to_string(),
+                kind: EdgeKind::Flow,
+                metadata: None,
+            }),
+        )
+        .await;
+        assert!(
+            rejected.is_err(),
+            "deleting Arm's only Flow edge must be rejected"
+        );
+        let still_there = state
+            .neo4j
+            .edges_of_kind(&project.id, EdgeKind::Flow)
+            .await
+            .unwrap();
+        assert!(still_there
+            .iter()
+            .any(|e| e.source == "Arm" && e.target == "Ignite"));
+
+        // Add a second edge off "Ignite" so deleting Ignite->Cutoff leaves both endpoints with
+        // at least one remaining Flow edge -- succeeds normally.
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "Cutoff".to_string(),
+                    target: "Arm".to_string(),
+                    kind: EdgeKind::Flow,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+        let allowed = delete_edge(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(project.id.clone()),
+            Json(CreateEdgeRequest {
+                source: "Ignite".to_string(),
+                target: "Cutoff".to_string(),
+                kind: EdgeKind::Flow,
+                metadata: None,
+            }),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "Cutoff/Ignite both keep a remaining Flow edge, so this delete must succeed"
+        );
+    }
+
+    /// FR-CORE-13's other half — the orphan-Actions report, mirroring
+    /// `mission_coverage_flags_the_one_orphaned_requirement`'s own shape exactly.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn orphan_actions_report_flags_the_disconnected_action() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "orphan-actions").await;
+        make_action(&state.neo4j, &project.id, "Arm").await;
+        make_action(&state.neo4j, &project.id, "Ignite").await;
+        make_action(&state.neo4j, &project.id, "Lonely").await;
+        state
+            .neo4j
+            .create_edge(
+                &project.id,
+                &Edge {
+                    source: "Arm".to_string(),
+                    target: "Ignite".to_string(),
+                    kind: EdgeKind::Flow,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let report =
+            traceability::get_orphan_actions(State(state.clone()), Path(project.id.clone()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(report.total_actions, 3);
+        assert_eq!(report.orphaned_ids, vec!["Lonely".to_string()]);
     }
 
     /// Scope-downs pass — closes the `ChoiceConstraint` schema gap `seed_fr_arch_system_model`'s

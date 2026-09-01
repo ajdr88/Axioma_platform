@@ -87,6 +87,9 @@ export function ElementInspector({
   const [members, setMembers] = useState<{ id: string; name: string }[]>([]);
   const [addingMemberId, setAddingMemberId] = useState("");
   const [memberActionError, setMemberActionError] = useState<string | null>(null);
+  const [outgoingFlows, setOutgoingFlows] = useState<{ id: string; name: string }[]>([]);
+  const [addingFlowTargetId, setAddingFlowTargetId] = useState("");
+  const [flowActionError, setFlowActionError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentMeta[]>([]);
   const [uploading, setUploading] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -245,6 +248,76 @@ export function ElementInspector({
       return;
     }
     await loadMembers();
+  }
+
+  // FR-CORE-13 real build-out — same "fetch every edge of this kind, filter locally" pattern
+  // `loadMembers` above already uses; only this element's own *outgoing* Flow edges are shown
+  // (an Action's incoming flows are edited from the upstream Action's own inspector).
+  const loadFlows = useCallback(async () => {
+    if (elementKind !== "Action") {
+      setOutgoingFlows([]);
+      return;
+    }
+    const res = await fetch(`/api/projects/${projectId}/edges?kind=Flow`);
+    if (!res.ok) {
+      return;
+    }
+    const flowEdges: { source: string; target: string }[] = await res.json();
+    setOutgoingFlows(
+      flowEdges
+        .filter((e) => e.source === elementId)
+        .map((e) => ({
+          id: e.target,
+          name: elements.find((el) => el.id === e.target)?.name ?? e.target,
+        })),
+    );
+  }, [elementId, elementKind, projectId, elements]);
+
+  useEffect(() => {
+    loadFlows();
+    setFlowActionError(null);
+    setAddingFlowTargetId("");
+  }, [loadFlows]);
+
+  async function handleAddFlow(targetId: string) {
+    if (!targetId) {
+      return;
+    }
+    setFlowActionError(null);
+    const res = await fetch(`/api/projects/${projectId}/edges`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: elementId, target: targetId, kind: "Flow" }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      setFlowActionError(err?.error ?? `add failed with status ${res.status}`);
+      return;
+    }
+    setAddingFlowTargetId("");
+    // A real bug, found live: `loadFlows` alone only refreshes this panel's own local list —
+    // unlike Collection membership, Flow edges are also drawn on the main canvas
+    // (`page.tsx`'s `ARCH_EDGE_STYLES.Flow`), which reads from `page.tsx`'s own `edges` state,
+    // populated only inside `reloadModel`. Without this, a just-added Flow edge was invisible on
+    // canvas until an unrelated action forced a full reload.
+    await Promise.all([loadFlows(), reloadModel()]);
+  }
+
+  /** Surfaces the real deletion-guard's rejection (`apps/api/src/main.rs::delete_edge`, FR-CORE-13
+   * — can't delete an Action's last remaining Flow edge) as an inline error, not a silent no-op. */
+  async function handleRemoveFlow(targetId: string) {
+    setFlowActionError(null);
+    const res = await fetch(`/api/projects/${projectId}/edges`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: elementId, target: targetId, kind: "Flow" }),
+    });
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      setFlowActionError(err || `remove failed with status ${res.status}`);
+      return;
+    }
+    await Promise.all([loadFlows(), reloadModel()]);
   }
 
   const loadAttachments = async () => {
@@ -512,6 +585,66 @@ export function ElementInspector({
               >
                 Export as Table (CSV)
               </a>
+            </div>
+          )}
+
+          {elementKind === "Action" && (
+            <div className="border-t border-white/10 pt-3">
+              <p className="mb-1.5 text-[10px] uppercase tracking-widest text-white/40">
+                Flow (FR-CORE-13)
+              </p>
+              {flowActionError && <p className="mb-1.5 text-xs text-alert">{flowActionError}</p>}
+              {outgoingFlows.length === 0 && (
+                <p className="text-xs text-white/40">No outgoing Flow edges.</p>
+              )}
+              {outgoingFlows.length > 0 && (
+                <ul className="mb-2 space-y-0.5">
+                  {outgoingFlows.map((target) => (
+                    <li
+                      key={target.id}
+                      className="flex items-center justify-between gap-2 text-xs text-white/80"
+                    >
+                      <span className="truncate">→ {target.name}</span>
+                      <Button
+                        variant="ghost"
+                        onClick={() => handleRemoveFlow(target.id)}
+                        className="!px-1.5 !py-0 text-xs"
+                      >
+                        &times;
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <div className="mb-2 flex gap-1.5">
+                <select
+                  value={addingFlowTargetId}
+                  onChange={(event) => setAddingFlowTargetId(event.target.value)}
+                  className="flex-1 rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
+                >
+                  <option value="">add outgoing flow to…</option>
+                  {elements
+                    .filter(
+                      (e) =>
+                        e.kind === "Action" &&
+                        e.id !== elementId &&
+                        !outgoingFlows.some((f) => f.id === e.id),
+                    )
+                    .map((e) => (
+                      <option key={e.id} value={e.id}>
+                        {e.name}
+                      </option>
+                    ))}
+                </select>
+                <Button
+                  variant="ghost"
+                  onClick={() => handleAddFlow(addingFlowTargetId)}
+                  disabled={!addingFlowTargetId}
+                  className="!px-2 !py-1 text-xs"
+                >
+                  Add
+                </Button>
+              </div>
             </div>
           )}
 

@@ -181,6 +181,16 @@
 **Action:** Add an Action with no incoming/outgoing flow.
 **PASS:** Orphan Action rejected per FR-CORE-13; allocated Actions show the correct owning-Block stereotype.
 **FAIL:** Orphan Action silently accepted, or allocation not visible/queryable.
+**Landed status (2026-09-01, impl v5 §23.4):** **FR-CORE-13's orphan-Action half built and
+covered.** A real `Action` NodeKind + `Flow` EdgeKind exist; "orphan Action rejected" is real via
+two complementary mechanisms (a real, previously-blocked design decision, not literally "add an
+Action with no flow and see it bounce" — that's structurally impossible for a freshly-created
+node): an edge-deletion-time guard rejects deleting an Action's last remaining `Flow` edge, and a
+new `GET .../validation/orphan-actions` report flags any currently-orphaned Action. FR-CORE-12
+(Swimlane allocation) was already built in an earlier pass (impl v5 §16.3) via the generic
+`Allocate` edge — unchanged by this item. The Decision-node guard-conflict half of FR-CORE-13 is
+explicitly **not built** (needs a Decision node concept + guard expressions + a satisfiability-
+style conflict check, none of which exist) — flagged, not attempted.
 
 ---
 
@@ -424,17 +434,13 @@ work was needed for that half of this requirement.
 derivation graph (e.g. Compressor/Combustor/Turbine existence depending on each other).
 **PASS:** Selection choices exist with derivation edges, including at least one real cycle.
 **FAIL:** No cyclic derivation representable at all.
-**Landed status:** **partially built** — `SelectionChoice` nodes and `ArchDerives` edges are real
-and tested (same test as T-ARCH-01), but the seeded `ArchDerives` edges are plain "this choice is
-scoped to its owning subsystem" links, not a genuine cyclic mutual-dependency graph — the seed
-code's own comment says a real DSG's option-derivation graph is "out of scope for this static
-seed." `ArchDerives` is cycle-permitted by schema (confirmed in `sysml-core`), so a real cyclic
-example is representable whenever real Mode B design-space content needs one — just not
-constructed by today's fixture. **Still true after the FR-ARCH-01…06 real build-out pass** — that
-pass added real *resolution* (`PATCH .../cem/archspace/choices/:id/resolve`,
-`resolve_choice_transitions_state_and_enforces_incompatibility_and_linked_constraints`) and
-constraint *enforcement* (FR-ARCH-04, see T-ARCH-04), but did not touch `ArchDerives`'s own seeded
-shape — cyclic derivation remains unbuilt, unchanged from before.
+**Landed status (2026-09-01, impl v5 §23.2):** **built and covered.** `sysml_core::compute_
+derived_existence` genuinely evaluates through `ArchDerives` cycles (a DFS with real back-edge
+detection, not a cycle-*rejector*), exposed via `GET .../cem/archspace/:subsystemId/derived-
+existence?seedIds=...`. `Turbofan-Ref`'s seed now carries the requirement's own literal example as
+real content — `CoreHpCompressor -ArchDerives-> Combustor -ArchDerives-> TurbineHpLp -ArchDerives->
+CoreHpCompressor` — confirmed end to end by `derived_existence_evaluates_through_the_real_seeded_
+cycle`, not just a unit-test-only fixture.
 
 ### T-ARCH-03 — Connection choice modeling, cardinality rules
 **Verifies:** FR-ARCH-03
@@ -444,15 +450,14 @@ cardinality.
 **PASS:** Cardinality (list/range/lower-bound-only) is a real, enforced rule — a violating
 connection is rejected.
 **FAIL:** Cardinality accepted as a descriptive label only, never checked.
-**Landed status:** **partially built after the FR-ARCH-01…06 real build-out pass.** The
-requirement's own "resolved after selection choices" ordering is now real and enforced:
-`resolve_choice`'s `:ConnectionChoice` branch rejects (400) resolving a connection choice before
-every `SelectionChoice` its properties reference (`sourceSelectionChoiceId`/
-`targetSelectionChoiceId`) is itself resolved. The `cardinality` field itself is still confirmed
-(by direct code reading — no reference to it exists outside that one descriptive seed string
-anywhere in `sysml-core`/`apps/api`) to be plain descriptive text, never a computed/enforced rule —
-list/range/lower-bound-only cardinality checking specifically remains **not built**, flagged here,
-not invented around.
+**Landed status (2026-09-01, impl v5 §23.3):** **built and covered.** The ordering half (real
+since the FR-ARCH-01…06 pass) is unchanged. The cardinality half is now real too:
+`sysml_core::check_connection_cardinality` enforces a structured `{"type": "range"|"list", ...}`
+shape (this pass's own invented encoding, since no doc specifies one — "range" covers both "range"
+and "lower-bound-only" via an optional `max`) against the `connections` array a resolve request now
+actually carries. `resolve_choice_enforces_connection_choice_cardinality` confirms end to end
+against the real seeded `BleedAirRouting` choice: 0/2 connections rejected, exactly 1 accepted and
+persisted.
 
 ### T-ARCH-04 — Incompatibility & choice constraints
 **Verifies:** FR-ARCH-04
@@ -931,7 +936,7 @@ follow-up, honestly flagged rather than attempted.
 | NFR-COMP-01/02/03/05 | T-X-07 |
 | NFR-COMP-04 | T-P1.1-05 |
 
-**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` now has at least one test-spec row, including FR-COMP-01…06 and FR-ARCH-01…08 (authored in the scope-downs pass, §§ above; FR-ARCH-01…06 then given a real HTTP-layer/resolution build-out, impl v5 §20; FR-COMP-03/06 then given a real HTTP-layer build-out too, impl v5 §21; FR-ARCH-07/08 then closed for real too, impl v5 §22 — **this closes the entire FR-ARCH-01…08 group**) — though one row still documents a genuinely **not-built** PASS criterion rather than a passing test (T-ARCH-03, partially — its ordering half is now real, its cardinality-enforcement half isn't, T-ARCH-02's cyclic-derivation half also remains unbuilt; each says so explicitly in its own "Landed status" line; not silently marked green). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
+**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` now has at least one test-spec row, including FR-COMP-01…06 and FR-ARCH-01…08 (authored in the scope-downs pass, §§ above; FR-ARCH-01…06 then given a real HTTP-layer/resolution build-out, impl v5 §20; FR-COMP-03/06 then given a real HTTP-layer build-out too, impl v5 §21; FR-ARCH-07/08 then closed for real too, impl v5 §22 — **this closes the entire FR-ARCH-01…08 group**; FR-ARCH-02's cyclic-derivation half then closed for real too, impl v5 §23.2, with the requirement's own literal Compressor/Combustor/Turbine example landed as real seed content; FR-ARCH-03's cardinality-enforcement half then closed for real too, impl v5 §23.3 — **every FR-ARCH-01…08 test-spec row is now built and covered, none left partial**). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
 
 ## Phase 6 landed status **[REV-D]**
 
@@ -964,9 +969,15 @@ reasoning: `docs/Axioma_implementation_v5.md` §18. Summary, most-current first:
   (`export_report_renders_risk_register_html_matching_the_json_endpoint`), T-CORE-12-01's
   allocation half (`allocate_edge_round_trips_through_the_generic_edge_endpoint`).
 - **Explicitly not exercisable — flagged, not built to make the spec sentence pass**: T-INFO-01's
-  Data Type half (FR-INFO-02 has no dedicated endpoint), T-INFO-02 (no Object Flow/Action model
-  exists — same blocked Action/Activity `NodeKind` decision as FR-CORE-13), T-EXPORT-01 (no
-  server-side full-diagram render, client-side viewport PNG only), T-CORE-12-01's orphan-Action
-  half (FR-CORE-13, same blocker), T-DOCIMPORT-07 (OCR was deliberately never built — a scanned
-  PDF correctly fails via the existing `document_import_with_no_extractable_text_fails_with_a_
-  precise_reason` test's own code path, the honest opposite of "OCR runs automatically").
+  Data Type half (FR-INFO-02 has no dedicated endpoint), T-INFO-02 (FR-INFO-04, "type an Object
+  Flow using an Information Element" — a real `Action`/`Flow` now exist as of impl v5 §23.4, so
+  the *blocker* this row used to share with FR-CORE-13 is gone, but the specific "flow typed by an
+  Information Element" mechanism itself was never part of that item's scope and still doesn't
+  exist — a narrower, still-real, still-open gap now, not the same blocker), T-EXPORT-01 (no
+  server-side full-diagram render, client-side viewport PNG only), T-DOCIMPORT-07 (OCR was
+  deliberately never built — a scanned PDF correctly fails via the existing
+  `document_import_with_no_extractable_text_fails_with_a_precise_reason` test's own code path, the
+  honest opposite of "OCR runs automatically").
+- **T-CORE-12-01 is now fully built and covered** (impl v5 §23.4) — both its allocation half
+  (already real, `allocate_edge_round_trips_through_the_generic_edge_endpoint`) and its
+  orphan-Action half (new this pass) are real. Moved out of the not-built list above.

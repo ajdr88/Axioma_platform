@@ -2234,8 +2234,182 @@ traceability p95, the number already proven-by-hand) became a real, automated, b
 - `ci.yml`'s own stale top-of-file comment (claiming the 1M-element fixture "doesn't exist yet")
   fixed as part of this item — Tier 3 item 23 in the pending-items doc, closed as a side effect.
 
-### 23.2 FR-ARCH-02 — pending implementation
+### 23.2 FR-ARCH-02 — real cyclic `ArchDerives` derivation
 
-### 23.3 FR-ARCH-03 — pending implementation
+**What existed before this item**: `ArchDerives` edges were only ever written as flat scoping
+links (`SelectionChoice → its own subsystem`, `Function → its fulfiller`) — nothing evaluated them
+as a derivation graph at all. The requirement (reqs v5 §5.17, FR-ARCH-02) explicitly asks for
+edges expressing "if selected, these elements exist," **including cycles** — its own literal
+example is mutually-dependent Compressor/Combustor/Turbine existence.
 
-### 23.4 FR-CORE-13 — pending implementation
+**What was built**:
+- `sysml_core::compute_derived_existence(seed_ids, edges) -> DerivedExistence`
+  (`packages/sysml-core/src/lib.rs`) — a DFS over `ArchDerives` edges from a caller-supplied seed
+  set, using standard white/gray/black coloring (`stack` = current path, `finished` = fully
+  explored). A back edge to a node still on `stack` is a real cycle; every id from that ancestor
+  down to the current node is marked `within_cycle` — the opposite discipline from
+  `would_create_containment_cycle`, which *rejects* a cycle; this one evaluates *through* one, per
+  NFR-REL-02's "cycles are a legitimate, expected shape" (`ArchDerives`'s own doc comment). 4 new
+  unit tests, including the literal 3-cycle example and a check that an upstream, non-cyclic seed
+  isn't mis-flagged as cyclic itself.
+- New endpoint, `GET /cem/archspace/:subsystemId/derived-existence?seedIds=A,B,C`
+  (`apps/api/src/archspace.rs::derived_existence`) — loads every real `ArchDerives` edge in the
+  project (derivation genuinely crosses subsystem boundaries, so this is deliberately not scoped to
+  one subsystem) and returns `{derivedElementIds, withinCycle}`.
+- **Real seed content demonstrating the spec's own literal example**, not just a synthetic
+  unit-test fixture: three new `ArchDerives` edges directly between the real seeded subsystem
+  Structures — `CoreHpCompressor -ArchDerives-> Combustor -ArchDerives-> TurbineHpLp
+  -ArchDerives-> CoreHpCompressor` (`main.rs`'s `cyclic_derivations`). A new integration test,
+  `derived_existence_evaluates_through_the_real_seeded_cycle`, confirms the endpoint correctly
+  walks this real cycle end to end (seed `CoreHpCompressor` → all three ids returned, all three
+  flagged `withinCycle`) — passed on its first real run.
+- **Minimal frontend surface**: `ArchspacePanel.tsx` gains a "Check Derived Existence" button,
+  available as soon as a subsystem is picked (it reads the graph directly — no design-space handle
+  needed, unlike Define/Decode/Generate below it). Cyclic ids render in a distinct color with an
+  explicit "(within a cycle)" label. New proxy route,
+  `apps/web/src/app/api/projects/[projectId]/cem/archspace/[id]/derived-existence/route.ts`,
+  forwarding `?seedIds=...` verbatim — same "required query params, not defaulted here" precedent
+  `elements/[id]/traceability`'s own proxy route already set.
+
+### 23.3 FR-ARCH-03 — real `ConnectionChoice` cardinality enforcement
+
+**What existed before this item**: `cardinality` was a free-text string (`"single connection"`
+etc.) on the element body, never read by `resolve_choice` — only the "resolved after selection
+choices" *ordering* half was real (`resolve_choice`'s prerequisite-`SelectionChoice` check).
+Resolving a `ConnectionChoice` was a bare boolean flip with no way to even express how many
+connections were being resolved.
+
+**Design choice, stated up front**: no doc anywhere pins down a concrete JSON encoding for the
+three named categories (list/range/lower-bound-only) — this pass invents one:
+`{"type": "range", "min": N, "max": M|null}` (covers both "range" and "lower-bound-only," the
+latter via `max: null`) and `{"type": "list", "allowed": [N, M, ...]}` (exact allowed counts). A
+missing/unrecognized `type` is treated as "anything goes," matching how every other absent body
+property in this codebase is treated.
+
+**What was built**:
+- `sysml_core::check_connection_cardinality(element_id, cardinality, resolved_count) ->
+  Result<(), ValidationError>` (`packages/sysml-core/src/lib.rs`), plus a new
+  `ValidationError::CardinalityViolation` variant — same "pure check in `sysml-core`, wired into an
+  `apps/api` handler" shape as FR-COMP-03/06's own checks. 5 new unit tests (range under/over/
+  exact bounds, lower-bound-only, list, missing/malformed `type`, and the error's own content).
+- `ResolveChoiceRequest` (`apps/api/src/archspace.rs`) gains a real `connections:
+  Vec<ConnectionPair>` field — `resolve_choice`'s `:ConnectionChoice` branch validates
+  `connections.len()` against the element's structured `cardinality` (after the existing ordering
+  check, not replacing it) and persists the real resolved set as a `resolvedConnections` body
+  property, the same pattern `SelectionChoice`'s own `selected`/`resolutionState` already use — no
+  new `EdgeKind` needed for this scope.
+- Seed data migrated: `BleedAirRouting`/`PowerOfftakeRouting`'s `cardinality` strings both became
+  `{"type": "range", "min": 1, "max": 1}` (both genuinely "exactly one connection"; the free-text
+  "resolved after..." note was redundant with the already-separate, already-enforced
+  `sourceSelectionChoiceId` ordering property).
+- New integration test, `resolve_choice_enforces_connection_choice_cardinality`, against the real
+  seeded `BleedAirRouting` choice: 0 connections rejected (below `min`), 2 rejected (above `max`),
+  exactly 1 succeeds and is genuinely persisted — passed on its first real run against the live
+  stack. Full `apps/api --ignored` suite re-run: 75/75, zero regressions (72 prior + 3 new: the
+  cardinality test, the FR-ARCH-02 derived-existence test, and item 1's CI perf-gate test).
+
+### 23.4 FR-CORE-13 — orphan-Action rejection: real `Action`/`Flow` modeling + canvas UI
+
+**What existed before this item**: no `Action`/`Activity`/flow concept anywhere — blocked since
+Phase 1 because reusing `:Structure` was tried and rejected (no way to distinguish an orphan Action
+from a legitimate unconnected top-level Block). Per explicit user direction this pass built it for
+real, including a minimal canvas UI, rather than deferring it again.
+
+**Scope cut, stated up front**: FR-CORE-13's full text also asks for rejecting "a Decision node
+with more than one outgoing flow whose guard can evaluate `True` simultaneously" — that needs a
+Decision node concept, guard expressions on `Flow` edges, and a satisfiability-style conflict
+check. None of that exists and it wasn't part of what was asked ("orphan-Action rejection").
+**Not attempted this pass**, flagged as a distinct, still-open follow-up.
+
+**Design — the real "rejection," worked out from two existing precedents, not invented from
+scratch** (a genuinely fresh Action necessarily has zero `Flow` edges right after creation, so a
+hard reject-on-create is structurally impossible):
+- New `NodeKind::Action` and `EdgeKind::Flow` (`packages/sysml-core/src/lib.rs`). `Flow` is
+  **kind-constrained** (both endpoints must be `Action` — the third real endpoint-legality rule in
+  `check_relationship_endpoints`, joining `Satisfy`/`Concerns`) and **cycle-permitted** (not
+  subject to `is_acyclicity_scoped` — SysML Activity flows legitimately loop, same treatment as
+  `ArchDerives`/`Allocate`). `Action` is deliberately distinct from `Function` (FR-ARCH-01's Mode B
+  concept) — reqs v5 §5.17 itself draws that line.
+- **Edge-deletion-time guard** (`apps/api/src/main.rs::delete_edge`): deleting a `Flow` edge is
+  rejected if it's the last remaining `Flow` edge (in or out) of either endpoint — same "reject the
+  specific mutation that would produce an illegal state" shape `create_edge`'s dangling-edge/cycle
+  checks already use, just on delete instead of create.
+- **A real orphan-Actions report**, `sysml_core::check_orphan_actions(elements, edges) ->
+  Vec<ElementId>`, wired into `GET /projects/:id/validation/orphan-actions`
+  (`apps/api/src/traceability.rs::get_orphan_actions`) — mirrors the *existing*
+  `get_mission_coverage` precedent exactly (a computed report flagging a wrong-but-not-illegal-to-
+  create state), covering the "freshly created, never connected" case the deletion-guard can't. 10
+  new `sysml-core` unit tests total across the endpoint-legality rule and both check functions; 3
+  new `apps/api` integration tests (Flow round-trip + illegal-endpoint rejection, the
+  last-edge-deletion guard including its "not a blanket ban" half, the orphan report) — all passed
+  on their first real run against the live stack.
+- `packages/sysml-textual`'s keyword mapping and `packages/shared-types`' hand-mirrored TypeScript
+  unions both updated (`"action"`/`"Action"`, `"Flow"`) — confirmed via a full `cargo build
+  --workspace`, which is what actually catches every exhaustive-match site a new enum variant
+  ripples into (found and fixed `sysml-textual`'s own match this same way; `apps/api` had none).
+
+**Minimal canvas UI** (per explicit user choice):
+- `page.tsx`'s "+ Add Node" kind dropdown gains an `"Action"` option, reusing the existing
+  `createElement(name, kind)` primitive exactly as `"Structure"` does — no new endpoint.
+- `ElementInspector.tsx` gains a "Flow" section, visible only when the selected element's kind is
+  `Action` — a dropdown of the project's other Actions + "Add outgoing flow" button, plus a list of
+  existing outgoing Flow edges each with a remove button that surfaces the deletion-guard's real
+  rejection inline (`res.text()`, not `res.json()` — `import::BadRequest` returns plain text, a
+  real, deliberate divergence from the sibling Collection-members section's own `res.json()`
+  parsing) — the same "let the UI edit an existing edge kind via a dropdown" shape now proven a
+  third time (Collection membership, Swimlane allocation, this).
+- Canvas rendering: `AxiomaBlockNode`'s `kindAccent`/`kindGlyph` gain an `Action` entry (light
+  green, "▶"); `Flow` edges get a new entry in the existing `ARCH_EDGE_STYLES` table and are
+  fetched/rendered the same way (`edges?kind=Flow`).
+
+**A real, serious bug found and fixed along the way — not caused by this item's own code, but
+directly exposed by it.** Live browser verification of FR-ARCH-02's cyclic seed content (added in
+§23.2, above) crashed the *entire canvas* on load: `RangeError: Invalid array length` from
+`packages/diagram-engine/src/clustering.ts`'s `collectDescendants`. Root cause:
+`page.tsx`'s `containsEdgesForClustering` fed **every** canvas edge (`Contains` *and*
+`ArchDerives`/`IncompatibleWith`/`ChoiceConstraint`) into a containment-only traversal with no
+visited-set — a real, previously-latent violation of CLAUDE.md's own rule ("all traversal must use
+visited-set cycle detection, never assume global acyclicity") that simply never fired before this
+pass, because no genuinely cyclic edge had ever existed in the seed data until FR-ARCH-02's own
+real content landed. Fixed two ways: (1) the actual root cause — `AxiomaEdgeData` gained a real
+`kind` field, stamped by `toFlowEdge`/`toFlowArchEdge`/`onConnect`'s local `addEdge` call, and
+`containsEdgesForClustering` now filters to `kind === "Contains"` before handing anything to
+clustering; (2) defense-in-depth — `collectDescendants` itself gained a visited-set guard, so a
+future caller mistake can no longer crash the canvas, only misbehave boundedly. Both fixes
+live-verified via Playwright: the crash is gone, pan/zoom still works, and FR-ARCH-02's own
+"Check Derived Existence" feature now genuinely renders its real 3-cycle end to end.
+
+**Live browser verification of the canvas UI, and two more real bugs found and fixed along the
+way** (Playwright, against the real running dev stack): creating Actions, connecting a Flow edge
+via `ElementInspector`'s dropdown, deleting an Action's only Flow edge (rejected with a real inline
+error — confirmed the exact text, `"cannot delete this Flow edge: it is <id>'s only remaining Flow
+edge, which would leave it orphaned"`), and confirming the guard checks **both** endpoints' Flow
+counts (not just the deleted edge's source) — a real, intentionally conservative reading of "would
+leave it orphaned" the first verification pass initially mis-predicted as a bug, then correctly
+re-derived from `delete_edge`'s own code before concluding it wasn't.
+
+- **Bug found**: adding/removing a Flow edge via `ElementInspector` only refreshed the panel's own
+  local list (`loadFlows()`) — `page.tsx`'s own canvas `edges` state (what actually feeds
+  `ARCH_EDGE_STYLES.Flow`'s rendering) is populated only inside `reloadModel()`, which
+  `handleAddFlow`/`handleRemoveFlow` never called. A newly added/removed Flow edge was invisible
+  on canvas until an unrelated action forced a full reload. Fixed: both handlers now also call
+  `reloadModel()` (`await Promise.all([loadFlows(), reloadModel()])`).
+- **Bug found**: a just-created element wasn't selectable in another Action's Flow dropdown (or
+  the pre-existing Collection-membership dropdown — same root cause, a real, general gap this
+  feature happened to make visible, not introduced by it) until a full reload —
+  `page.tsx`'s `placeNewElement` updated React Flow's node state via `setNodes` but never the
+  separate `elements` array both dropdowns filter from. Fixed: `placeNewElement` now also calls
+  `setElements` to append the new element.
+- **Re-verified via Playwright, both fixes confirmed**: a just-created Action is selectable in
+  another Action's Flow dropdown immediately, no reload, confirmed across 6+ repeated trials with
+  zero exceptions. Adding/removing a Flow edge triggers the real `Promise.all([loadFlows(),
+  reloadModel()])` refetch every time (traced at the network level — `GET /edges?kind=Flow`
+  returns the updated list within ~500ms, no reload needed), and in a clean isolated run the
+  canvas edge itself painted in ~1s. **One honestly-flagged observation, not treated as a code
+  defect**: under heavy same-machine test load (many concurrent headless-Chromium verification
+  runs), the downstream ELK-layout/React-Flow *paint* occasionally lagged well behind the
+  already-correct data refresh in a few trials — the verifying agent traced this to CPU contention
+  from its own repeated test launches, not the fix (the specific changed code path was proven
+  correctly wired in every single trial at the data level). Also reconfirmed the sole-edge-removal
+  rejection's exact message and the "second edge present → removal succeeds" case, both consistent
+  every run. Zero unexpected browser console/page errors across the whole verification.

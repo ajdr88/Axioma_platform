@@ -46,6 +46,7 @@ pub(crate) fn kind_keyword(kind: NodeKind) -> &'static str {
         NodeKind::Function => "function",
         NodeKind::SelectionChoice => "selectionchoice",
         NodeKind::ConnectionChoice => "connectionchoice",
+        NodeKind::Action => "action",
     }
 }
 
@@ -71,6 +72,7 @@ pub(crate) fn kind_from_keyword(word: &str) -> Option<NodeKind> {
         "function" => Some(NodeKind::Function),
         "selectionchoice" => Some(NodeKind::SelectionChoice),
         "connectionchoice" => Some(NodeKind::ConnectionChoice),
+        "action" => Some(NodeKind::Action),
         _ => None,
     }
 }

@@ -55,6 +55,11 @@ interface ProposeResponse {
   viability: Viability;
 }
 
+interface DerivedExistenceResponse {
+  derivedElementIds: string[];
+  withinCycle: string[];
+}
+
 /** FR-ARCH-08's typed states — color-coded the same way this app's other validation/status
  * badges already are (green = good, amber = needs a closer look, red = real problem), not a new
  * visual convention. */
@@ -99,6 +104,10 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
   const [proposingIndex, setProposingIndex] = useState<number | null>(null);
   const [proposeError, setProposeError] = useState<string | null>(null);
   const [proposedByIndex, setProposedByIndex] = useState<Record<number, ProposeResponse>>({});
+  const [derivedExistenceLoading, setDerivedExistenceLoading] = useState(false);
+  const [derivedExistenceError, setDerivedExistenceError] = useState<string | null>(null);
+  const [derivedExistenceResult, setDerivedExistenceResult] =
+    useState<DerivedExistenceResponse | null>(null);
 
   async function handleDefine() {
     if (!subsystemId) return;
@@ -200,6 +209,29 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
     }
   }
 
+  async function handleCheckDerivedExistence() {
+    if (!subsystemId) return;
+    setDerivedExistenceLoading(true);
+    setDerivedExistenceError(null);
+    setDerivedExistenceResult(null);
+    try {
+      const res = await fetch(
+        `/api/projects/${projectId}/cem/archspace/${subsystemId}/derived-existence?seedIds=${encodeURIComponent(subsystemId)}`,
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.error ?? `request failed with status ${res.status}`);
+      }
+      setDerivedExistenceResult(await res.json());
+    } catch (err) {
+      setDerivedExistenceError(
+        err instanceof Error ? err.message : "failed to evaluate derived existence",
+      );
+    } finally {
+      setDerivedExistenceLoading(false);
+    }
+  }
+
   return (
     <Panel className="absolute right-4 top-4 z-10 w-96 max-w-[calc(100vw-2rem)] max-h-[calc(100vh-2rem)] overflow-y-auto p-4">
       <div className="mb-3 flex items-start justify-between gap-2">
@@ -245,6 +277,49 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
           >
             {defining ? "Defining…" : "Define Design Space"}
           </Button>
+
+          {/* FR-ARCH-02 — reads the real graph directly (no design space handle needed), unlike
+           * everything below it, so it's available as soon as a subsystem is picked. */}
+          <Button
+            onClick={handleCheckDerivedExistence}
+            disabled={derivedExistenceLoading || !subsystemId}
+            className="mb-3 w-full justify-center !py-1 text-xs"
+          >
+            {derivedExistenceLoading ? "Checking…" : "Check Derived Existence"}
+          </Button>
+
+          {derivedExistenceError && (
+            <p className="mb-2 text-xs text-alert">{derivedExistenceError}</p>
+          )}
+
+          {derivedExistenceResult && (
+            <div
+              className="mb-3 rounded border border-white/10 p-1.5"
+              data-archspace-derived-existence
+            >
+              <p className="mb-1 text-[10px] uppercase tracking-widest text-white/40">
+                Derived Existence (seed: {subsystemId})
+              </p>
+              {derivedExistenceResult.derivedElementIds.length === 0 ? (
+                <p className="text-[11px] text-white/50">
+                  nothing derived — no ArchDerives edges from this seed.
+                </p>
+              ) : (
+                derivedExistenceResult.derivedElementIds.map((id) => {
+                  const cyclic = derivedExistenceResult.withinCycle.includes(id);
+                  return (
+                    <p
+                      key={id}
+                      className={`font-mono text-[11px] ${cyclic ? "text-yellow-400" : "text-white/80"}`}
+                    >
+                      {id}
+                      {cyclic && " (within a cycle)"}
+                    </p>
+                  );
+                })
+              )}
+            </div>
+          )}
 
           {defineError && <p className="mb-2 text-xs text-alert">{defineError}</p>}
 

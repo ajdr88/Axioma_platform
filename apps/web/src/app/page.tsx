@@ -150,7 +150,7 @@ function toFlowEdge(edge: ApiEdge): FlowEdge<AxiomaEdgeData> {
     target: edge.target,
     type: "axiomaEdge",
     style: { stroke: "#7C7C86" },
-    data: {},
+    data: { kind: "Contains" },
   };
 }
 
@@ -173,6 +173,9 @@ const ARCH_EDGE_STYLES: Record<
     slug: "choiceconstraint",
     style: { stroke: "#E8A93A", strokeDasharray: "6 3" },
   },
+  // FR-CORE-13 real build-out — same "read-only on this canvas, edited via ElementInspector's
+  // dropdown" treatment as the three above (no drag-to-connect creation UI for this kind either).
+  Flow: { slug: "flow", style: { stroke: "#6EE89A", strokeDasharray: "" } },
 };
 
 function toFlowArchEdge(
@@ -187,7 +190,7 @@ function toFlowArchEdge(
     type: "axiomaEdge",
     style,
     reconnectable: false,
-    data: {},
+    data: { kind },
   };
 }
 
@@ -235,9 +238,9 @@ export default function Home() {
   /** FR-INFO-01/03 — "+ Add Node" toolbar kind picker; `InformationElement` needs a second,
    * dedicated create call (`/information/elements`) to set `abstractionLevel` atomically, unlike
    * every other kind which goes through the generic `createElement`. */
-  const [newElementKind, setNewElementKind] = useState<"Structure" | "InformationElement">(
-    "Structure",
-  );
+  const [newElementKind, setNewElementKind] = useState<
+    "Structure" | "InformationElement" | "Action"
+  >("Structure");
   const [newInfoAbstractionLevel, setNewInfoAbstractionLevel] = useState<
     "Conceptual" | "Logical" | "Physical"
   >("Conceptual");
@@ -327,6 +330,7 @@ export default function Home() {
         incompatibleWithRes,
         choiceConstraintRes,
         allocateRes,
+        flowRes,
       ] = await Promise.all([
         fetch(apiPath(currentProjectId, "/elements")),
         fetch(apiPath(currentProjectId, "/contains")),
@@ -338,6 +342,7 @@ export default function Home() {
         fetch(apiPath(currentProjectId, "/edges?kind=IncompatibleWith")),
         fetch(apiPath(currentProjectId, "/edges?kind=ChoiceConstraint")),
         fetch(apiPath(currentProjectId, "/edges?kind=Allocate")),
+        fetch(apiPath(currentProjectId, "/edges?kind=Flow")),
       ]);
       for (const res of [
         elementsRes,
@@ -350,6 +355,7 @@ export default function Home() {
         incompatibleWithRes,
         choiceConstraintRes,
         allocateRes,
+        flowRes,
       ]) {
         if (!res.ok) {
           throw new Error(await readErrorMessage(res));
@@ -365,6 +371,7 @@ export default function Home() {
       const incompatibleWith: ApiEdge[] = await incompatibleWithRes.json();
       const choiceConstraint: ApiEdge[] = await choiceConstraintRes.json();
       const allocate: ApiEdge[] = await allocateRes.json();
+      const flow: ApiEdge[] = await flowRes.json();
       if (reloadTokenRef.current !== token) {
         return;
       }
@@ -399,6 +406,7 @@ export default function Home() {
         ...archDerives.map((e) => toFlowArchEdge(e, "ArchDerives")),
         ...incompatibleWith.map((e) => toFlowArchEdge(e, "IncompatibleWith")),
         ...choiceConstraint.map((e) => toFlowArchEdge(e, "ChoiceConstraint")),
+        ...flow.map((e) => toFlowArchEdge(e, "Flow")),
       ]);
       setCausesEdges(causes);
       setMitigatedByEdges(mitigatedBy);
@@ -464,6 +472,11 @@ export default function Home() {
     });
     const newNode = toFlowNode(element, position);
     setNodes((nds) => [...nds, newNode]);
+    // A real bug, found live: `elements` (the separate id/name/kind list `ElementInspector`'s
+    // Collection-members and Flow dropdowns both filter from) previously only updated inside
+    // `reloadModel`, so a just-created element wasn't selectable in either dropdown until an
+    // unrelated action forced a full reload.
+    setElements((els) => [...els, element]);
     return newNode;
   }
 
@@ -513,7 +526,9 @@ export default function Home() {
     const newNode =
       newElementKind === "InformationElement"
         ? await createInformationElement("New Information Element", newInfoAbstractionLevel)
-        : await createElement("New Element", "Structure");
+        : newElementKind === "Action"
+          ? await createElement("New Action", "Action")
+          : await createElement("New Element", "Structure");
     if (newNode) {
       setNodes((nds) =>
         nds.map((n) =>
@@ -921,8 +936,10 @@ interface CanvasProps {
   elements: ApiElement[];
   allocateEdges: ApiEdge[];
   handleAllocate: (elementId: string, laneId: string) => Promise<void>;
-  newElementKind: "Structure" | "InformationElement";
-  setNewElementKind: React.Dispatch<React.SetStateAction<"Structure" | "InformationElement">>;
+  newElementKind: "Structure" | "InformationElement" | "Action";
+  setNewElementKind: React.Dispatch<
+    React.SetStateAction<"Structure" | "InformationElement" | "Action">
+  >;
   newInfoAbstractionLevel: "Conceptual" | "Logical" | "Physical";
   setNewInfoAbstractionLevel: React.Dispatch<
     React.SetStateAction<"Conceptual" | "Logical" | "Physical">
@@ -1126,8 +1143,18 @@ function Canvas({
   // remounts them, which re-triggers dimension measurement, which (via `onNodesChange`) sets
   // state again and forces another render — an infinite loop discovered via a real DOM
   // mutation-observer check during this work (a genuine bug, not just a perf nice-to-have).
+  // `edges` also carries ArchDerives/IncompatibleWith/ChoiceConstraint (rendered on the main
+  // canvas since docs/IMPLEMENTATION_KICKOFF.md Phase 5) — filtered to real `Contains` edges
+  // only. A real bug, found live: passing every edge unfiltered meant a genuinely cyclic
+  // ArchDerives edge (FR-ARCH-02's own seeded example) got walked by `computeClusteredNodes`'s
+  // containment traversal as if it were parent/child, crashing the whole canvas
+  // (`RangeError: Invalid array length` from its unbounded stack). `Contains` is the only kind
+  // this clustering may ever treat as containment.
   const containsEdgesForClustering = useMemo(
-    () => edges.map((e) => ({ source: e.source, target: e.target })),
+    () =>
+      edges
+        .filter((e) => e.data?.kind === "Contains")
+        .map((e) => ({ source: e.source, target: e.target })),
     [edges],
   );
   const clusteredNodes = useMemo(
@@ -1343,7 +1370,16 @@ function Canvas({
             }
             setEdges((eds) =>
               addEdge(
-                { ...connection, type: "axiomaEdge", style: { stroke: "#7C7C86" } },
+                {
+                  ...connection,
+                  type: "axiomaEdge",
+                  style: { stroke: "#7C7C86" },
+                  // Matches toFlowEdge's own data shape — without this, a freshly drag-connected
+                  // edge would be silently excluded from clustering's containment walk until the
+                  // next full reload (a real, related bug found alongside the crash this same
+                  // fix addresses).
+                  data: { kind: "Contains" },
+                },
                 eds,
                 // Match toFlowEdge's id convention — addEdge defaults to its own "xy-edge__..."
                 // format, which would otherwise make a freshly-connected edge's id inconsistent
@@ -1453,12 +1489,15 @@ function Canvas({
                 <select
                   value={newElementKind}
                   onChange={(event) =>
-                    setNewElementKind(event.target.value as "Structure" | "InformationElement")
+                    setNewElementKind(
+                      event.target.value as "Structure" | "InformationElement" | "Action",
+                    )
                   }
                   className="rounded border border-white/10 bg-obsidian/60 px-1 py-1 text-xs text-white/80"
                 >
                   <option value="Structure">Structure</option>
                   <option value="InformationElement">Information Element</option>
+                  <option value="Action">Action</option>
                 </select>
               )}
               {editMode && newElementKind === "InformationElement" && (

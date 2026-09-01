@@ -91,8 +91,31 @@ FR-ARCH group closed. The user chose to start with Tier 0 (correctness/CI-integr
 item closed: **T-P1.4-06 wired into CI** (impl v5 §23.1) — a new `perf-gate` job seeds the real
 1M-element fixture and runs a genuine, build-failing `p95 < 2s` assertion for NFR-PERF-04
 traceability; the browser-side "load < 5s, memory < 2GB" half is honestly flagged as still open,
-not attempted. `apps/docs` was also stood up for real this session as an MkDocs + Material site
-(renders `docs/` directly, no copy).
+not attempted. Second item closed: **FR-ARCH-02's real cyclic `ArchDerives` derivation** (impl v5
+§23.2) — `sysml_core::compute_derived_existence` genuinely evaluates *through* a cycle (opposite
+discipline from the existing cycle-*rejecting* `would_create_containment_cycle`), a new
+`derived-existence` endpoint exposes it, and `Turbofan-Ref`'s seed now carries the requirement's
+own literal Compressor/Combustor/Turbine mutual-dependency example as real content, not just a
+unit-test fixture. Third item closed: **FR-ARCH-03's real `ConnectionChoice` cardinality
+enforcement** (impl v5 §23.3) — `sysml_core::check_connection_cardinality` enforces a new
+structured cardinality shape (this pass's own invented JSON encoding, since no doc specifies one)
+against a real `connections` array `resolve_choice` now accepts, alongside the ordering half that
+was already real. **Every FR-ARCH-01…08 test-spec row is now built and covered.** Fourth and last
+Tier 0 item closed: **FR-CORE-13's orphan-Action rejection** (impl v5 §23.4) — real `NodeKind::
+Action`/`EdgeKind::Flow` (the third real endpoint-legality rule, joining Satisfy/Concerns), a
+last-Flow-edge deletion guard plus an orphan-Actions report (the actual "rejection," since a
+hard reject-on-create is structurally impossible for a node that necessarily starts unconnected),
+and a minimal canvas UI, per explicit user choice to build this one for real rather than defer it
+again. **This closed a real, previously-latent bug along the way**: FR-ARCH-02's own new cyclic
+seed content crashed the whole canvas (`RangeError: Invalid array length`) — `page.tsx` was
+feeding every canvas edge, not just `Contains`, into a containment-only traversal with no
+visited-set, a real violation of this file's own traversal rule that simply never fired before a
+genuinely cyclic edge existed in seed data. Fixed at the root (edges now carry a real `kind` field,
+clustering filters to `Contains` only) and with defense-in-depth (the traversal itself gained a
+visited-set guard). **All four Tier 0 items from `docs/pending_items_2026-09-01.md` are now
+closed** — Tier 1 (Product 2/Mode B maturity) is the natural next tier, not yet started. `apps/docs`
+was also stood up for real this session as an MkDocs + Material site (renders `docs/` directly,
+no copy).
 
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2
@@ -184,10 +207,14 @@ global acyclicity.
 All of the above are real `NodeKind`/`EdgeKind` variants in `packages/sysml-core/src/lib.rs` today
 (with `sysml-textual`'s keyword mapping and `packages/shared-types` kept in sync) — not aspirational.
 Full detail, including which of the new edges got a real endpoint-legality rule vs. stayed
-deliberately kind-unconstrained, in `docs/Axioma_implementation_v5.md` §2.3. **Not yet done**:
-FR-CORE-13 (orphan-Action rejection) — blocked on an Action/Activity `NodeKind` decision no
-merged doc makes yet, flagged there rather than guessed. (FR-CORE-12, Swimlane allocation, is
-built — see impl v5 §16.3 — and was never blocked on that same decision.)
+deliberately kind-unconstrained, in `docs/Axioma_implementation_v5.md` §2.3. Also real as of the
+Tier 0 pass (impl v5 §23.4): `NodeKind::Action` and `EdgeKind::Flow` (FR-CORE-13's own
+long-blocked Action/Activity `NodeKind` decision, resolved) — `Flow` is kind-constrained (both
+ends must be `Action`, the third real endpoint-legality rule alongside `Satisfy`/`Concerns`) and
+cycle-permitted. FR-CORE-13's orphan-Action rejection is now built (a last-Flow-edge deletion guard
+plus an orphan-Actions report); its Decision-node guard-conflict half is not (needs a Decision node
+concept + guard expressions + a satisfiability check, none of which exist — flagged, not
+attempted). (FR-CORE-12, Swimlane allocation, was already built earlier — see impl v5 §16.3.)
 
 ## Non-negotiable architectural rules
 1. **Convergence ≠ validity.** The CRDT layer only guarantees clients converge to the same
@@ -252,8 +279,8 @@ test-validated — corner badge), **Staleness** (current / `Suspect` — red pul
 2. **P1.2 IDE Experience (Mo 3–4):** Monaco + LSP; canvas with viewport virtualization;
    Hazard/Risk panel; Mission timeline; provenance visual language scaffolding. *Also here (v5):
    Dynamic/Static Collections (FR-CORE-10/11), Swimlane allocation (FR-CORE-12, built — see
-   impl v5 §16.3) + orphan-Action validation (FR-CORE-13, still blocked on an Action/Activity
-   `NodeKind` decision no merged doc makes yet).*
+   impl v5 §16.3) + orphan-Action validation (FR-CORE-13, built — see impl v5 §23.4; its
+   Decision-node guard-conflict half remains explicitly not built).*
 3. **P1.3 Digital Thread (Mo 5):** budgeted traceability + change-impact; standards-aligned
    safety reporting (ARP4761 / MIL-STD-882 / ISO 26262). *Also here (v5): diagram/table export
    (FR-EXPORT-01/02), the full documents→draft-model pipeline (FR-CORE-14…18).*
