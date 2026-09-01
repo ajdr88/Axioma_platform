@@ -596,6 +596,53 @@ pub fn check_compressor_blade_loading(
     Ok(())
 }
 
+/// The result of [`check_compressor_spec_achievability`] — kept as a plain struct (not just a
+/// bool) so a caller can report *why* a spec is flagged, not just that it is.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AchievabilityResult {
+    pub implied_velocity_ft_per_sec: f64,
+    pub achievable: bool,
+}
+
+/// FR-COMP-06 (Negotiable-Specification Flagging, reqs v5 §5.15) — a real, computed check that two
+/// fields of a compressor subsystem's FR-COMP-01 over-all specification are mutually incompatible,
+/// rather than the static `negotiable`/`flagged` booleans this codebase seeded before this
+/// function existed. **No formula for this is given anywhere in the docs** (same "invent a
+/// reasonable, documented, deterministic relationship" situation as `cem-core`'s own thrust/SFC
+/// model) — the requirement's own literal example references a stage count that isn't actually one
+/// of FR-COMP-01's 9 named fields and would need a cross-element lookup this schema has no clean
+/// basis for (a stage-count `:Parameter` only ever carries a `bound` range, never a resolved
+/// "current value"). Chosen instead: a real, self-contained continuity-equation check entirely
+/// within the 9-field spec — `weight_flow_lb_per_sec` and `outlet_diameter_in` imply an outlet
+/// velocity (mass flow = density × velocity × area, using a simplified constant sea-level air
+/// density — an explicitly illustrative assumption, not a real compressible-flow calculation); if
+/// that implied velocity exceeds the spec's own stated `max_outlet_velocity_ft_per_sec`, the two
+/// fields are genuinely mutually incompatible. Verified by hand against both of this codebase's
+/// real seeded subsystems before choosing this formula: Fan & LP Compression (550 lb/sec, 74in,
+/// 750 ft/sec target) implies ~241 ft/sec, comfortably under; Core (HP) Compressor (110 lb/sec,
+/// 18in, 900 ft/sec target) implies ~814 ft/sec, under but closer — both a real, non-trivial
+/// computation, not a check that trivially always passes or always fails.
+pub fn check_compressor_spec_achievability(
+    weight_flow_lb_per_sec: f64,
+    outlet_diameter_in: f64,
+    max_outlet_velocity_ft_per_sec: f64,
+) -> AchievabilityResult {
+    /// Sea-level standard air density — the simplifying constant-density assumption this
+    /// function's own doc comment flags as illustrative, not a real compressible-flow model.
+    const AIR_DENSITY_LB_PER_FT3: f64 = 0.0765;
+
+    let outlet_diameter_ft = outlet_diameter_in / 12.0;
+    let outlet_area_ft2 = std::f64::consts::FRAC_PI_4 * outlet_diameter_ft * outlet_diameter_ft;
+    let implied_velocity_ft_per_sec =
+        weight_flow_lb_per_sec / (AIR_DENSITY_LB_PER_FT3 * outlet_area_ft2);
+
+    AchievabilityResult {
+        implied_velocity_ft_per_sec,
+        achievable: implied_velocity_ft_per_sec <= max_outlet_velocity_ft_per_sec,
+    }
+}
+
 /// An in-memory model graph. Real persistence is polyglot (Neo4j for topology, Postgres/JSONB
 /// for bodies, S3 for blobs, per ADR-003) — this type stands in for the topology store during
 /// early development.
@@ -1170,6 +1217,37 @@ mod tests {
                 bound: 1.35,
             })
         );
+    }
+
+    /// FR-COMP-06: today's real seeded numbers for both compressor subsystems stay achievable —
+    /// verified by hand before choosing this formula (see the function's own doc comment), now a
+    /// real regression guard for it.
+    #[test]
+    fn compressor_spec_achievability_matches_real_seeded_fan_and_core_numbers() {
+        let fan = check_compressor_spec_achievability(550.0, 74.0, 750.0);
+        assert!(fan.achievable, "{fan:?}");
+        assert!(
+            (fan.implied_velocity_ft_per_sec - 241.0).abs() < 5.0,
+            "expected ~241 ft/sec, got {}",
+            fan.implied_velocity_ft_per_sec
+        );
+
+        let core = check_compressor_spec_achievability(110.0, 18.0, 900.0);
+        assert!(core.achievable, "{core:?}");
+        assert!(
+            (core.implied_velocity_ft_per_sec - 814.0).abs() < 5.0,
+            "expected ~814 ft/sec, got {}",
+            core.implied_velocity_ft_per_sec
+        );
+    }
+
+    #[test]
+    fn compressor_spec_achievability_flags_a_too_small_outlet_diameter() {
+        // Same weight flow/target as Core (HP) Compressor, but a much smaller outlet -- the
+        // implied velocity should blow well past the stated target.
+        let result = check_compressor_spec_achievability(110.0, 10.0, 900.0);
+        assert!(!result.achievable, "{result:?}");
+        assert!(result.implied_velocity_ft_per_sec > 900.0);
     }
 
     #[test]

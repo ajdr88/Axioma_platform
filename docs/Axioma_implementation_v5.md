@@ -1938,3 +1938,94 @@ seeded content on a fresh project, live, against the actual shared dev database.
   also caught the `choices`-always-empty gap documented in §20.2 — confirmed via direct `curl`
   after the fix: `POST .../define` then `POST .../decode` on the real running host API returned
   `"choices":[{"choiceId":"BleedOfftakeStage","presentOption":"Stage 3"}]`, not `[]`.
+
+## 21. FR-COMP-01…06's Real Build-Out
+
+Four of the six were already closed before this pass: FR-COMP-01/02/05 (seeded content on
+`Turbofan-Ref`) and FR-COMP-04 (the `LINKED` `ChoiceConstraint` metadata fix, §19.1). The two real
+gaps — confirmed by reading impl v5 §11's own note before starting, not assumed — were
+FR-COMP-03 (`sysml_core::check_compressor_blade_loading` existed, pure and unit-tested, but "not
+yet HTTP-enforced... wiring is Phase 5's API-surface job," a job that never happened) and FR-COMP-06
+(the seeded `negotiable`/`flagged` fields were static booleans, no detection logic anywhere). Both
+close through the same mechanism: real validation/computation wired into the existing generic
+`PUT /api/v0/projects/:projectId/elements/:id/body` handler (`update_element_body`) — the same
+endpoint every other body-property edit in this app already goes through. **No new frontend
+component** — these are new/recomputed properties on elements already editable through
+`ElementInspector.tsx`'s existing generic properties editor; a 400 already surfaces through that
+editor's existing error handling.
+
+**Dispatch is property-shape-driven, not element-kind-gated**: the handler checks whether the
+incoming properties contain the relevant field names (`diffusionFactor`/`relativeMach` for
+FR-COMP-03; `designWeightFlowLbPerSec`+`outletDiameterIn`+`maxOutletVelocityFtPerSec` together for
+FR-COMP-06), not whether the element is specifically `FanLpCompression`/`CoreHpCompressor` —
+matching how every other body-property convention in this app already works, and avoiding an extra
+Neo4j kind lookup on the hot path of every body update.
+
+### 21.1 FR-COMP-03: real HTTP enforcement of blade-loading/Mach bounds
+
+Pure wiring — `check_compressor_blade_loading`'s signature already matched exactly what was
+needed, no `sysml-core` change required. `update_element_body` now calls it whenever the merged
+properties contain `diffusionFactor` and/or `relativeMach`, reading a new
+`bladeLoadingOverrideAcknowledged` boolean from the same properties bag (default `false`). Its
+`Err(ValidationError)` propagates via `?` — `ApiError`'s existing `ValidationError` arm already
+downcasts to 400, no new error-handling code needed.
+
+- **Seed touch-up**: both `FanLpCompression`/`CoreHpCompressor` subsystem *Structure* bodies (not
+  the separate `REQ-FAN-SPEC`/`REQ-CORE-SPEC` spec Requirements) gained real, illustrative,
+  in-bounds `diffusionFactor`/`relativeMach` values (`0.35`/`1.1` and `0.32`/`1.15`), merged in
+  alongside the existing Interface Contract properties in `seed_fr_comp_content`'s existing
+  read-then-write block — so the check has real content to prove itself against, matching the
+  FR-ARCH pass's own "touch up seed data so it round-trips for real" precedent.
+- New tests (`update_element_body_enforces_compressor_blade_loading_bounds`): today's real seeded
+  values are accepted; diffusion factor over 0.4 without an override is rejected; the same update
+  with the override succeeds; relative Mach over 1.35 is rejected **even with** an override — the
+  function's own pre-existing "demonstrated bound is a hard ceiling" behavior, exercised through
+  HTTP for the first time.
+- **Live-verified against the real running host API**, not just the test suite: a real `PUT` with
+  `diffusionFactor: 0.45` returned `400` with the message `"FanLpCompression: diffusionFactor 0.45
+  exceeds the 0.4 bound without an acknowledged override"`; the same request with
+  `bladeLoadingOverrideAcknowledged: true` returned `204`. Both compressor subsystems' real bodies
+  were restored to their original seeded values afterward.
+
+### 21.2 FR-COMP-06: real computed mutual-incompatibility detection
+
+**No formula for this exists anywhere in the docs** (same situation as `cem-core`'s own thrust/SFC
+model) — confirmed by reading reqs v5 §5.15 in full before designing anything. The requirement's
+own literal example ("requested pressure ratio not achievable within the stated length/weight
+budget at the stated stage count") references a stage count that isn't one of FR-COMP-01's 9 named
+fields and would need a cross-element lookup this schema has no clean basis for (a stage-count
+`:Parameter` only ever carries a `bound` range, never a resolved "current value"). **Chosen
+instead**: a real, self-contained continuity-equation check entirely within the 9-field spec —
+new `sysml_core::check_compressor_spec_achievability(weight_flow_lb_per_sec, outlet_diameter_in,
+max_outlet_velocity_ft_per_sec) -> AchievabilityResult`. Mass flow = density × velocity × area, a
+simplified constant sea-level air density (`0.0765 lb/ft³`) — explicitly documented as an
+illustrative assumption, not a real compressible-flow calculation. If the implied outlet velocity
+exceeds the spec's own stated `maxOutletVelocityFtPerSec`, the two fields are genuinely mutually
+incompatible. Verified by hand against both real seeded subsystems *before* choosing this formula:
+Fan & LP Compression (550 lb/sec, 74in, 750 ft/sec target) implies ~241 ft/sec, comfortably under;
+Core (HP) Compressor (110 lb/sec, 18in, 900 ft/sec target) implies ~814 ft/sec, under but closer —
+a real, non-trivial computation, not a check that trivially always passes or always fails.
+
+- `update_element_body`: whenever the merged properties contain `designWeightFlowLbPerSec`,
+  `outletDiameterIn`, and `maxOutletVelocityFtPerSec` together, calls the new function and
+  **overwrites the `flagged` field in the properties being persisted with the computed result**.
+  `flagged` is now genuinely server-computed, not client-settable — matching the requirement's own
+  "flagged for review, not silently adjusted or silently accepted" wording. `negotiable` is left
+  untouched (a human judgment call this computation has no basis to make).
+- New tests (`update_element_body_computes_flagged_from_real_spec_achievability`): today's real
+  seeded numbers stay `flagged: false` even when the client explicitly tries to set `true`; a
+  deliberately-shrunk `outletDiameterIn` flips `flagged: true` even when the client explicitly
+  sends `false` — proving the field is genuinely computed, not passed through either direction.
+- **Live-verified against the real running host API**: `REQ-CORE-SPEC` updated with
+  `outletDiameterIn: 10.0, flagged: false` came back with `flagged: true` in the persisted body,
+  confirmed via a follow-up `GET` — the server's own computation, not the client's claim. Restored
+  to the original `outletDiameterIn: 18.0, flagged: false` afterward.
+
+### 21.3 Verification
+
+- `cargo test -p sysml-core`: 31/31 passing (29 prior + 2 new — the achievability function's own
+  hand-verified calculation is now a real regression guard, not just a doc-comment claim).
+- `apps/api --ignored`: **69/69 passing** (67 prior + 2 new), zero regressions.
+- `cargo build/clippy/fmt --workspace`: clean throughout.
+- Live `curl` verification against the real running host API for both checks (§21.1/§21.2) — no
+  browser verification needed, no new frontend surface this pass.

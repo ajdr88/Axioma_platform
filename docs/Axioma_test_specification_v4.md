@@ -342,11 +342,13 @@ Mach number exceeds 1.2, no override flag set.
 **PASS:** Rejected (or flagged) by the semantic-validation layer without an explicit
 human-acknowledged override.
 **FAIL:** Accepted silently.
-**Landed status:** **validated-but-unwired, not built at the HTTP layer** — a real
-`check_compressor_blade_loading` rule exists and is unit-tested inside `sysml-core` itself, but
-nothing in `apps/api`'s element-creation/validation path actually calls it yet. This PASS
-criterion is not currently achievable through the real HTTP API — flagged here, not invented
-around; wiring it in belongs to a future pass, not silently claimed done.
+**Landed status:** built and covered — `check_compressor_blade_loading` is now wired into the real
+`PUT /api/v0/projects/:projectId/elements/:id/body` endpoint (FR-COMP-01…06 real build-out, impl v5
+§21.1), property-shape-driven (fires whenever the merged properties contain `diffusionFactor`/
+`relativeMach`, not gated to specific subsystem ids). `update_element_body_enforces_compressor_
+blade_loading_bounds` exercises the real HTTP path end to end; also live-verified via `curl`
+against the running host API (a real 400 with a precise message, then 204 once
+`bladeLoadingOverrideAcknowledged: true` is set).
 
 ### T-COMP-04 — Stage-count consistency (compressor ↔ driving turbine)
 **Verifies:** FR-COMP-04
@@ -380,10 +382,19 @@ pressure ratio unreachable within the stated length/weight budget at the stated 
 saved.
 **PASS:** `flagged: true`, surfaced for human review, not silently adjusted or accepted.
 **FAIL:** Silently adjusted, or `flagged` stays `false` for a genuinely incompatible spec.
-**Landed status:** **not built** — `negotiable`/`flagged` are real, seeded boolean fields (the
-storage FR-COMP-06 needs), but nothing computes or sets them from an actual mutual-incompatibility
-check; the seeded values (`negotiable: true, flagged: false`) are static, not derived. Flagged
-here, not invented around.
+**Landed status:** built and covered — a real, computed check now exists
+(`sysml_core::check_compressor_spec_achievability`, FR-COMP-01…06 real build-out, impl v5 §21.2).
+No formula for this existed anywhere in the docs; a self-contained continuity-equation check
+(implied outlet velocity from weight flow + outlet diameter, vs. the spec's own stated
+`maxOutletVelocityFtPerSec`) was invented and verified by hand against both real seeded subsystems
+before being chosen — documented as illustrative, not a real compressible-flow model.
+`update_element_body` now overwrites `flagged` with the real computed result whenever the relevant
+three fields are present together, server-computed rather than client-settable — proven both ways
+by `update_element_body_computes_flagged_from_real_spec_achievability` (a client-forced `true` on
+an achievable spec is overridden back to `false`; a client-forced `false` on a genuinely
+unachievable one is overridden to `true`) and live `curl` verification against the running host
+API. `negotiable` stays a static, human-set field, unchanged — this computation has no basis to
+decide it.
 
 ---
 
@@ -897,7 +908,7 @@ build-out pass, not this one.
 | NFR-COMP-01/02/03/05 | T-X-07 |
 | NFR-COMP-04 | T-P1.1-05 |
 
-**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` now has at least one test-spec row, including FR-COMP-01…06 and FR-ARCH-01…08 (authored in the scope-downs pass, §§ above; FR-ARCH-01…06 then given a real HTTP-layer/resolution build-out in a follow-up pass, impl v5 §20) — though several of those rows document a genuinely **not-built** PASS criterion rather than a passing test (T-COMP-03/06, T-ARCH-02/07/08 fully so; T-ARCH-03 partially — its ordering half is now real, its cardinality-enforcement half isn't — each says so explicitly in its own "Landed status" line; not silently marked green). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
+**Coverage note:** every FR and NFR in `Axioma_requirements_v5.md` now has at least one test-spec row, including FR-COMP-01…06 and FR-ARCH-01…08 (authored in the scope-downs pass, §§ above; FR-ARCH-01…06 then given a real HTTP-layer/resolution build-out, impl v5 §20; FR-COMP-03/06 then given a real HTTP-layer build-out too, impl v5 §21) — though several of those rows still document a genuinely **not-built** PASS criterion rather than a passing test (T-ARCH-02/07/08 fully so; T-ARCH-03 partially — its ordering half is now real, its cardinality-enforcement half isn't — each says so explicitly in its own "Landed status" line; not silently marked green). Two NFRs are covered *indirectly* and should gain dedicated tests only if they become release-gating: **NFR-CEM-01** (Mode A/Mode B latency — asserted within T-P2.1-02 and T-P1.4-01 rather than as a standalone benchmark) and **NFR-CEM-03** (no-training-on-customer-data posture — a policy/deployment guarantee validated via the isolation tests T-X-02/T-X-07 and, **[REV-D]**, T-DOCIMPORT-06, rather than a runtime assertion).
 
 ## Phase 6 landed status **[REV-D]**
 

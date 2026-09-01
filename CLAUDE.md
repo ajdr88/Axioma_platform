@@ -262,10 +262,16 @@ dependency, lowest urgency of the merged groups.*
    (`PATCH /cem/archspace/choices/:id/resolve`), and a minimal frontend panel — proven against the
    real seeded Turbofan-Ref content, not just the Phase 2 spike's synthetic fixture.
    FR-ARCH-02/03's cyclic-derivation/cardinality-enforcement halves and FR-ARCH-07/08 remain
-   explicitly open (see impl v5 §20's own scope note). FR-COMP-01…06 (compressor requirements) is
-   the next requested pass — **don't assume the Mo 7–9 window absorbs that unchanged just because
-   the spike is done** — the spike de-risked *whether* the approach works, not *how long* the real
-   build takes.
+   explicitly open (see impl v5 §20's own scope note). **FR-COMP-01…06 is now also fully closed** —
+   see impl v5 §21: FR-COMP-03 (`sysml_core::check_compressor_blade_loading`, previously pure/
+   unit-tested only) and FR-COMP-06 (a new, real `check_compressor_spec_achievability` computed
+   check — no formula existed anywhere in the docs, a self-contained continuity-equation check was
+   invented and verified by hand against both real seeded subsystems) are both wired into the
+   real `PUT .../elements/:id/body` endpoint, property-shape-driven rather than hardcoded to
+   specific subsystem ids, and live-verified against the running host API. FR-ARCH-07/08 (the
+   proposal/review-gate wiring named just above) is the next open item on this track — **don't
+   assume the Mo 7–9 window absorbs any of this real build-out unchanged just because the spike is
+   done** — the spike de-risked *whether* the approach works, not *how long* the real build takes.
 6. **P2.2 Contract + Autonomy + Review (Mo 9–10):** proposal/branch workflow, L0–L4 autonomy.
    *Also here (v5): FR-ARCH-07/08 (architecture instance generation/comparison, non-convergent
    handling) alongside the proposal/branch workflow.*

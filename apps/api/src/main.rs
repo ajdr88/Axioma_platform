@@ -1225,8 +1225,59 @@ async fn update_element_body(
         .and_then(|b| b.get("rationale"))
         .and_then(|v| v.as_str())
         .map(String::from);
+    let mut properties = payload.properties;
+
+    // FR-COMP-03 (Blade-Loading & Mach Validation) real HTTP enforcement -- wires
+    // `sysml_core::check_compressor_blade_loading` (previously pure/unit-tested only, see its own
+    // doc comment) into the one generic body-mutation endpoint. Property-shape-driven, not
+    // element-kind-gated: applies to any element whose properties include `diffusionFactor`/
+    // `relativeMach`, not hardcoded to specific subsystem ids -- matching every other body-property
+    // convention already flowing through this endpoint (Hazard severity, Mission phase, etc.).
+    if let Some(obj) = properties.as_object() {
+        let diffusion_factor = obj.get("diffusionFactor").and_then(|v| v.as_f64());
+        let relative_mach = obj.get("relativeMach").and_then(|v| v.as_f64());
+        if diffusion_factor.is_some() || relative_mach.is_some() {
+            let override_acknowledged = obj
+                .get("bladeLoadingOverrideAcknowledged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            sysml_core::check_compressor_blade_loading(
+                &id,
+                diffusion_factor,
+                relative_mach,
+                override_acknowledged,
+            )?;
+        }
+    }
+
+    // FR-COMP-06 (Negotiable-Specification Flagging) real computed detection --
+    // `sysml_core::check_compressor_spec_achievability`. `flagged` is server-computed, not
+    // client-settable: overwritten here with the real result before diffing/persisting, so a
+    // caller can never silently mark an achievable spec as flagged or an unachievable one as
+    // clean ("flagged for review, not silently adjusted or silently accepted" -- reqs v5 §5.15's
+    // own wording). `negotiable` is left untouched -- a human judgment call this computation has
+    // no basis to make.
+    let achievability = properties.as_object().and_then(|obj| {
+        let weight_flow = obj.get("designWeightFlowLbPerSec")?.as_f64()?;
+        let outlet_diameter = obj.get("outletDiameterIn")?.as_f64()?;
+        let max_velocity = obj.get("maxOutletVelocityFtPerSec")?.as_f64()?;
+        Some(sysml_core::check_compressor_spec_achievability(
+            weight_flow,
+            outlet_diameter,
+            max_velocity,
+        ))
+    });
+    if let Some(result) = achievability {
+        if let Some(obj) = properties.as_object_mut() {
+            obj.insert(
+                "flagged".to_string(),
+                serde_json::Value::Bool(!result.achievable),
+            );
+        }
+    }
+
     let mut diff_entries = Vec::new();
-    if let Some(new_properties) = payload.properties.as_object() {
+    if let Some(new_properties) = properties.as_object() {
         for (key, new_val) in new_properties {
             let old_val = old_properties
                 .get(key)
@@ -1257,7 +1308,7 @@ async fn update_element_body(
             &ElementBody {
                 element_id: id.clone(),
                 rationale: payload.rationale,
-                properties: payload.properties,
+                properties,
             },
         )
         .await?;
@@ -1564,6 +1615,13 @@ async fn seed_fr_comp_content(
         inlet_port: (&'static str, u32, serde_json::Value),
         exit_port: (&'static str, u32, serde_json::Value),
         interface_contract: [(&'static str, serde_json::Value); 6],
+        // FR-COMP-03 real build-out -- illustrative, in-bounds blade-loading numbers on the
+        // subsystem Structure itself (not the separate spec Requirement), so
+        // `check_compressor_blade_loading` has real seeded content to validate against. Bounds
+        // per reqs v5 §5.15: diffusion factor <= 0.4 routine, relative Mach <= 1.2 routine /
+        // 1.35 demonstrated-extended-with-override.
+        diffusion_factor: f64,
+        relative_mach: f64,
     }
 
     let seeds = [
@@ -1647,6 +1705,8 @@ async fn seed_fr_comp_content(
                     }),
                 ),
             ],
+            diffusion_factor: 0.35,
+            relative_mach: 1.1,
         },
         CompressorSeed {
             subsystem_id: "CoreHpCompressor",
@@ -1727,6 +1787,8 @@ async fn seed_fr_comp_content(
                     }),
                 ),
             ],
+            diffusion_factor: 0.32,
+            relative_mach: 1.15,
         },
     ];
 
@@ -1961,6 +2023,17 @@ async fn seed_fr_comp_content(
         properties.insert(
             "specProvenance".to_string(),
             serde_json::json!("docs-worked-example"),
+        );
+        // FR-COMP-03 real build-out -- illustrative, in-bounds blade-loading numbers so
+        // `check_compressor_blade_loading` (wired for real into `update_element_body`) has real
+        // seeded content to validate against, not just synthetic test-only values.
+        properties.insert(
+            "diffusionFactor".to_string(),
+            serde_json::json!(seed.diffusion_factor),
+        );
+        properties.insert(
+            "relativeMach".to_string(),
+            serde_json::json!(seed.relative_mach),
         );
         state
             .postgres
@@ -5905,6 +5978,170 @@ mod tests {
         assert_eq!(
             fan_properties["specProvenance"],
             serde_json::json!("docs-worked-example")
+        );
+    }
+
+    async fn merged_update_body(
+        state: &AppState,
+        project_id: &str,
+        element_id: &str,
+        new_fields: serde_json::Value,
+    ) -> Result<StatusCode, ApiError> {
+        let existing = state
+            .postgres
+            .get_body(project_id, element_id)
+            .await
+            .unwrap();
+        let mut properties = existing
+            .as_ref()
+            .and_then(|b| b.get("properties"))
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(new_obj) = new_fields.as_object() {
+            for (k, v) in new_obj {
+                properties.insert(k.clone(), v.clone());
+            }
+        }
+        update_element_body(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path((project_id.to_string(), element_id.to_string())),
+            Json(UpdateBodyRequest {
+                rationale: None,
+                properties: serde_json::Value::Object(properties),
+            }),
+        )
+        .await
+    }
+
+    /// FR-COMP-03 real build-out — `sysml_core::check_compressor_blade_loading` wired into the
+    /// real `PUT .../elements/:id/body` endpoint for the first time (previously pure/unit-tested
+    /// only). Property-shape-driven: fires because the merged properties contain
+    /// `diffusionFactor`/`relativeMach`, not because `FanLpCompression` is hardcoded anywhere.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn update_element_body_enforces_compressor_blade_loading_bounds() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "comp-blade-loading").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        // Real seeded values (0.35/1.1) are within bounds -- accepted.
+        merged_update_body(
+            &state,
+            &project.id,
+            "FanLpCompression",
+            serde_json::json!({ "diffusionFactor": 0.35, "relativeMach": 1.1 }),
+        )
+        .await
+        .expect("within-bounds blade loading should be accepted");
+
+        // Diffusion factor over 0.4 without an override is rejected.
+        let rejected = merged_update_body(
+            &state,
+            &project.id,
+            "FanLpCompression",
+            serde_json::json!({ "diffusionFactor": 0.45 }),
+        )
+        .await;
+        assert!(rejected.is_err(), "expected rejection, got {rejected:?}");
+
+        // The same update, with the override acknowledged, succeeds.
+        merged_update_body(
+            &state,
+            &project.id,
+            "FanLpCompression",
+            serde_json::json!({
+                "diffusionFactor": 0.45,
+                "bladeLoadingOverrideAcknowledged": true,
+            }),
+        )
+        .await
+        .expect("override-acknowledged diffusion factor should be accepted");
+
+        // Relative Mach above the 1.35 demonstrated-extended ceiling is never accepted, even with
+        // an override -- the function's own existing hard-ceiling behavior, now exercised through
+        // HTTP for the first time.
+        let rejected = merged_update_body(
+            &state,
+            &project.id,
+            "CoreHpCompressor",
+            serde_json::json!({
+                "relativeMach": 1.4,
+                "bladeLoadingOverrideAcknowledged": true,
+            }),
+        )
+        .await;
+        assert!(
+            rejected.is_err(),
+            "expected relativeMach=1.4 to be rejected even with override, got {rejected:?}"
+        );
+    }
+
+    /// FR-COMP-06 real build-out — `sysml_core::check_compressor_spec_achievability` wired into
+    /// the same endpoint. `flagged` is server-computed: a client-supplied `flagged` value is
+    /// always overwritten with the real computed result, never passed through.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d`"]
+    async fn update_element_body_computes_flagged_from_real_spec_achievability() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "comp-achievability").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        // Today's real seeded numbers stay achievable -- a client trying to force `flagged: true`
+        // anyway is overridden back to `false` by the server.
+        merged_update_body(
+            &state,
+            &project.id,
+            "REQ-CORE-SPEC",
+            serde_json::json!({
+                "designWeightFlowLbPerSec": 110.0,
+                "outletDiameterIn": 18.0,
+                "maxOutletVelocityFtPerSec": 900.0,
+                "flagged": true,
+            }),
+        )
+        .await
+        .expect("update should succeed");
+        let body = state
+            .postgres
+            .get_body(&project.id, "REQ-CORE-SPEC")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body["properties"]["flagged"],
+            serde_json::json!(false),
+            "server should compute flagged=false for achievable numbers, not pass through the \
+             client's flagged=true, got {body}"
+        );
+
+        // A deliberately-shrunk outlet diameter makes the spec genuinely unachievable -- flagged
+        // flips to true even though the client didn't ask for it.
+        merged_update_body(
+            &state,
+            &project.id,
+            "REQ-CORE-SPEC",
+            serde_json::json!({
+                "designWeightFlowLbPerSec": 110.0,
+                "outletDiameterIn": 10.0,
+                "maxOutletVelocityFtPerSec": 900.0,
+                "flagged": false,
+            }),
+        )
+        .await
+        .expect("update should succeed");
+        let body = state
+            .postgres
+            .get_body(&project.id, "REQ-CORE-SPEC")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body["properties"]["flagged"],
+            serde_json::json!(true),
+            "server should compute flagged=true once the numbers are genuinely unachievable, \
+             got {body}"
         );
     }
 
