@@ -4856,6 +4856,62 @@ mod tests {
         );
     }
 
+    /// T-P1.4-06 / NFR-PERF-04's real, automated CI gate — turns the one-off hand measurement
+    /// `traceability.rs`'s own doc comment describes (566-890ms across 5 runs) into a real
+    /// assertion. Requires the `Turbofan-Scale` fixture to already be seeded
+    /// (`cargo run -p api --bin seed_turbofan_scale`) — seeding ~1M elements inline in a test
+    /// would dwarf the thing being measured, so this test only ever reads it.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` and a pre-seeded Turbofan-Scale fixture (`cargo run -p api --bin seed_turbofan_scale`)"]
+    async fn scale_fixture_traceability_p95_under_nfr_perf_04_budget() {
+        let state = test_app_state().await;
+        let project = state
+            .versioning
+            .list_projects()
+            .await
+            .expect("listing projects")
+            .into_iter()
+            .find(|p| p.name == "Turbofan Scale")
+            .expect(
+                "Turbofan-Scale fixture not seeded — run \
+                 `cargo run -p api --bin seed_turbofan_scale` first",
+            );
+
+        let mut samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let response = traceability::get_traceability(
+                State(state.clone()),
+                Path((project.id.clone(), "REQ-THRUST-SCALE".to_string())),
+                Query(traceability::TraceabilityQuery {
+                    depth: Some(1),
+                    max_fanout: Some(500),
+                    direction: Some(traceability::Direction::Incoming),
+                    cursor: None,
+                }),
+            )
+            .await
+            .expect("traversal against the scale fixture");
+            let elapsed = start.elapsed();
+            let body = response_json(response).await;
+            let result_count = body["results"].as_array().unwrap().len();
+            assert_eq!(
+                result_count, 200,
+                "expected one full page (PAGE_SIZE=200) of REQ-THRUST-SCALE's ~1,200 real \
+                 Satisfy dependents, got {result_count} — fixture may not be fully seeded"
+            );
+            samples.push(elapsed);
+        }
+
+        // n=5, same sample size as the original hand measurement this test replaces — p95 at
+        // this count is just the max, so take it directly rather than a fiddly percentile index.
+        let p95 = *samples.iter().max().unwrap();
+        assert!(
+            p95 < std::time::Duration::from_secs(2),
+            "NFR-PERF-04 budget breached: p95={p95:?} across samples={samples:?}"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires `docker compose up -d`"]
     async fn delete_with_dependents_returns_breach_then_succeeds_with_acknowledge() {

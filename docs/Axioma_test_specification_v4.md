@@ -588,6 +588,12 @@ self-contained trigger for the real non-convergent path, not a mocked one).
 **Action:** CI loads the fixture and runs the P1.2/P1.3 perf assertions.
 **PASS:** load < 5 s; client memory < 2 GB; all referenced perf budgets green; a regression fails the build.
 **FAIL:** any budget breached or the gate not wired into CI.
+**Landed status (2026-09-01, impl v5 §23.1):** partially built — the backend-measurable half is
+real: a new `perf-gate` CI job seeds the real fixture and runs
+`scale_fixture_traceability_p95_under_nfr_perf_04_budget`, a genuine `assert!(p95 < 2s)` against
+NFR-PERF-04, wired to fail the build on regression. The browser-side "load < 5s; client memory <
+2GB" half is **not** covered — that needs a headless-Chromium pass in CI, a separate, heavier
+follow-up, honestly flagged rather than attempted.
 
 ### T-INTX-01 — Message-based interaction with timing constraint **[REV-D]**
 **Verifies:** FR-INTX-01, FR-INTX-02

@@ -1,8 +1,11 @@
 name: CI
 
-# Inner-loop checks only (impl §3.3 tier 1): Biome, cargo fmt/clippy, and a pnpm build.
-# Functional-validation, performance-gate, and delivery tiers are follow-on work — they depend on
-# features (SysML v2 validation suite, 1M-element fixture) that don't exist yet.
+# Inner-loop checks (impl §3.3 tier 1): Biome, cargo fmt/clippy, and a pnpm build — plus a real
+# performance gate (T-P1.4-06 / NFR-PERF-04) against the 1M-element `Turbofan-Scale` fixture.
+# Functional-validation and delivery tiers are still follow-on work — they depend on a SysML v2
+# validation suite that doesn't exist yet. The performance gate covers only the backend-measurable
+# half of T-P1.4-06 (traceability p95); the browser-side "load < 5s, memory < 2GB" numbers would
+# need a headless-Chromium pass against a 1M-element-loaded page and aren't wired in here.
 
 on:
   push:
@@ -50,3 +53,59 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  perf-gate:
+    name: 1M-element scale gate (T-P1.4-06, NFR-PERF-04)
+    runs-on: ubuntu-latest
+    # Neo4j/Postgres as GitHub Actions service containers — same images/credentials as
+    # docker-compose.yml, no docker-compose itself needed in CI. No MinIO service: ObjectStore::
+    # connect() only builds a local S3 client config, it never does a live handshake, so any
+    # S3_ENDPOINT value works here (confirmed by reading apps/api/src/store/objects.rs).
+    services:
+      neo4j:
+        image: neo4j:5-community
+        env:
+          NEO4J_AUTH: neo4j/axioma-dev
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "wget -q -O - http://localhost:7474 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: axioma
+          POSTGRES_PASSWORD: axioma-dev
+          POSTGRES_DB: axioma
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U axioma"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NEO4J_URI: bolt://localhost:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: axioma-dev
+      DATABASE_URL: postgres://axioma:axioma-dev@localhost:5432/axioma
+      S3_ENDPOINT: http://localhost:9000
+      S3_ACCESS_KEY: axioma
+      S3_SECRET_KEY: axioma-dev
+      S3_BUCKET: axioma-geometry
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ~55s locally for 1,000,007 elements / 1,000,005 edges (confirmed by a real timed run,
+      # 2026-09-01) — a fresh project every run, so no cleanup step needed between CI runs.
+      - run: cargo run -p api --bin seed_turbofan_scale
+
+      - run: >-
+          cargo test -p api scale_fixture_traceability_p95_under_nfr_perf_04_budget --
+          --ignored --nocapture

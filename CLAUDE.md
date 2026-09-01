@@ -85,6 +85,15 @@ materialize-on-accept `"archspace-instance"` proposal origin) — see the P2.1 r
 for the full detail. **This closes the entire FR-ARCH-01…08 group.** `apps/api --ignored` now
 stands at 72/72, zero regressions across all three passes.
 
+**Pending-items audit + Tier 0 pass (2026-09-01)** — `docs/pending_items_2026-09-01.md` is a full,
+prioritized sweep of every genuinely open item across the whole platform, produced right after the
+FR-ARCH group closed. The user chose to start with Tier 0 (correctness/CI-integrity gaps). First
+item closed: **T-P1.4-06 wired into CI** (impl v5 §23.1) — a new `perf-gate` job seeds the real
+1M-element fixture and runs a genuine, build-failing `p95 < 2s` assertion for NFR-PERF-04
+traceability; the browser-side "load < 5s, memory < 2GB" half is honestly flagged as still open,
+not attempted. `apps/docs` was also stood up for real this session as an MkDocs + Material site
+(renders `docs/` directly, no copy).
+
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2
 model graph, shipped as **two independently-shippable products**:

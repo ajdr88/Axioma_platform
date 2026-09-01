@@ -2187,3 +2187,55 @@ established in §20.4 specifically to avoid the sibling-dynamic-route-name crash
   through this UI).
 
 **This closes the entire FR-ARCH-01…08 group.**
+
+## 23. Tier 0 Correctness Pass — CI Scale Gate, Cyclic `ArchDerives`, Cardinality, Orphan-Action
+
+Following `docs/pending_items_2026-09-01.md`'s full platform-wide audit, the user chose to start
+with Tier 0 (correctness/CI-integrity gaps — the group judged highest-leverage, since these protect
+guarantees the rest of the platform already relies on). Each of the four items below is its own
+commit, not one bundled diff.
+
+### 23.1 T-P1.4-06 wired into CI — a real, automated NFR-PERF-04 gate
+
+**What existed before this item**: `apps/api/src/bin/seed_turbofan_scale.rs` could seed the real
+1M-element `Turbofan-Scale` fixture, and `traceability.rs`'s own doc comment claimed NFR-PERF-04's
+"<2s p95" passed — but that was a one-off hand measurement, never an automated assertion, and
+`.github/workflows/ci.yml` had no Docker services at all (`cargo test --workspace` only — the
+`#[ignore]`d integration suite, 72 tests at the time, never ran in CI either; that remains a
+separate, larger, explicitly out-of-scope gap).
+
+**Honest scope cut, decided up front**: T-P1.4-06's own PASS bar also names "load < 5s; client
+memory < 2GB" — browser/canvas-side numbers needing a real headless-Chromium pass against a
+1M-element-loaded page in CI. Not attempted here — only the backend-measurable half (NFR-PERF-04
+traceability p95, the number already proven-by-hand) became a real, automated, build-failing gate.
+
+**What was built**:
+- A new `perf-gate` CI job (`.github/workflows/ci.yml`), using GitHub Actions' native `services:`
+  containers for `neo4j:5-community`/`postgres:16` (same images/credentials as
+  `docker-compose.yml`) rather than docker-compose itself — no MinIO service needed, confirmed by
+  reading `apps/api/src/store/objects.rs::ObjectStore::connect`: it only builds a local S3 client
+  config, never a live handshake, so any `S3_ENDPOINT` value works.
+- A new integration test, `scale_fixture_traceability_p95_under_nfr_perf_04_budget`
+  (`apps/api/src/main.rs`), replacing the hand measurement with a real assertion: 5 traversal
+  samples (`depth=1, maxFanout=500, direction=incoming` from `REQ-THRUST-SCALE`, mirroring the
+  original manual run exactly), `p95 < 2s` (at n=5, p95 is just the max — taken directly rather
+  than a fiddly percentile index). The test reads the fixture, it never seeds it — seeding ~1M
+  elements inline would dwarf the thing being measured; the CI job seeds it in a prior step.
+- **Real numbers from a real local run (2026-09-01, this dev machine)**: seeding took **51.6s**
+  (1,000,007 elements / 1,000,005 edges / 1,200 Satisfy edges across the 5 subsystems); the new
+  test then passed with all 5 samples well under budget. Docker/CI runner timing will differ from
+  this dev machine but gives a real basis for the job's expected runtime.
+- **A real finding while writing the test**: the original assumption — that `results` would
+  contain up to `maxFanout=500` items directly — was wrong. `get_traceability` paginates at a fixed
+  `PAGE_SIZE=200` regardless of `maxFanout` (confirmed by `traceability_pagination_covers_full_set_
+  without_duplicates`'s own existing assertion), so the new test's own result-count assertion
+  checks for `200` (one full page), not `500`. Caught by running the test for real against the
+  freshly-seeded fixture, not assumed from reading the handler.
+- `ci.yml`'s own stale top-of-file comment (claiming the 1M-element fixture "doesn't exist yet")
+  fixed as part of this item — Tier 3 item 23 in the pending-items doc, closed as a side effect.
+
+### 23.2 FR-ARCH-02 — pending implementation
+
+### 23.3 FR-ARCH-03 — pending implementation
+
+### 23.4 FR-CORE-13 — pending implementation

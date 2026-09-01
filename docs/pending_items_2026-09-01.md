@@ -18,12 +18,10 @@ header). Two corrections made during this audit that a naive doc-read would have
 
 Fix first — these undermine guarantees the rest of the platform already relies on.
 
-1. **T-P1.4-06 not wired into CI.** The 1M-element `Turbofan-Scale` fixture and seeding binary
-   (`apps/api/src/bin/seed_turbofan_scale.rs`) exist and pass manually (NFR-PERF-04 traceability
-   confirmed "<2s p95" by hand), but `.github/workflows/ci.yml` doesn't run it — its own comment
-   still claims the 1M-element fixture "doesn't exist yet." Every NFR-PERF budget in the platform
-   is currently unverified by CI; a regression anywhere could ship silently. **[Chosen starting
-   point.]**
+1. ~~**T-P1.4-06 not wired into CI.**~~ **Closed 2026-09-01 (impl v5 §23.1).** A new `perf-gate`
+   CI job seeds the real fixture and runs a new automated assertion (`p95 < 2s` for NFR-PERF-04
+   traceability), failing the build on regression. The browser-side "load < 5s; client memory <
+   2GB" half is still not covered — flagged, not silently dropped; a separate, heavier follow-up.
 2. **FR-ARCH-02: no cyclic `ArchDerives` derivation graph.** Mode B's design space can't represent
    genuinely interdependent subsystems (e.g. Compressor/Combustor/Turbine existence depending on
    each other), even though the schema explicitly permits cycles. Undermines trust in every
@@ -100,9 +98,8 @@ No functional gap; cheap correctness fixes so the docs stay trustworthy.
     passed, and the full build being done. Impl v5 §2.5, §9.3.
 22. `Axioma_requirements_v5.md`'s FR-COMP/FR-ARCH status column universally still says "not yet
     specified — Phase 6," even for items closed long since (FR-COMP-01…06, FR-ARCH-01…08).
-23. `.github/workflows/ci.yml`'s own comment claims the 1M-element fixture "doesn't exist yet" — it
-    does now (`apps/api/src/bin/seed_turbofan_scale.rs`). Same underlying fact as Tier 0 item 1;
-    fixing item 1 should also fix this comment.
+23. ~~`.github/workflows/ci.yml`'s own comment claims the 1M-element fixture "doesn't exist
+    yet."~~ **Closed 2026-09-01**, as a side effect of Tier 0 item 1.
 
 ## Tier 4 — Not started by design
 
