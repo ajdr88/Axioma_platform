@@ -276,13 +276,14 @@ fn to_proto_definition(
                 node_names: cc.node_names.clone(),
             })
             .collect(),
-        objective: def
-            .objective
-            .as_ref()
+        objectives: def
+            .objectives
+            .iter()
             .map(|o| archspace_client::proto::Objective {
                 name: o.name.clone(),
                 direction: o.direction,
-            }),
+            })
+            .collect(),
     }
 }
 
@@ -673,6 +674,65 @@ pub(crate) async fn generate_instances(
     }
     Ok(Json(GenerateInstancesResponseDto {
         instances,
+        refreshed_handle_id,
+    }))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OptimizeRequestDto {
+    /// `"nsga2"` (default when absent/empty) or `"hierarchical-bo"` — see
+    /// `cem_archspace.proto`'s `RunOptimization` doc comment for the real difference.
+    #[serde(default)]
+    pub(crate) algorithm: Option<String>,
+    #[serde(default)]
+    pub(crate) population_size: Option<i32>,
+    #[serde(default)]
+    pub(crate) n_generations: Option<i32>,
+    #[serde(default)]
+    pub(crate) seed: Option<i32>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OptimizeResponseDto {
+    pub(crate) algorithm: String,
+    pub(crate) best_objective_values: Vec<f64>,
+    pub(crate) best_design_vector: Vec<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) refreshed_handle_id: Option<String>,
+}
+
+/// `POST /api/v0/projects/:projectId/cem/archspace/:handleId/optimize` — Tier 1 pass (item 7):
+/// the first real, human/frontend-reachable way to trigger `RunOptimization`, which previously had
+/// zero real HTTP callers (only a test called `archspace_client::run_optimization` directly).
+/// Genuinely multi-objective once the design space has more than one encoded design variable
+/// (`cem_core::archspace::encode_design_space`'s own "one objective per design variable"
+/// convention) — `n_obj` on the sidecar's real `DSGArchOptProblem` is derived automatically from
+/// however many objectives got built, no separate wiring needed. `algorithm: "hierarchical-bo"`
+/// runs genuine hierarchical Bayesian Optimization (`sb_arch_opt.algo.arch_sbo`, "ArchSBO") instead
+/// of the default NSGA-II — real, not a fallback dressed up as one, confirmed by observing
+/// genuinely different result values for the two algorithms against the same design space before
+/// trusting this wiring.
+pub(crate) async fn optimize(
+    State(state): State<AppState>,
+    Path((_project_id, handle_id)): Path<(String, String)>,
+    Json(payload): Json<OptimizeRequestDto>,
+) -> Result<Json<OptimizeResponseDto>, ApiError> {
+    let (handle_id, refreshed_handle_id) = ensure_live_handle(&state, &handle_id).await?;
+    let algorithm = payload.algorithm.unwrap_or_else(|| "nsga2".to_string());
+    let result = archspace_client::run_optimization(
+        &handle_id,
+        payload.population_size.unwrap_or(10),
+        payload.n_generations.unwrap_or(5),
+        payload.seed.unwrap_or(0),
+        &algorithm,
+    )
+    .await?;
+    Ok(Json(OptimizeResponseDto {
+        algorithm: result.algorithm,
+        best_objective_values: result.best_objective_values,
+        best_design_vector: result.best_design_vector,
         refreshed_handle_id,
     }))
 }

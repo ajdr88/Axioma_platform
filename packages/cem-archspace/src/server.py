@@ -29,23 +29,36 @@ logger = logging.getLogger("cem-archspace")
 class _PlaceholderEvaluator(DSGEvaluator):
     """FR-ARCH-08 (Non-Convergent Evaluation Handling): a design-vector combination adsg-core
     itself already marks infeasible never reaches `_evaluate` at all (the graph-processor's own
-    correction step handles that); this evaluator's only job is the placeholder objective, and it
-    returns NaN if the objective node's own design-variable dependency has no value -- the same
+    correction step handles that); this evaluator's only job is the placeholder objective(s), and
+    it returns NaN for any objective whose own design-variable dependency has no value -- the same
     explicit non-convergence signal `adsg_core.optimization.evaluator.DSGEvaluator`'s own
     docstring specifies ("NaN is allowed"), reusing FR-CEM-13's typed-outcome discipline rather
     than a bespoke failure shape.
+
+    Tier 1 pass (item 7) -- generalized from a single `(objective_node, dv_node)` pair to a real
+    list of pairs, one per declared objective, each reading its own design variable's raw value
+    (`dsg_builder.build_design_space`'s own real 1:1 ordering between `objective_nodes` and
+    `dv_nodes`). `DSGArchOptProblem`'s `n_obj` is derived automatically from however many
+    objectives this evaluator declares -- genuinely multi-objective once more than one pair exists,
+    no separate wiring needed.
     """
 
-    def __init__(self, dsg, objective_node, objective_dv_node):
+    def __init__(self, dsg, objective_dv_pairs):
         super().__init__(dsg)
-        self._objective_node = objective_node
-        self._objective_dv_node = objective_dv_node
+        self._objective_dv_pairs = objective_dv_pairs
 
     def _evaluate(self, dsg_inst, metric_nodes):
-        value = dsg_inst.des_var_value(self._objective_dv_node) if self._objective_dv_node else None
-        if value is None:
-            return {self._objective_node: float("nan")}
-        return {self._objective_node: float(value)}
+        values = {}
+        for objective_node, dv_node in self._objective_dv_pairs:
+            value = dsg_inst.des_var_value(dv_node) if dv_node else None
+            values[objective_node] = float("nan") if value is None else float(value)
+        return values
+
+
+def _objective_dv_pairs(built):
+    """The real 1:1 pairing `_PlaceholderEvaluator` needs -- `dsg_builder.build_design_space`'s own
+    documented ordering guarantee between `objective_nodes` and `dv_nodes`."""
+    return list(zip(built.objective_nodes, built.dv_nodes.values()))
 
 
 class CemArchspaceServicer(cem_archspace_pb2_grpc.CemArchspaceServicer):
@@ -82,12 +95,11 @@ class CemArchspaceServicer(cem_archspace_pb2_grpc.CemArchspaceServicer):
         )
 
         # FR-ARCH-06's other three real metrics -- live on the same DSGArchOptProblem
-        # RunOptimization/EvaluateViability already build, which needs a real objective (same
-        # precondition those two RPCs already gate on) -- omitted (proto3 `optional`, a real
+        # RunOptimization/EvaluateViability already build, which needs at least one real objective
+        # (same precondition those two RPCs already gate on) -- omitted (proto3 `optional`, a real
         # absence) rather than faked as 0.0 when this design space has none.
-        if built.objective_node is not None:
-            objective_dv_node = next(iter(built.dv_nodes.values()), None)
-            evaluator = _PlaceholderEvaluator(built.dsg, built.objective_node, objective_dv_node)
+        if built.objective_nodes:
+            evaluator = _PlaceholderEvaluator(built.dsg, _objective_dv_pairs(built))
             problem = DSGArchOptProblem(evaluator)
             stats_kwargs.update(
                 correction_ratio=problem.get_correction_ratio(),
@@ -117,47 +129,66 @@ class CemArchspaceServicer(cem_archspace_pb2_grpc.CemArchspaceServicer):
 
     def RunOptimization(self, request, context):
         built = self._get(request.handle_id, context)
-        if built.objective_node is None:
+        if not built.objective_nodes:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
-                "design space has no objective; RunOptimization needs one",
+                "design space has no objectives; RunOptimization needs at least one",
             )
 
-        # The spike's placeholder objective reads back the first declared design variable's
-        # value -- the evaluator only needs *a* numeric signal to prove SBArchOpt actually drives
+        # Each declared objective reads back its own paired design variable's raw value -- the
+        # evaluator only needs *a* numeric signal per objective to prove SBArchOpt actually drives
         # adsg-core's evaluation loop, not a physically meaningful one (see README.md's scope
-        # note). `dv_nodes` is insertion-ordered by dsg_builder.build_design_space.
-        objective_dv_node = next(iter(built.dv_nodes.values()), None)
-
-        evaluator = _PlaceholderEvaluator(built.dsg, built.objective_node, objective_dv_node)
+        # note). `n_obj` on `problem` below is derived automatically from however many pairs this
+        # evaluator declares -- genuinely multi-objective once more than one exists.
+        evaluator = _PlaceholderEvaluator(built.dsg, _objective_dv_pairs(built))
         problem = DSGArchOptProblem(evaluator)
-        nsga2 = get_nsga2(pop_size=max(request.population_size, 4))
-        result = minimize(
-            problem,
-            nsga2,
-            termination=("n_gen", max(request.n_generations, 1)),
-            seed=request.seed,
-        )
 
-        best_f = float(np.asarray(result.F).reshape(-1)[0]) if result.F is not None else float("nan")
-        best_x = list(np.asarray(result.X).reshape(-1)) if result.X is not None else []
+        # Tier 1 pass (item 7) -- real algorithm choice. Both `ArchOptNSGA2` (get_nsga2) and
+        # `InfillAlgorithm` (get_arch_sbo_gp) subclass the same `pymoo.core.algorithm.Algorithm`,
+        # confirmed by reading both classes directly -- the exact same `minimize(problem, algo,
+        # termination=..., seed=...)` call pattern applies to either, no separate top-level wiring.
+        algorithm = request.algorithm or "nsga2"
+        if algorithm == "hierarchical-bo":
+            from sb_arch_opt.algo.arch_sbo.api import get_arch_sbo_gp, get_sbo_termination
+
+            algo = get_arch_sbo_gp(problem, init_size=max(request.population_size, 4))
+            termination = get_sbo_termination(n_max_infill=max(request.n_generations, 1))
+        elif algorithm == "nsga2":
+            algo = get_nsga2(pop_size=max(request.population_size, 4))
+            termination = ("n_gen", max(request.n_generations, 1))
+        else:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"unknown algorithm {algorithm!r}")
+
+        result = minimize(problem, algo, termination=termination, seed=request.seed)
+
+        # One representative point -- the first row of whatever pymoo returned (a single best
+        # individual for single-objective; the first point of a real non-dominated Pareto front
+        # for multi-objective, see this RPC's own proto doc comment).
+        if result.F is not None:
+            f_matrix = np.atleast_2d(result.F)
+            x_matrix = np.atleast_2d(result.X)
+            best_f = [float(v) for v in f_matrix[0]]
+            best_x = [float(v) for v in x_matrix[0]]
+        else:
+            best_f = []
+            best_x = []
         return cem_archspace_pb2.OptimizeResult(
-            best_objective_value=best_f,
-            best_design_vector=[float(v) for v in best_x],
+            best_objective_values=best_f,
+            best_design_vector=best_x,
+            algorithm=algorithm,
         )
 
     def EvaluateViability(self, request, context):
         built = self._get(request.handle_id, context)
-        if built.objective_node is None:
+        if not built.objective_nodes:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
-                "design space has no objective; EvaluateViability needs one",
+                "design space has no objectives; EvaluateViability needs at least one",
             )
 
         # Reuses the exact same evaluator/problem RunOptimization already builds -- no new
         # evaluator, no new problem class (see this RPC's own proto doc comment).
-        objective_dv_node = next(iter(built.dv_nodes.values()), None)
-        evaluator = _PlaceholderEvaluator(built.dsg, built.objective_node, objective_dv_node)
+        evaluator = _PlaceholderEvaluator(built.dsg, _objective_dv_pairs(built))
         problem = DSGArchOptProblem(evaluator)
         gp = GraphProcessor(built.dsg)
 
@@ -186,8 +217,15 @@ class CemArchspaceServicer(cem_archspace_pb2_grpc.CemArchspaceServicer):
         )
         candidate_out = {}
         problem._evaluate(x_candidate, candidate_out)
-        candidate_f = float(np.asarray(candidate_out["F"]).reshape(-1)[0])
-        objective_computed = bool(np.isfinite(candidate_f))
+        # Tier 1 pass (item 7) -- with real multi-objective support, "computed" means every
+        # declared objective evaluated to a real (non-NaN) value, not just the first; `objective_
+        # value` in the response stays the first objective's value for display purposes (this
+        # RPC's own single-value shape predates multi-objective and is about overall viability, not
+        # a full per-objective breakdown -- `RunOptimization`'s `bestObjectiveValues` is where the
+        # real multi-objective breakdown lives).
+        candidate_f_row = np.asarray(candidate_out["F"]).reshape(-1)
+        objective_computed = bool(np.all(np.isfinite(candidate_f_row)))
+        candidate_f = float(candidate_f_row[0]) if candidate_f_row.size > 0 else float("nan")
 
         # A real sb_arch_opt.algo.arch_sbo.hc_strategy.RandomForestClassifier, trained on the
         # freshly-sampled/evaluated (x, is_valid) pairs above -- the real, standalone predictor

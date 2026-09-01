@@ -73,12 +73,15 @@ pub(crate) async fn decode_instance(
     Ok(instance)
 }
 
-#[allow(dead_code)]
+/// `algorithm`: `"nsga2"` (default when empty) or `"hierarchical-bo"` — see
+/// `cem_archspace.proto`'s own `RunOptimization` doc comment for the real difference (Tier 1
+/// pass, item 7). Real, non-test caller as of this pass — `archspace.rs::optimize`.
 pub(crate) async fn run_optimization(
     handle_id: &str,
     population_size: i32,
     n_generations: i32,
     seed: i32,
+    algorithm: &str,
 ) -> anyhow::Result<OptimizeResult> {
     let mut client = connect().await?;
     let result = client
@@ -87,6 +90,7 @@ pub(crate) async fn run_optimization(
             population_size,
             n_generations,
             seed,
+            algorithm: algorithm.to_string(),
         })
         .await?
         .into_inner();
@@ -167,9 +171,9 @@ pub(crate) fn spike_compressor_design_space() -> DesignSpaceDefinition {
             kind: ChoiceConstraintKind::Linked as i32,
             node_names: vec!["n_HP_stages".to_string(), "n_HP_turbine_stages".to_string()],
         }],
-        objective: Some(Objective {
+        objectives: vec![Objective {
             name: "TotalStages".to_string(),
             direction: -1,
-        }),
+        }],
     }
 }

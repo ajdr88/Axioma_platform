@@ -72,6 +72,15 @@ interface ProposeResponse {
   refreshedHandleId?: string;
 }
 
+/** Tier 1 pass (item 7) — real multi-objective search. `bestObjectiveValues` has one real entry
+ * per encoded design variable now (was a single value before this pass). */
+interface OptimizeResponse {
+  algorithm: string;
+  bestObjectiveValues: number[];
+  bestDesignVector: number[];
+  refreshedHandleId?: string;
+}
+
 interface DerivedExistenceResponse {
   derivedElementIds: string[];
   withinCycle: string[];
@@ -125,6 +134,10 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
   const [derivedExistenceError, setDerivedExistenceError] = useState<string | null>(null);
   const [derivedExistenceResult, setDerivedExistenceResult] =
     useState<DerivedExistenceResponse | null>(null);
+  const [optimizeAlgorithm, setOptimizeAlgorithm] = useState<"nsga2" | "hierarchical-bo">("nsga2");
+  const [optimizing, setOptimizing] = useState(false);
+  const [optimizeError, setOptimizeError] = useState<string | null>(null);
+  const [optimizeResult, setOptimizeResult] = useState<OptimizeResponse | null>(null);
 
   async function handleDefine() {
     if (!subsystemId) return;
@@ -209,6 +222,42 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
       setGenerateError(err instanceof Error ? err.message : "failed to generate instances");
     } finally {
       setGenerating(false);
+    }
+  }
+
+  /** Tier 1 pass (item 7) — the first real, human-reachable way to trigger `RunOptimization`
+   * (previously zero real HTTP callers). `hierarchical-bo` genuinely trains a real Gaussian-
+   * Process surrogate server-side and can take significantly longer than `nsga2` — no client-side
+   * timeout is set, matching the panel's other long-ish calls (Generate & Compare). */
+  async function handleOptimize() {
+    if (!defineResult) return;
+    setOptimizing(true);
+    setOptimizeError(null);
+    setOptimizeResult(null);
+    try {
+      const res = await fetch(
+        `/api/projects/${projectId}/cem/archspace/${defineResult.handleId}/optimize`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            algorithm: optimizeAlgorithm,
+            populationSize: 10,
+            nGenerations: 5,
+          }),
+        },
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.error ?? `request failed with status ${res.status}`);
+      }
+      const optimized: OptimizeResponse = await res.json();
+      updateHandleIfRefreshed(optimized.refreshedHandleId);
+      setOptimizeResult(optimized);
+    } catch (err) {
+      setOptimizeError(err instanceof Error ? err.message : "failed to run optimization");
+    } finally {
+      setOptimizing(false);
     }
   }
 
@@ -402,6 +451,46 @@ export function ArchspacePanel({ projectId, elements, onClose }: ArchspacePanelP
               >
                 {generating ? "Generating…" : "Generate & Compare (5)"}
               </Button>
+
+              <div className="mt-2 flex gap-1.5">
+                <select
+                  value={optimizeAlgorithm}
+                  onChange={(event) =>
+                    setOptimizeAlgorithm(event.target.value as "nsga2" | "hierarchical-bo")
+                  }
+                  className="flex-1 rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
+                >
+                  <option value="nsga2">NSGA-II</option>
+                  <option value="hierarchical-bo">Hierarchical BO</option>
+                </select>
+                <Button
+                  onClick={handleOptimize}
+                  disabled={optimizing}
+                  className="flex-1 justify-center !py-1 text-xs"
+                >
+                  {optimizing ? "Optimizing…" : "Run Optimization"}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {optimizeError && <p className="mb-2 text-xs text-alert">{optimizeError}</p>}
+
+          {optimizeResult && (
+            <div
+              className="mb-3 rounded border border-white/10 p-1.5"
+              data-archspace-optimize-result
+            >
+              <p className="mb-1 text-[10px] uppercase tracking-widest text-white/40">
+                Optimization Result ({optimizeResult.algorithm})
+              </p>
+              <p className="font-mono text-[11px] text-white/70">
+                objectives: [
+                {optimizeResult.bestObjectiveValues.map((v) => v.toFixed(3)).join(", ")}]
+              </p>
+              <p className="font-mono text-[11px] text-white/70">
+                vector: [{optimizeResult.bestDesignVector.map((v) => v.toFixed(2)).join(", ")}]
+              </p>
             </div>
           )}
 

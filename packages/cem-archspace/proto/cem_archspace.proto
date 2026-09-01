@@ -40,9 +40,16 @@ service CemArchspace {
   rpc DecodeInstance(DecodeRequest) returns (ArchitectureInstance);
 
   // Proves the *other* half of ADR-011 (SBArchOpt actually consumes an adsg-core-built problem
-  // and optimizes it) -- wraps the design space in a DSGEvaluator/DSGArchOptProblem and runs
-  // SBArchOpt's own NSGA-II wrapper (sb_arch_opt.algo.pymoo_interface.get_nsga2) for a fixed
-  // number of generations against the single declared objective.
+  // and optimizes it) -- wraps the design space in a DSGEvaluator/DSGArchOptProblem and runs one
+  // of two real algorithms against however many objectives were declared (Tier 1 pass, item 7):
+  // `algorithm: "nsga2"` (default) -- SBArchOpt's own evolutionary wrapper
+  // (sb_arch_opt.algo.pymoo_interface.get_nsga2), genuinely multi-objective once more than one
+  // objective exists, not just single-objective as the original spike exercised. `algorithm:
+  // "hierarchical-bo"` -- genuine hierarchical Bayesian Optimization
+  // (sb_arch_opt.algo.arch_sbo.api.get_arch_sbo_gp, "ArchSBO"), needing the real `smt` dependency
+  // this pass added. Returns one representative point (the first) from whatever `pymoo` returned
+  // -- a single best individual for single-objective, or the first point of the real non-dominated
+  // Pareto front for multi-objective; browsing the *whole* front is a real, separate follow-up.
   rpc RunOptimization(OptimizeRequest) returns (OptimizeResult);
 
   // FR-ARCH-08 (Non-Convergent Evaluation Handling). Reuses the exact DSGEvaluator/
@@ -102,9 +109,13 @@ message ChoiceConstraint {
   repeated string node_names = 2;
 }
 
-// Spike-scoped: exactly one objective, direction mirrors adsg_core's MetricNode.direction
-// (-1 = minimize, +1 = maximize). Multi-objective/constraint metrics are real adsg-core/SBArchOpt
-// capability, just not exercised by this pass's single-objective placeholder evaluator.
+// direction mirrors adsg_core's MetricNode.direction (-1 = minimize, +1 = maximize). Tier 1 pass
+// (item 7) -- real multi-objective support: `DesignSpaceDefinition.objectives` is now `repeated`,
+// one real objective per encoded design variable (`cem_core::archspace::encode_design_space`'s own
+// convention), not the spike's original "exactly one." `n_obj` on the sidecar's real
+// `DSGArchOptProblem` is derived automatically from however many real objectives got built here --
+// NSGA-II (`RunOptimization`) genuinely runs multi-objective once more than one exists, no separate
+// wiring needed.
 message Objective {
   string name = 1;
   int32 direction = 2;
@@ -118,7 +129,7 @@ message DesignSpaceDefinition {
   repeated ConnectionChoice connection_choices = 5;
   repeated IncompatibilityConstraint incompatibility_constraints = 6;
   repeated ChoiceConstraint choice_constraints = 7;
-  Objective objective = 8;
+  repeated Objective objectives = 8;
 }
 
 message DesignSpaceHandle {
@@ -155,14 +166,21 @@ message ArchitectureInstance {
 
 message OptimizeRequest {
   string handle_id = 1;
+  // "nsga2" (population_size real) or "hierarchical-bo" (population_size used as its initial DOE
+  // size, n_generations as its max infill count -- see the RPC's own doc comment). Empty/absent
+  // defaults to "nsga2" server-side.
   int32 population_size = 2;
   int32 n_generations = 3;
   int32 seed = 4;
+  string algorithm = 5;
 }
 
 message OptimizeResult {
-  double best_objective_value = 1;
+  // One real value per declared objective (Tier 1 pass, item 7 -- was a single `double` when only
+  // one objective could ever exist).
+  repeated double best_objective_values = 1;
   repeated double best_design_vector = 2;
+  string algorithm = 3;
 }
 
 // FR-ARCH-08. An empty `design_vector` asks the server to sample one at random first, same

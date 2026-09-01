@@ -87,7 +87,10 @@ pub struct DesignSpaceDefinitionInput {
     pub connection_choices: Vec<ConnectionChoiceInput>,
     pub incompatibility_constraints: Vec<IncompatibilityConstraintInput>,
     pub choice_constraints: Vec<ChoiceConstraintInput>,
-    pub objective: Option<ObjectiveInput>,
+    /// Tier 1 pass (item 7) — was `Option<ObjectiveInput>` (exactly zero or one, regardless of
+    /// content); real multi-objective support needs one real objective per design variable, see
+    /// `encode_design_space`'s own doc comment for the exact construction rule.
+    pub objectives: Vec<ObjectiveInput>,
 }
 
 // --- Inputs: already-fetched graph content, plain data only ---------------------------------
@@ -314,11 +317,30 @@ pub fn encode_design_space(
         }
     }
 
-    let has_any_content = !design_variables.is_empty() || !selection_choice_inputs.is_empty();
-    let objective = has_any_content.then(|| ObjectiveInput {
-        name: format!("{root_name}Objective"),
-        direction: -1,
-    });
+    // Tier 1 pass (item 7) -- real multi-objective support: one real objective per encoded design
+    // variable (each reading that DV's own raw value, `server.py`'s `_PlaceholderEvaluator` real
+    // 1:1 pairing), not exactly one regardless of content. Falls back to the original single
+    // auto-named objective when there are no design variables but some other content was encoded
+    // (a selection-choice-only design space) -- preserves the real, already-relied-upon "no design
+    // variables -> guaranteed NaN/Diverged" case `evaluate_reports_diverged_for_a_design_space_
+    // with_no_design_variables` exercises, which needs *an* objective to exist with nothing real
+    // to read.
+    let objectives: Vec<ObjectiveInput> = if !design_variables.is_empty() {
+        design_variables
+            .iter()
+            .map(|dv| ObjectiveInput {
+                name: format!("{}Objective", dv.name),
+                direction: -1,
+            })
+            .collect()
+    } else if !selection_choice_inputs.is_empty() {
+        vec![ObjectiveInput {
+            name: format!("{root_name}Objective"),
+            direction: -1,
+        }]
+    } else {
+        Vec::new()
+    };
 
     EncodeResult {
         definition: DesignSpaceDefinitionInput {
@@ -329,7 +351,7 @@ pub fn encode_design_space(
             connection_choices: connection_choice_inputs,
             incompatibility_constraints,
             choice_constraints: choice_constraint_inputs,
-            objective,
+            objectives,
         },
         skipped,
     }
@@ -480,16 +502,18 @@ mod tests {
             result.definition.choice_constraints[0].kind,
             ChoiceConstraintKindInput::Linked
         );
-        // FR-ARCH-08 needs every real design space to carry an objective (EvaluateViability/
-        // RunOptimization both fail without one) -- confirmed always set whenever anything real
-        // was encoded.
-        let objective = result
-            .definition
-            .objective
-            .as_ref()
-            .expect("a design space with real content should always get a real objective");
-        assert_eq!(objective.name, "CoreHpCompressorObjective");
-        assert_eq!(objective.direction, -1);
+        // Tier 1 pass (item 7) -- one real objective per design variable, not exactly one
+        // regardless of content (FR-ARCH-08 still needs at least one for EvaluateViability/
+        // RunOptimization to work at all -- confirmed always ≥1 whenever anything real was
+        // encoded).
+        assert_eq!(result.definition.objectives.len(), 2);
+        assert_eq!(result.definition.objectives[0].name, "n_HP_stagesObjective");
+        assert_eq!(result.definition.objectives[0].direction, -1);
+        assert_eq!(
+            result.definition.objectives[1].name,
+            "n_HP_turbine_stagesObjective"
+        );
+        assert_eq!(result.definition.objectives[1].direction, -1);
     }
 
     #[test]
@@ -512,7 +536,33 @@ mod tests {
         assert!(result.skipped[0].reason.contains("no bound"));
         // Nothing encodable at all -- no design variables, no selection choices -- means no real
         // objective either, not a fabricated one over an empty design space.
-        assert!(result.definition.objective.is_none());
+        assert!(result.definition.objectives.is_empty());
+    }
+
+    /// Tier 1 pass (item 7) — the preserved fallback: a design space with no design variables but
+    /// real other content (here, one selection choice) still gets exactly one auto-named
+    /// objective, the same real, already-relied-upon mechanism
+    /// `evaluate_reports_diverged_for_a_design_space_with_no_design_variables`
+    /// (`apps/api/src/main.rs`) exercises for a guaranteed non-convergent case — nothing real to
+    /// read, so it evaluates to NaN, not a per-DV objective (there are no DVs to build one per).
+    #[test]
+    fn encode_design_space_falls_back_to_one_auto_named_objective_with_no_design_variables() {
+        let result = encode_design_space(
+            "OnlyChoices",
+            &[],
+            &[],
+            &[SelectionChoiceElement {
+                id: "OnlyChoice".to_string(),
+                options: serde_json::json!(["A", "B"]),
+            }],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(result.definition.design_variables.is_empty());
+        assert_eq!(result.definition.objectives.len(), 1);
+        assert_eq!(result.definition.objectives[0].name, "OnlyChoicesObjective");
+        assert_eq!(result.definition.objectives[0].direction, -1);
     }
 
     #[test]

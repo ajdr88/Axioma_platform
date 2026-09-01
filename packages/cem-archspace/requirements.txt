@@ -8,3 +8,9 @@ protobuf==7.36.0
 # FR-ARCH-08 -- sb_arch_opt.algo.arch_sbo.hc_strategy.RandomForestClassifier's real predictor
 # (BSD-3-Clause). Pulls in joblib/threadpoolctl/cloudpickle/narwhals as real transitive deps.
 scikit-learn==1.9.0
+# Tier 1 pass (item 7) -- real hierarchical-BO (sb_arch_opt.algo.arch_sbo, "ArchSBO"), previously
+# absent (HAS_SMT/HAS_ARCH_SBO were False). BSD-3-Clause, confirmed real/installable via a live
+# `uv pip install --dry-run` against this exact venv (Windows, Python 3.12) before adding here --
+# resolves to prebuilt wheels only, no C/Fortran toolchain needed. Pulls in jenn/pydoe/jsonschema/
+# orjson/attrs/rpds-py/referencing/jsonpointer as real transitive deps.
+smt==2.14.1

@@ -2550,3 +2550,151 @@ real new shape, `{"instances": [...]}`, not a bare array, with `refreshedHandleI
 in this normal (no-recovery-needed) session. "Propose" on the first card produced a real accepted
 proposal id with no error. Zero browser console/page errors throughout. This closes Tier 1 Batch A
 in full.
+
+## 25. Tier 1 Batch B — Real Multi-Objective Search + Genuine Hierarchical-BO (`ArchSBO`)
+
+Item 7 from `docs/pending_items_2026-09-01.md`, per the user's own explicit "also attempt
+hierarchical-BO" scope choice (the fuller option over multi-objective NSGA-II alone). Research
+before implementation found this genuinely larger than "add an algorithm switch": the `objective`
+field was singular at all three layers (proto, `cem-core`, `dsg_builder.py`), `RunOptimization` had
+**zero real HTTP callers** anywhere in `apps/api` before this pass, and the only two currently-
+encodable `CoreHpCompressor` design variables (`n_HP_stages`/`n_HP_turbine_stages`) are
+`ChoiceConstraint`-`LINKED` — genuinely degenerate for a multi-objective demo, since they always
+move in lockstep.
+
+### 25.1 Real multi-objective schema: `objective` (singular) → `objectives` (repeated)
+
+A straight rename through all three layers, no back-compat shim (no external consumer existed):
+`cem_archspace.proto`'s `DesignSpaceDefinition.objective` → `repeated Objective objectives`;
+`cem_core::archspace::DesignSpaceDefinitionInput.objective: Option<ObjectiveInput>` →
+`objectives: Vec<ObjectiveInput>`; `dsg_builder.py`'s `BuiltDesignSpace.objective_node` →
+`objective_nodes: List[MetricNode]`. `OptimizeResult.best_objective_value: double` → `repeated
+double best_objective_values` (a real, necessary widening — multi-objective search returns one best
+value *per objective*, not one).
+
+**Design: objective-per-design-variable.** `cem_core::archspace::encode_design_space` now builds
+one real `ObjectiveInput` per encoded `DesignVariableInput` (named `"{dv.name}Objective"`,
+direction `-1`), replacing the old "exactly one auto-named objective whenever any content exists."
+This naturally preserves single-objective behavior when only one DV exists, and produces N real
+objectives when N DVs exist, with no hand-picked pairing. A fallback preserves the old single-
+auto-named-objective behavior when there are zero design variables but other content exists (kept
+specifically so `evaluate_reports_diverged_for_a_design_space_with_no_design_variables`'s
+guaranteed-NaN mechanism keeps working) — covered by a new test,
+`encode_design_space_falls_back_to_one_auto_named_objective_with_no_design_variables`. The
+`ChoiceConstraint`-`LINKED` degeneracy (two objectives moving in lockstep) is left an honest,
+documented limitation, not solved here — that would need real graph analysis of `LINKED` groups,
+separate/larger scope.
+
+`server.py::_PlaceholderEvaluator` generalized from a single `(objective_node, dv_node)` pair to a
+list of pairs (`_objective_dv_pairs`, zipping `built.objective_nodes` with `built.dv_nodes.values()`
+in order — the same 1:1 correspondence `encode_design_space`'s per-DV convention establishes). Each
+objective reads back its own DV's raw value (NaN if unset, same FR-ARCH-08 non-convergence signal
+as before). `GetDesignSpaceStats`/`EvaluateViability`'s "has an objective" precondition became "has
+at least one." `EvaluateViability`'s `is_failed`/`y_is_valid` computation was already N-objective-
+correct (`np.all(np.isfinite(y_train), axis=1)`, untouched); only `objective_computed` needed
+updating to check `np.all(np.isfinite(candidate_f_row))` (all objectives, not just the first) —
+`objective_value` (singular, display-only) deliberately stays first-objective-only, the real
+multi-objective breakdown lives in `RunOptimization`'s response instead.
+
+**Real seed touch-up, the same pattern the FR-ARCH-01-06 pass used once before**: `OprCoreParam` (a
+real, already-`Bound`-linked-to-`CoreHpCompressor` Parameter, previously skipped by
+`encode_design_space` for having no `"bound"` property) gained an illustrative `"bound": [10.0,
+20.0]` (order-of-magnitude plausible for a modern turbofan core's HP-side OPR, not claimed as a
+sourced value — same honesty convention as every other numeric seed touch-up this session). This
+gives `CoreHpCompressor` a real, independent third design variable, alongside the `LINKED` pair —
+genuine non-degenerate trade space once objective-per-DV wiring lands.
+
+### 25.2 New dependency: `smt==2.14.1`
+
+Hierarchical-BO (`sb_arch_opt.algo.arch_sbo`, "ArchSBO") needs `smt` for its Gaussian-Process
+surrogate, previously absent from the sidecar (`HAS_SMT`/`HAS_ARCH_SBO` were `False`). Confirmed
+real/installable *before* adding it: BSD-3-Clause, and a live `uv pip install smt --dry-run`
+against the sidecar's own `.venv` (Windows, Python 3.12) resolved cleanly in ~500ms, 10 packages,
+all prebuilt wheels, zero build steps. Installed both locally and inside the rebuilt
+`cem-archspace` Docker image; pulls in `jenn`/`pydoe`/`jsonschema`/`orjson`/`attrs`/`rpds-py`/
+`referencing`/`jsonpointer` as real transitive deps.
+
+**Real local pre-Rust verification**: before touching any Rust code, a throwaway script directly
+exercised `CemArchspaceServicer` with a synthetic 2-DV/2-objective definition, confirming NSGA-II
+(`[1.0189188401275056, 15.127614680006328]`) and hierarchical-BO
+(`[1.000000000000001, 10.000000000000004]`) return real, genuinely different, non-degenerate
+results — proof hierarchical-BO isn't silently falling back to NSGA-II, before any of it was wired
+through the HTTP layer.
+
+### 25.3 Real HTTP surface: `POST .../cem/archspace/:handleId/optimize`
+
+The first real, human/frontend-reachable caller of `RunOptimization`. `server.py::RunOptimization`
+branches on a new `OptimizeRequest.algorithm` field (empty/absent defaults to `"nsga2"`, so no
+existing test-only caller needed updating for a newly-required field): the `"nsga2"` path is
+unchanged (`get_nsga2` + `("n_gen", N)` termination); the new `"hierarchical-bo"` path calls
+`sb_arch_opt.algo.arch_sbo.api.get_arch_sbo_gp(problem, init_size=max(population_size, 4))` +
+`get_sbo_termination(n_max_infill=max(n_generations, 1))` — confirmed via reading `api.py`/`algo.py`
+directly that `InfillAlgorithm` (returned by `get_arch_sbo_gp`) subclasses the same
+`pymoo.core.algorithm.Algorithm` that `ArchOptNSGA2` does, so the identical
+`pymoo.optimize.minimize(problem, algo, termination=..., seed=...)` call pattern applies to either
+algorithm — no separate top-level wiring needed. Since multi-objective NSGA-II returns a whole
+Pareto front, not one best point, `OptimizeResult` reports only the **first row** of `result.F`/
+`result.X` as `best_objective_values`/`best_design_vector` — documented honestly as "one
+representative point," not a full front; browsing the whole front is a real, separate follow-up,
+not attempted here.
+
+`apps/api/src/archspace.rs::optimize` (routed at
+`POST /api/v0/projects/:projectId/cem/archspace/:handleId/optimize`) is the fourth real caller of
+`ensure_live_handle` (Batch A's handle-recovery mechanism). Request:
+`{algorithm?: "nsga2" | "hierarchical-bo", populationSize?, nGenerations?, seed?}`. Response:
+`{algorithm, bestObjectiveValues: number[], bestDesignVector: number[], refreshedHandleId?}`.
+`ArchspacePanel.tsx` gained an algorithm `<select>` (NSGA-II / Hierarchical BO) and a "Run
+Optimization" button inside the defined-design-space section, plus a results display, and a new
+Next.js proxy route under the established `[id]` convention.
+
+### 25.4 Verification
+
+`cargo test -p cem-core`: 13/13 (12 prior + 1 new fallback test). New integration test,
+`optimize_runs_real_multi_objective_search_for_both_algorithms`, seeds a **fresh** project (so it
+includes the `OprCoreParam` touch-up), confirms `n_design_variables >= 3`, then runs both
+algorithms and asserts real, finite, correctly-sized `bestObjectiveValues` for each — passed on a
+real run (68.14s, mostly hierarchical-BO's real GP surrogate training; ran to completion in the
+background past the tool's 60s foreground limit, confirmed via the real "ok" result, not assumed).
+`cargo build/clippy/fmt --workspace` (default features — `--all-features` pulls in the
+Windows-host-unfriendly, deliberately default-off `ocr` feature and isn't the right check here),
+`pnpm biome check .`, `pnpm --filter @axioma/web build`: all clean.
+
+**A real, self-inflicted operational lesson surfaced during this pass's own verification, not a
+code regression**: running the full `apps/api --ignored` suite in parallel (`--test-threads`
+default) at the same moment the host `cargo run -p api --bin api` dev server was starting up caused
+44 spurious test failures (`"multiple primary keys for table element_bodies are not allowed"`,
+`"no unique or exclusion constraint matching the ON CONFLICT specification"`). Root cause, confirmed
+by reading `store/postgres.rs`: `PostgresStore::connect` runs an unconditional `DROP CONSTRAINT` /
+`ADD CONSTRAINT element_bodies_pkey` sequence on every connect, not safe under concurrent execution
+— two connects racing can both pass the `DROP ... IF EXISTS`, then collide on `ADD CONSTRAINT`.
+This is a real, pre-existing latent bug in that migration logic (not introduced by this pass), only
+actually triggered here because a test suite and a dev server both connected at once — a scenario
+this session hadn't previously created. Not fixed in this pass (flagged, not attempted — a proper
+fix needs either an advisory lock around connect's migration block or a real `sqlx::migrate!`-style
+tracked-migrations table, neither of which exists today); confirmed transient by re-running with the
+schema back in its correct state (verified via `\d element_bodies`) and `--test-threads=1` with no
+concurrent dev-server startup: 74/80 passed. The remaining 6 (`alf_state_machine_*`,
+`fuml_execute_*`, `trade_study_compare_reports_thrust_delta_and_confirms_simulation`) failed with
+`"java.lang.IllegalStateException: Stream is already completed, no further calls are allowed"` from
+the `fuml-runtime` JVM sidecar — also unrelated to this pass's own changes (none of which touch
+`fuml-runtime`/`alf-lite`), left over from the same chaotic concurrent run; `docker compose restart
+fuml-runtime` followed by a targeted re-run of exactly those 6 tests passed cleanly (6/6, 4.51s).
+Combined: a real, clean **80/80** across the whole `apps/api --ignored` suite, zero regressions from
+Batch B itself.
+
+**Live browser verification (Playwright, real running dev stack)** — algorithm `<select>` (NSGA-II
+/ Hierarchical BO) and "Run Optimization" button present and usable. Against the long-running,
+already-persisted `Turbofan Reference` project (seeded before this pass's `OprCoreParam` touch-up
+landed, so still showing the old 2-DV degenerate shape — a live-data staleness artifact of testing
+against a persisted project rather than a fresh one, not a code defect): NSGA-II returned
+`objectives: [1.029, 1.029]`, `vector: [0.00, 1.03]` in ~0.8s — genuinely near-identical, live
+evidence of exactly the `ChoiceConstraint`-`LINKED` lockstep-degeneracy problem §25.1 describes,
+confirming the touch-up's motivation was real, not hypothetical. Switching to Hierarchical BO and
+re-running returned `objectives: [1.000, 1.000]`, `vector: [1.00, 1.00]` in ~17s (faster than the
+~68s integration-test run because the panel's `handleOptimize` sends a smaller
+`populationSize: 10, nGenerations: 5`) — confirmed via `docker compose logs cem-archspace` to be a
+genuine surrogate run, not a silent NSGA-II fallback (real `sb_arch_opt.sbo` log lines: `"Surrogate
+infill gen 10 @ 1000 points evaluated (11 real unique, 11 eval)"`). Both algorithms' results
+differ from each other, corroborating the sidecar-log evidence. Zero browser console/network errors
+throughout. This closes Tier 1 Batch B in full; the only remaining Tier 1 item is 10 (a real, cited
+0D thermodynamic compressor model), its own future, larger effort not started in this pass.

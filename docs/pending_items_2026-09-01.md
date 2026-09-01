@@ -53,11 +53,15 @@ High value for CEM specifically; Product 1 is unaffected either way.
    accept this doc's own prior recommendation.** The design-space *definition* (not the sidecar's
    own live graph object) now persists in Postgres, with transparent recovery — a stale handle
    after a sidecar restart is re-derived on demand, confirmed by a real integration test.
-7. **Only a single-objective/simple viability search is wired.** SBArchOpt's real multi-objective,
-   hierarchical-BO (`ArchSBO`) capability sits unused; Mode B's actual optimization power is well
-   below what the sidecar library can do. Impl v5 §10.3. **Still open — Tier 1 Batch B/C, not yet
-   started** (per explicit user choice, this batch also attempts genuine hierarchical-BO, not just
-   NSGA-II multi-objective, so it's split out as its own larger pass).
+7. ~~**Only a single-objective/simple viability search is wired.**~~ **Closed 2026-09-01 (impl v5
+   §25), per explicit user choice to also attempt genuine hierarchical-BO (`ArchSBO`), not just
+   NSGA-II multi-objective.** Real multi-objective schema (`objective` → `objectives`) through
+   proto/`cem-core`/`dsg_builder.py`, a new `smt` dependency for the GP surrogate, and the first
+   real HTTP surface for `RunOptimization` (`POST .../optimize`, both algorithms selectable). A real
+   seed touch-up (`OprCoreParam` gained a bound) gives `CoreHpCompressor` a genuine non-degenerate
+   third design variable, sidestepping the `ChoiceConstraint`-`LINKED` lockstep the other two DVs
+   have — that generic degeneracy itself stays open, not solved structurally. Live-verified both
+   algorithms return real, distinct, non-degenerate results.
 8. ~~**FR-ARCH-06 exposes 1 of 4 real metrics.**~~ **Closed 2026-09-01 (impl v5 §24.2).** All four
    real metrics now computed and surfaced — also corrected a real doc misattribution along the way
    (Correction Ratio/Fraction/Max Rate Diversity are `sb_arch_opt` concepts, not `adsg_core`, as

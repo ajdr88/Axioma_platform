@@ -12,7 +12,7 @@ ever added for design variables and connectors that must always be present, neve
 that belong to a choice.
 """
 
-from typing import Dict
+from typing import Dict, List
 
 from adsg_core import BasicDSG, ConnectorNode, DesignVariableNode, NamedNode
 from adsg_core.graph.adsg_nodes import DSGNode, MetricNode, MetricType
@@ -30,21 +30,23 @@ class BuiltDesignSpace:
     """A constructed DSG plus the lookups needed to serve the rest of the RPCs: `node_by_name`
     resolves a decoded instance's present nodes back into the names the client sent in (adsg-core's
     own instance graph only carries `DSGNode` objects, not the caller's original string ids);
-    `dv_nodes` (insertion order) is what `RunOptimization`'s placeholder evaluator reads its
-    objective value from -- the first declared design variable, by construction of this spike's
-    own test problem, not a general "pick any objective source" rule."""
+    `dv_nodes` (insertion order) pairs 1:1, in order, with `objective_nodes` (Tier 1 pass, item 7 --
+    real multi-objective support: `cem_core::archspace::encode_design_space` now builds one real
+    objective per encoded design variable, so `objective_nodes[i]` reads its value from
+    `dv_nodes`'s i-th entry -- `server.py`'s `_PlaceholderEvaluator` is what actually zips these
+    two together; this class just carries both lists in the same real order)."""
 
     def __init__(
         self,
         dsg: BasicDSG,
         node_by_name: Dict[str, DSGNode],
         dv_nodes: Dict[str, DesignVariableNode],
-        objective_node: MetricNode,
+        objective_nodes: List[MetricNode],
     ):
         self.dsg = dsg
         self.node_by_name = node_by_name
         self.dv_nodes = dv_nodes
-        self.objective_node = objective_node
+        self.objective_nodes = objective_nodes
 
 
 def build_design_space(definition) -> BuiltDesignSpace:
@@ -90,15 +92,16 @@ def build_design_space(definition) -> BuiltDesignSpace:
         nodes = [node_by_name[name] for name in constraint.node_names]
         dsg = dsg.constrain_choices(kind, nodes)
 
-    objective_node = None
-    if definition.HasField("objective"):
+    objective_nodes: List[MetricNode] = []
+    for objective in definition.objectives:
         objective_node = MetricNode(
-            definition.objective.name,
-            direction=definition.objective.direction,
+            objective.name,
+            direction=objective.direction,
             type_=MetricType.OBJECTIVE,
         )
         dsg.add_edge(root, objective_node)
+        objective_nodes.append(objective_node)
 
     return BuiltDesignSpace(
-        dsg=dsg, node_by_name=node_by_name, dv_nodes=dv_nodes, objective_node=objective_node
+        dsg=dsg, node_by_name=node_by_name, dv_nodes=dv_nodes, objective_nodes=objective_nodes
     )

@@ -132,6 +132,28 @@ handle from its persisted definition, confirmed by a real integration test forci
 objective + hierarchical-BO) and 10 (a real 0D thermodynamic compressor model) remain as their own
 later, larger batches — not started yet.
 
+**Tier 1 Batch B (2026-09-01, impl v5 §25)** closes item 7: real multi-objective search plus
+genuine hierarchical-BO (`SBArchOpt`'s `ArchSBO`), per the user's own explicit choice of the fuller
+option over NSGA-II alone. A real schema change (`objective` → `objectives`, singular to repeated)
+runs through the proto/`cem-core`/`dsg_builder.py`, with `cem_core::archspace::encode_design_space`
+now building one objective per design variable rather than exactly one regardless of content. A new
+`smt` sidecar dependency (confirmed real/installable before adding it) powers hierarchical-BO's
+Gaussian-Process surrogate. `RunOptimization` — previously with zero real HTTP callers anywhere —
+gets its first one: `POST .../cem/archspace/:handleId/optimize`, algorithm-selectable, routed
+through Batch A's `ensure_live_handle`. A real seed touch-up (`OprCoreParam` gained a bound) gives
+`CoreHpCompressor` a genuine third, independent design variable, sidestepping (not solving) the
+`ChoiceConstraint`-`LINKED` lockstep the other two design variables have. Live browser verification
+confirmed both algorithms return real, finite, genuinely distinct results — the still-degenerate
+persisted `Turbofan Reference` project's own NSGA-II run (`[1.029, 1.029]`) was live evidence of
+exactly the lockstep problem the touch-up targets, and sidecar logs confirmed hierarchical-BO
+genuinely trains a GP surrogate rather than silently falling back to NSGA-II. Along the way, running
+the full `apps/api --ignored` suite concurrently with a dev-server startup surfaced a real,
+pre-existing (not introduced here) concurrency bug in `PostgresStore::connect`'s unconditional
+`DROP`/`ADD CONSTRAINT` migration sequence — flagged, not fixed, since it's outside this pass's
+scope; confirmed transient and unrelated to Batch B's own changes. `apps/api --ignored` now stands
+at 80/80. Item 10 (a real 0D thermodynamic compressor model) remains its own later, larger batch —
+not started yet.
+
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2
 model graph, shipped as **two independently-shippable products**:

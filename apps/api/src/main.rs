@@ -336,6 +336,10 @@ async fn main() -> anyhow::Result<()> {
             post(archspace::generate_instances),
         )
         .route(
+            "/api/v0/projects/:projectId/cem/archspace/:handleId/optimize",
+            post(archspace::optimize),
+        )
+        .route(
             "/api/v0/projects/:projectId/cem/archspace/:handleId/propose",
             post(archspace::propose),
         )
@@ -2745,6 +2749,16 @@ async fn seed_fr_arch_system_model(
             properties: serde_json::json!({
                 "description": "Combines toward overall OPR [1.1-60.0].",
                 "illustrative": true,
+                // Tier 1 pass (item 7) — a real, independent third design variable for
+                // CoreHpCompressor's Mode B design space (previously skipped by encode_design_
+                // space for having no bound). Illustrative, same honesty convention as every other
+                // numeric bound in this seed — a plausible HP-core sub-contribution to the overall
+                // OPR range named just above, not a sourced engine's real figure. Deliberately NOT
+                // ChoiceConstraint-LINKED to CoreHpStagesParam/TurbineHpStagesParam, so it gives
+                // this design space a genuine non-degenerate multi-objective trade axis (see
+                // `cem_core::archspace::encode_design_space`'s own "one objective per design
+                // variable" doc comment).
+                "bound": [10.0, 20.0],
             }),
         },
         ParamSeed {
@@ -5674,14 +5688,16 @@ mod tests {
             .contains(&"n_HP_stages".to_string()));
 
         // ADR-011's other half: SBArchOpt actually consumes the adsg-core-built problem and
-        // optimizes it — a real, non-NaN best objective comes back, not just "did not error".
-        let opt_result = archspace_client::run_optimization(&handle_id, 10, 3, 42)
+        // optimizes it — real, non-NaN best objective values come back, not just "did not error".
+        // `spike_compressor_design_space` declares one objective, so exactly one value back.
+        let opt_result = archspace_client::run_optimization(&handle_id, 10, 3, 42, "nsga2")
             .await
             .expect("running the optimization RPC");
+        assert_eq!(opt_result.best_objective_values.len(), 1);
         assert!(
-            opt_result.best_objective_value.is_finite(),
-            "expected a real optimized objective value, got {}",
-            opt_result.best_objective_value
+            opt_result.best_objective_values[0].is_finite(),
+            "expected a real optimized objective value, got {:?}",
+            opt_result.best_objective_values
         );
 
         // A bogus handle must be rejected loudly (NOT_FOUND), never silently.
@@ -5694,12 +5710,13 @@ mod tests {
     /// `cem_core::archspace::encode_design_space` + the real sidecar round-trip end to end
     /// through `apps/api`'s own HTTP surface. After this pass's seed touch-up (real `options`
     /// array for `BleedOfftakeStage`, real `sourceConnectorNames`/`targetConnectorNames` on both
-    /// `:ConnectionChoice`s, real `bound`s on the two stage-count Parameters), every primitive
-    /// this pass's touch-up targeted is genuinely encodable. Three *other*, pre-existing
-    /// FR-COMP-01/02 Parameters (`CoreEquivalentSpeedParam`/`CoreEquivalentWeightFlowParam`/
-    /// `OprCoreParam`) are real, honestly-expected skips — they're seeded with no `bound` at all
-    /// ("no numeric target sourced anywhere yet", their own seed comment), not a bug this test
-    /// should paper over.
+    /// `:ConnectionChoice`s, real `bound`s on the two stage-count Parameters, and — Tier 1 pass,
+    /// item 7 — a real `bound` on `OprCoreParam` too, giving this design space a genuine third,
+    /// independent design variable for multi-objective search), every primitive either pass's
+    /// touch-up targeted is genuinely encodable. Two *other*, pre-existing FR-COMP-01/02
+    /// Parameters (`CoreEquivalentSpeedParam`/`CoreEquivalentWeightFlowParam`) are real,
+    /// honestly-expected skips — they're seeded with no `bound` at all ("no numeric target sourced
+    /// anywhere yet", their own seed comment), not a bug this test should paper over.
     #[tokio::test]
     #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
     async fn define_design_space_from_real_seeded_core_hp_compressor_subsystem_round_trips_through_the_sidecar(
@@ -5715,13 +5732,10 @@ mod tests {
         .await
         .expect("defining a design space from real seeded content")
         .0;
-        let expected_skips: std::collections::HashSet<&str> = [
-            "CoreEquivalentSpeedParam",
-            "CoreEquivalentWeightFlowParam",
-            "OprCoreParam",
-        ]
-        .into_iter()
-        .collect();
+        let expected_skips: std::collections::HashSet<&str> =
+            ["CoreEquivalentSpeedParam", "CoreEquivalentWeightFlowParam"]
+                .into_iter()
+                .collect();
         for skipped in &response.skipped {
             assert!(
                 expected_skips.contains(skipped.element_id.as_str()),
@@ -5737,13 +5751,15 @@ mod tests {
                 && response.stats.n_valid <= response.stats.n_declared
         );
         // FR-ARCH-06's other three real metrics — real numbers confirmed by a live run against
-        // this exact fixture (2026-09-01): correction_ratio/discrete/continuous all 1.0 and
-        // correction_fraction/max_rate_diversity both 0.0 — CoreHpCompressor's design space is
-        // small and clean enough (2 design variables, imputation_ratio already 1.0) that no
-        // correction is needed and there's no meaningful rate imbalance to show, the same "small
-        // fixture, trivially uniform" honesty note the FR-ARCH-08 viability classifier's own
-        // verification already made. `Some(_)` (not `None`) is the real assertion here — this
-        // subsystem has a real objective, so the metrics must be genuinely computed, not omitted.
+        // this exact fixture (updated 2026-09-01 after the Tier 1 item 7 seed touch-up added
+        // OprCoreParam's own real bound, taking this from 2 to 3 real design variables,
+        // n_declared from 6 to 12): correction_ratio/discrete/continuous still all 1.0 and
+        // correction_fraction/max_rate_diversity still both 0.0 — every one of these design
+        // variables is a clean, unconstrained-by-value integer range, so there's still no real
+        // correction need or rate imbalance to show, the same "small fixture, trivially uniform"
+        // honesty note the FR-ARCH-08 viability classifier's own verification already made.
+        // `Some(_)` (not `None`) is the real assertion here — this subsystem has real objectives,
+        // so the metrics must be genuinely computed, not omitted.
         assert!(response.stats.correction_ratio.is_some_and(|v| v >= 1.0));
         assert!(response
             .stats
@@ -5782,6 +5798,66 @@ mod tests {
             "expected at least one grouped choice (e.g. BleedOfftakeStage), got {:?}",
             decoded.choices
         );
+    }
+
+    /// Tier 1 pass (item 7) — the new `/optimize` endpoint against real seeded `CoreHpCompressor`
+    /// content, for both algorithms. After the seed touch-up giving `OprCoreParam` a real, non-
+    /// `LINKED` bound, this design space genuinely has 3 design variables (the `LINKED`
+    /// `CoreHpStagesParam`/`TurbineHpStagesParam` pair plus the independent `OprCoreParam`), so a
+    /// real multi-objective run is exercised, not a degenerate single-axis one. Confirms
+    /// hierarchical-BO is genuinely wired, not silently falling back to NSGA-II, by asserting both
+    /// algorithms report their own real requested name back and produce a real (if not
+    /// necessarily identical) result — the actual disproof that it's not a fallback is the earlier
+    /// local sidecar verification (2026-09-01) showing genuinely different converged values for
+    /// the two algorithms against the same fixture.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn optimize_runs_real_multi_objective_search_for_both_algorithms() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "archspace-optimize").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let defined = archspace::define(
+            State(state.clone()),
+            Path((project.id.clone(), "CoreHpCompressor".to_string())),
+        )
+        .await
+        .expect("defining a design space from real seeded content")
+        .0;
+        assert!(
+            defined.stats.n_design_variables >= 3,
+            "expected the seed touch-up's real third design variable, got {:?}",
+            defined.stats
+        );
+
+        for algorithm in ["nsga2", "hierarchical-bo"] {
+            let response = archspace::optimize(
+                State(state.clone()),
+                Path((project.id.clone(), defined.handle_id.clone())),
+                Json(archspace::OptimizeRequestDto {
+                    algorithm: Some(algorithm.to_string()),
+                    population_size: Some(8),
+                    n_generations: Some(3),
+                    seed: Some(42),
+                }),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("running {algorithm} should succeed"))
+            .0;
+            assert_eq!(response.algorithm, algorithm);
+            assert_eq!(
+                response.best_objective_values.len(),
+                defined.stats.n_design_variables as usize,
+                "expected one real objective value per encoded design variable for {algorithm}, got {:?}",
+                response.best_objective_values
+            );
+            assert!(
+                response.best_objective_values.iter().all(|v| v.is_finite()),
+                "expected every objective value real/finite for {algorithm}, got {:?}",
+                response.best_objective_values
+            );
+            assert!(!response.best_design_vector.is_empty());
+        }
     }
 
     /// FR-ARCH-02's real build-out — confirms `derived_existence` evaluates through the real,
@@ -6023,10 +6099,10 @@ mod tests {
             connection_choices: vec![],
             incompatibility_constraints: vec![],
             choice_constraints: vec![],
-            objective: Some(archspace_client::proto::Objective {
+            objectives: vec![archspace_client::proto::Objective {
                 name: "EmptyObjective".to_string(),
                 direction: -1,
-            }),
+            }],
         };
         let handle_id = archspace_client::define_design_space(definition)
             .await
@@ -6065,10 +6141,10 @@ mod tests {
                 choice_id: "OnlyChoice".to_string(),
                 option_names: vec!["A".to_string(), "B".to_string()],
             }],
-            objective: Some(cem_core::archspace::ObjectiveInput {
+            objectives: vec![cem_core::archspace::ObjectiveInput {
                 name: "RecoveryObjective".to_string(),
                 direction: -1,
-            }),
+            }],
             ..Default::default()
         };
         state

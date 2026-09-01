@@ -492,6 +492,18 @@ missing HTTP-layer half**: `POST .../cem/archspace/:subsystemId/define` +
 `POST .../cem/archspace/:handleId/decode` encode/decode *real seeded graph content* (not just the
 spike's own synthetic fixture) via a new `cem_core::archspace` module — see
 `define_design_space_from_real_seeded_core_hp_compressor_subsystem_round_trips_through_the_sidecar`.
+**Updated 2026-09-01, impl v5 §25 (Tier 1 Batch B):** reqs v5 §5.17's own "cem-core gaps this
+closes" list names **optimizer algorithm selection (evolutionary vs. hierarchical Bayesian
+Optimization)** as "not yet specified at all," alongside this row's encode/decode scope — no
+dedicated FR-ARCH-0X id covers it, so it's tracked here rather than left undocumented. Now **built
+and covered**: `POST .../cem/archspace/:handleId/optimize` runs a real, selectable NSGA-II or
+hierarchical-BO (`SBArchOpt`'s `ArchSBO`) search over a real multi-objective encoding (one
+objective per design variable) — confirmed genuinely distinct, non-degenerate results for both
+algorithms via `optimize_runs_real_multi_objective_search_for_both_algorithms` and live browser
+verification (sidecar logs confirmed a real GP surrogate trains for hierarchical-BO, not a silent
+NSGA-II fallback). Hierarchical sampling/DoE generation (the other named gap in the same reqs
+bullet) stays unbuilt — `SBArchOpt`'s own default DoE inside `get_arch_sbo_gp` is used as-is, no
+separate DoE-generation endpoint was added.
 
 ### T-ARCH-06 — Design-space health metrics
 **Verifies:** FR-ARCH-06
