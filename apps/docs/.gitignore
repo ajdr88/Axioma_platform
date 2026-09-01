@@ -1,0 +1,6 @@
+# The venv and the built static site are regenerated locally (see README.md) — neither belongs in
+# git, same reasoning as cem-archspace's own .gitignore for its venv.
+.venv/
+__pycache__/
+*.pyc
+site/

@@ -1,0 +1,56 @@
+site_name: Axioma MBSE Platform
+site_description: Requirements, implementation, and test-specification docs for the Axioma monorepo
+repo_url: https://github.com/ajdr88/Axioma_platform
+repo_name: ajdr88/Axioma_platform
+
+# Renders the repo's real source-of-truth Markdown directly — no copy, no drift. See README.md.
+docs_dir: ../../docs
+site_dir: site
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.top
+    - navigation.instant
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+
+markdown_extensions:
+  - tables
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+
+nav:
+  - Home: index.md
+  - Requirements:
+      - v5 (current): Axioma_requirements_v5.md
+      - v4 (superseded): Axioma_requirements_v4.md
+      - v3 (superseded): Axioma_requirements_v3.md
+  - Implementation:
+      - v5 (current): Axioma_implementation_v5.md
+      - v4 (superseded): Axioma_implementation_v4.md
+      - v3 (superseded): Axioma_implementation_v3.md
+  - Test Specification (v4): Axioma_test_specification_v4.md
+  - Design Philosophy: Axioma_design_philosophy.md
+  - Stage Tracking Amendment: Axioma_stage_tracking_amendment.md
+  - Implementation Kickoff Plan: IMPLEMENTATION_KICKOFF.md
+  - Pending Items (2026-09-01): pending_items_2026-09-01.md

@@ -1,0 +1,4 @@
+# Pinned to the real versions confirmed installed/working via `uv pip install`, 2026-09-01.
+# mkdocs (BSD-2-Clause) + mkdocs-material (MIT) — see README.md for setup/build instructions.
+mkdocs==1.6.1
+mkdocs-material==9.7.7

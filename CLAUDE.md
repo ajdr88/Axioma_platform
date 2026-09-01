@@ -128,7 +128,7 @@ axioma/
 ├── apps/
 │   ├── web/                 # React 19 + Next.js + React Flow
 │   ├── api/                 # Rust (Axum) REST surface
-│   └── docs/
+│   └── docs/                # MkDocs + Material site, renders docs/ directly (no copy)
 ├── packages/
 │   ├── sysml-core/          # SysML v2 parse, KerML rules, semantic-validation layer
 │   ├── cem-core/            # Mode B: deterministic optimizer (no LLM)

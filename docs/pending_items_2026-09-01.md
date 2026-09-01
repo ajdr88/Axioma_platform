@@ -1,0 +1,124 @@
+# Pending Items — 2026-09-01
+
+A full sweep of every genuinely still-open/pending/not-built item across the Axioma monorepo's
+docs, as of `HEAD abb198e` (main), prioritized by impact on full platform functionality. Produced
+right after FR-ARCH-01…08 closed out (see `Axioma_implementation_v5.md` §22, `CLAUDE.md`'s status
+header). Two corrections made during this audit that a naive doc-read would have missed:
+
+- **P2.2's core mechanics (proposal/branch workflow + L0–L4 autonomy) are already fully built and
+  tested**, despite no "phase closed" narrative existing for it anywhere — confirmed directly via
+  `apps/api/src/autonomy.rs` and the `mode_b_propose_at_l0/l1/l3/l4_*` integration tests. Not
+  listed below as open.
+- **ADR-005's status line in `Axioma_implementation_v5.md` §2.5 still says "Recommended — spike to
+  ratify subset"**, even though the spike ran, passed, and the full `alf-lite`/State-Machine build
+  (T-P1.4-01…05) is done and tested. That's doc staleness, not a real functional gap — listed under
+  Tier 3, not Tier 0.
+
+## Tier 0 — Correctness / safety-integrity gaps
+
+Fix first — these undermine guarantees the rest of the platform already relies on.
+
+1. **T-P1.4-06 not wired into CI.** The 1M-element `Turbofan-Scale` fixture and seeding binary
+   (`apps/api/src/bin/seed_turbofan_scale.rs`) exist and pass manually (NFR-PERF-04 traceability
+   confirmed "<2s p95" by hand), but `.github/workflows/ci.yml` doesn't run it — its own comment
+   still claims the 1M-element fixture "doesn't exist yet." Every NFR-PERF budget in the platform
+   is currently unverified by CI; a regression anywhere could ship silently. **[Chosen starting
+   point.]**
+2. **FR-ARCH-02: no cyclic `ArchDerives` derivation graph.** Mode B's design space can't represent
+   genuinely interdependent subsystems (e.g. Compressor/Combustor/Turbine existence depending on
+   each other), even though the schema explicitly permits cycles. Undermines trust in every
+   downstream FR-ARCH capability (generate-instances/propose/viability). Impl v5 §20.3 scope note;
+   test spec T-ARCH-02 (cyclic half unbuilt).
+3. **FR-ARCH-03: no `ConnectionChoice` cardinality enforcement.** The `cardinality` field
+   (list/range/lower-bound-only) is still plain descriptive text with zero enforcement anywhere in
+   `sysml-core`/`apps/api` — the "resolved after selection choices" ordering half is real, the
+   enforcement half is not. Impl v5 §20.3; test spec T-ARCH-03.
+4. **FR-CORE-13: orphan-Action rejection missing.** Blocked on an undecided Action/Activity
+   `NodeKind` — no merged doc makes that decision yet — but until resolved this is a real hole in
+   "every write is validated." `CLAUDE.md` data-model section; impl v5 §16.5/§18.1/§18.3; test spec
+   T-CORE-12-01 orphan half, T-INFO-02 (same blocker).
+
+## Tier 1 — Product 2 / Mode B maturity
+
+High value for CEM specifically; Product 1 is unaffected either way.
+
+5. **`SolverResultState` not retrofitted into `trade_study.rs`/`fuml_client.rs`.** Those still use
+   ad hoc result shapes — the platform-wide "solver results are typed, never blindly trusted" rule
+   (CLAUDE.md non-negotiable #3) isn't actually uniform outside `archspace`. Flagged in impl v5 §22
+   as a real, deliberately-not-attempted follow-up.
+6. **`cem-archspace` design-space state is in-memory, process-lifetime only.** A sidecar restart
+   silently loses in-progress trade studies; nothing persists it or syncs it to Neo4j. Impl v5
+   §10.3 ("still open... it's still open after it").
+7. **Only a single-objective/simple viability search is wired.** SBArchOpt's real multi-objective,
+   hierarchical-BO (`ArchSBO`) capability sits unused; Mode B's actual optimization power is well
+   below what the sidecar library can do. Impl v5 §10.3.
+8. **FR-ARCH-06 exposes 1 of 4 real metrics.** Only Imputation Ratio is computed/surfaced via
+   `DesignSpaceStats`; Correction Ratio, Correction Fraction, and Max Rate Diversity were never
+   mapped through, even after the later §20 FR-ARCH-06 build-out (which only wires IR through).
+   Impl v5 §10.3.
+9. **`ChoiceConstraint`'s "uses parameter" relationship is a JSON array, not a graph edge.**
+   Flagged in impl v5 §11.1 as a real schema gap "for whenever Parametrics evaluation actually gets
+   built" — Parametrics was later built (§13) via linear interpolation over tabulated points, never
+   through this edge, so the gap was never actually closed.
+10. **FR-COMP-02 performance-map data is illustrative, not real.** The seeded
+    `sampledPointsAtDesignSpeed` carries `sourceNote: "illustrative shape only -- real constitutive
+    equations not yet sourced"` — reqs v5 §5.15 itself says the real off-design equations aren't
+    sourced yet. Impl v5 §11.1. A domain-correctness gap for any real trade study run against it.
+
+## Tier 2 — Product 1 feature completeness
+
+Self-contained gaps; none block other features.
+
+11. FR-INFO-02: no dedicated Data Type/Enumeration authoring endpoint — a Data Type is just a
+    plain `:InformationElement` today. Impl v5 §13.4/§17.4/§18.1; test spec T-INFO-01's Data Type
+    half.
+12. FR-INTX-02 timing constraints are captured on Interaction messages but nothing
+    analyzes/evaluates them. Impl v5 §16.5.
+13. No UI flow to create a new Interaction with participants — the toolbar's "+ Add Node" is
+    hardcoded to a different creation path. Impl v5 §16.1/§16.5/§17.
+14. Swimlane View layout is a manual React Flow grid, not ELK-driven (cosmetic — click-to-allocate
+    and drag-to-allocate both work fine today). Impl v5 §16.5.
+15. Parametrics evaluator only does linear interpolation over tabulated points — no general
+    algebraic expression/constraint evaluator, per the reqs' own non-concrete spec. Impl v5
+    §13.2/§18.1/§18.3.
+16. `human-authored` proposal origin has no real producer — the other two origins (`cem-generated`,
+    `document-import`) both work; nothing creates a `human-authored` proposal. Impl v5 §13.1.
+17. No LIST endpoint for saved-but-not-frozen Dynamic Collections — they live in `Home`-level React
+    state only, lost on page reload. Impl v5 §17.2 ("a real, accepted gap, not silently hidden").
+18. Attachment upload capped at axum's default 2MB (`DefaultBodyLimit` never raised). Impl v5
+    §17.2/§17.4.
+19. No column-selection on table export — CSV/XLSX export uses fixed baseline columns only. Impl
+    v5 §17.4; test spec T-EXPORT-02's literal "4 of 8 columns" scenario isn't matched.
+20. Only one report template (`"risk-register"`) exists; no PDF output, no MIL-STD-882/ISO 26262
+    template variants. Impl v5 §14.3.
+
+## Tier 3 — Documentation hygiene only
+
+No functional gap; cheap correctness fixes so the docs stay trustworthy.
+
+21. ADR-005's status line still says "Recommended — spike to ratify" despite the spike having run,
+    passed, and the full build being done. Impl v5 §2.5, §9.3.
+22. `Axioma_requirements_v5.md`'s FR-COMP/FR-ARCH status column universally still says "not yet
+    specified — Phase 6," even for items closed long since (FR-COMP-01…06, FR-ARCH-01…08).
+23. `.github/workflows/ci.yml`'s own comment claims the 1M-element fixture "doesn't exist yet" — it
+    does now (`apps/api/src/bin/seed_turbofan_scale.rs`). Same underlying fact as Tier 0 item 1;
+    fixing item 1 should also fix this comment.
+
+## Tier 4 — Not started by design
+
+Explicitly allowed to lag per the project's own roadmap sequencing — not really "gaps" so much as
+unstarted future phases.
+
+24. `cem-geometry` (Mode C) — research-risk, explicitly deferred to P2.3+. `CLAUDE.md` "What this
+    is"; `packages/cem-geometry/README.md`.
+25. `cem-connectors` (external FEA/CFD solver adapters) — not started, planned for P2.3. `CLAUDE.md`
+    roadmap; `packages/cem-connectors/README.md`.
+26. `scheduler` (governed Campaign job queue — concurrency/quota/cost/retry) — not started. Backs
+    the non-negotiable "Campaigns must declare a budget" rule (CLAUDE.md rule #5), but no Campaign
+    feature exists yet either, so nothing currently violates it. Worth building before Campaigns
+    themselves land, not before. `CLAUDE.md` roadmap; `packages/scheduler/README.md`.
+
+---
+
+*Starting point chosen 2026-09-01: Tier 0, in order — item 1 (wire T-P1.4-06 into CI) first as the
+cheapest, highest-leverage fix, then FR-ARCH-02/03 and FR-CORE-13.*
