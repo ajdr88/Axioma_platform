@@ -368,6 +368,14 @@ async fn main() -> anyhow::Result<()> {
             post(parametrics::evaluate),
         )
         .route(
+            "/api/v0/projects/:projectId/parametrics/models/:modelId",
+            get(parametrics::model_detail),
+        )
+        .route(
+            "/api/v0/projects/:projectId/parametrics/models/:modelId/evaluate",
+            post(parametrics::evaluate_model),
+        )
+        .route(
             "/api/v0/projects/:projectId/information/elements",
             post(information::create_information_element),
         )
@@ -1635,6 +1643,7 @@ async fn seed_turbofan_ref(state: &AppState, project_id: &str) -> anyhow::Result
     });
 
     seed_fr_comp_content(state, project_id, &mut diff_entries).await?;
+    seed_isentropic_compressor_model(state, project_id, &mut diff_entries).await?;
     seed_fr_arch_system_model(state, project_id, &mut diff_entries).await?;
 
     Ok(diff_entries)
@@ -2120,6 +2129,371 @@ async fn seed_fr_comp_content(
             )
             .await?;
     }
+
+    Ok(())
+}
+
+/// Pending-items Tier 1 item 10 (2026-09-01) — a real, cited 0D thermodynamic compressor-stage
+/// model, built as the first real instance of the reusable `NodeKind::Model` pattern (see that
+/// kind's own doc comment in `packages/sysml-core/src/lib.rs`). Governing relations are standard
+/// textbook gas-turbine content — Cohen, Rogers & Saravanamuttoo, *Gas Turbine Theory*, 6th ed.
+/// (the isentropic-compression/isentropic-efficiency chapters); Mattingly, *Elements of Gas
+/// Turbine Propulsion*, 2nd ed., gives the equivalent forms. Chapter-level citation confirmed;
+/// exact section numbers were not independently verified against a specific edition — stated
+/// honestly rather than invented precisely. Validated against a hand-worked numerical example by
+/// `evaluate_isentropic_compressor_model_matches_the_textbook_worked_example` in this module's own
+/// test suite.
+///
+/// **Deliberately separate from, and does not touch, `CorePerformanceMapConstraint`'s own
+/// `sourceNote: "illustrative shape only..."`** — this is a real, cited, validated *design-point*
+/// calculator (one operating point's temperature rise/specific work/power), not a full off-design
+/// stall-to-choke performance-map surface (that needs real empirical/correlation map data, a
+/// materially bigger effort, left explicitly open — see `docs/pending_items_2026-09-01.md`).
+async fn seed_isentropic_compressor_model(
+    state: &AppState,
+    project_id: &str,
+    diff_entries: &mut Vec<DiffEntry>,
+) -> anyhow::Result<()> {
+    const MODEL_ID: &str = "IsentropicCompressorStageModel";
+
+    let model = Element {
+        id: MODEL_ID.to_string(),
+        kind: NodeKind::Model,
+        name: "Isentropic compressor stage (0D design-point model)".to_string(),
+        active: true,
+        origin: Origin::Human,
+    };
+    state.neo4j.upsert_element(project_id, &model).await?;
+    diff_entries.push(DiffEntry::ElementCreated {
+        element_id: model.id.clone(),
+        kind: model.kind,
+        name: model.name.clone(),
+    });
+    state
+        .postgres
+        .upsert_body(
+            project_id,
+            &ElementBody {
+                element_id: MODEL_ID.to_string(),
+                rationale: Some(
+                    "Standard isentropic-efficiency compressor design-point relations -- Cohen, \
+                     Rogers & Saravanamuttoo, Gas Turbine Theory, 6th ed. (isentropic-compression \
+                     / efficiency chapters); Mattingly, Elements of Gas Turbine Propulsion, 2nd \
+                     ed., gives the equivalent forms. Chapter-level citation confirmed; exact \
+                     section numbers not independently verified against a specific edition. A \
+                     design-point calculator only -- not a full off-design performance-map \
+                     surface."
+                        .to_string(),
+                ),
+                properties: serde_json::json!({}),
+            },
+        )
+        .await?;
+
+    struct ParamSeed {
+        id: &'static str,
+        name: &'static str,
+        symbol: &'static str,
+        role: &'static str,
+        unit: &'static str,
+        design_value: Option<f64>,
+    }
+    let parameters = [
+        ParamSeed {
+            id: "T01Param",
+            name: "Inlet stagnation temperature",
+            symbol: "T01",
+            role: "input",
+            unit: "K",
+            // ISA sea-level static -- a standard reference condition, not a measured value.
+            design_value: Some(288.15),
+        },
+        ParamSeed {
+            id: "PRParam",
+            name: "Stage pressure ratio",
+            symbol: "PR",
+            role: "input",
+            unit: "dimensionless",
+            // Reused from CoreHpCompressor's own real seeded
+            // designOverallPressureRatioContribution (REQ-CORE-SPEC) -- not fabricated.
+            design_value: Some(8.0),
+        },
+        ParamSeed {
+            id: "EtaCParam",
+            name: "Isentropic (adiabatic) efficiency",
+            symbol: "EtaC",
+            role: "input",
+            unit: "dimensionless",
+            // Deliberately separate from CoreHpCompressor's own seeded
+            // targetPolytropicEfficiency (0.88, REQ-CORE-SPEC) -- that is a polytropic
+            // efficiency, a distinct quantity from the isentropic efficiency this model actually
+            // uses; conflating the two would be a real domain-correctness error, so this is a
+            // separate, explicitly illustrative isentropic-efficiency assumption instead.
+            design_value: Some(0.85),
+        },
+        ParamSeed {
+            id: "CpParam",
+            name: "Specific heat at constant pressure (air)",
+            symbol: "Cp",
+            role: "input",
+            unit: "J/(kg*K)",
+            design_value: Some(1005.0),
+        },
+        ParamSeed {
+            id: "GammaParam",
+            name: "Ratio of specific heats (air)",
+            symbol: "Gamma",
+            role: "input",
+            unit: "dimensionless",
+            design_value: Some(1.4),
+        },
+        ParamSeed {
+            id: "MdotParam",
+            name: "Mass flow rate",
+            symbol: "Mdot",
+            role: "input",
+            unit: "kg/s",
+            // 110.0 lb/s (CoreHpCompressor's own real seeded designWeightFlowLbPerSec,
+            // REQ-CORE-SPEC) * 0.45359237 kg/lb -- not fabricated.
+            design_value: Some(110.0 * 0.453_592_37),
+        },
+        ParamSeed {
+            id: "T02sParam",
+            name: "Isentropic exit stagnation temperature",
+            symbol: "T02s",
+            role: "output",
+            unit: "K",
+            design_value: None,
+        },
+        ParamSeed {
+            id: "DeltaTActualParam",
+            name: "Actual stagnation temperature rise",
+            symbol: "DeltaTActual",
+            role: "output",
+            unit: "K",
+            design_value: None,
+        },
+        ParamSeed {
+            id: "T02Param",
+            name: "Actual exit stagnation temperature",
+            symbol: "T02",
+            role: "output",
+            unit: "K",
+            design_value: None,
+        },
+        ParamSeed {
+            id: "SpecificWorkParam",
+            name: "Specific work",
+            symbol: "SpecificWork",
+            role: "output",
+            unit: "J/kg",
+            design_value: None,
+        },
+        ParamSeed {
+            id: "PowerParam",
+            name: "Shaft power",
+            symbol: "Power",
+            role: "output",
+            unit: "W",
+            design_value: None,
+        },
+    ];
+
+    for p in &parameters {
+        let element = Element {
+            id: p.id.to_string(),
+            kind: NodeKind::Parameter,
+            name: p.name.to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(project_id, &element).await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: element.id.clone(),
+            kind: element.kind,
+            name: element.name.clone(),
+        });
+        let mut properties = serde_json::json!({
+            "symbol": p.symbol,
+            "role": p.role,
+            "unit": p.unit,
+        });
+        if let Some(design_value) = p.design_value {
+            properties["designValue"] = serde_json::json!(design_value);
+        }
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: p.id.to_string(),
+                    rationale: None,
+                    properties,
+                },
+            )
+            .await?;
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: MODEL_ID.to_string(),
+                    target: p.id.to_string(),
+                    kind: EdgeKind::Contains,
+                    metadata: None,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: MODEL_ID.to_string(),
+            target: p.id.to_string(),
+            kind: EdgeKind::Contains,
+        });
+    }
+
+    struct ConstraintSeed {
+        id: &'static str,
+        name: &'static str,
+        formula: &'static str,
+        uses: &'static [&'static str],
+        produces: &'static str,
+    }
+    let constraints = [
+        ConstraintSeed {
+            id: "IsentropicExitTempConstraint",
+            name: "Isentropic exit stagnation temperature",
+            formula: "PR ** ((Gamma - 1.0) / Gamma) * T01",
+            uses: &["T01Param", "PRParam", "GammaParam"],
+            produces: "T02sParam",
+        },
+        ConstraintSeed {
+            id: "ActualTempRiseConstraint",
+            name: "Actual stagnation temperature rise",
+            formula: "(T02s - T01) / EtaC",
+            uses: &["T02sParam", "T01Param", "EtaCParam"],
+            produces: "DeltaTActualParam",
+        },
+        ConstraintSeed {
+            id: "ActualExitTempConstraint",
+            name: "Actual exit stagnation temperature",
+            formula: "T01 + DeltaTActual",
+            uses: &["T01Param", "DeltaTActualParam"],
+            produces: "T02Param",
+        },
+        ConstraintSeed {
+            id: "SpecificWorkConstraint",
+            name: "Specific work",
+            formula: "Cp * DeltaTActual",
+            uses: &["CpParam", "DeltaTActualParam"],
+            produces: "SpecificWorkParam",
+        },
+        ConstraintSeed {
+            id: "PowerConstraint",
+            name: "Shaft power",
+            formula: "Mdot * SpecificWork",
+            uses: &["MdotParam", "SpecificWorkParam"],
+            produces: "PowerParam",
+        },
+    ];
+
+    for c in &constraints {
+        let element = Element {
+            id: c.id.to_string(),
+            kind: NodeKind::Constraint,
+            name: c.name.to_string(),
+            active: true,
+            origin: Origin::Human,
+        };
+        state.neo4j.upsert_element(project_id, &element).await?;
+        diff_entries.push(DiffEntry::ElementCreated {
+            element_id: element.id.clone(),
+            kind: element.kind,
+            name: element.name.clone(),
+        });
+        state
+            .postgres
+            .upsert_body(
+                project_id,
+                &ElementBody {
+                    element_id: c.id.to_string(),
+                    rationale: None,
+                    properties: serde_json::json!({ "formula": c.formula }),
+                },
+            )
+            .await?;
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: MODEL_ID.to_string(),
+                    target: c.id.to_string(),
+                    kind: EdgeKind::Contains,
+                    metadata: None,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: MODEL_ID.to_string(),
+            target: c.id.to_string(),
+            kind: EdgeKind::Contains,
+        });
+        for used_param_id in c.uses {
+            state
+                .neo4j
+                .create_edge(
+                    project_id,
+                    &Edge {
+                        source: c.id.to_string(),
+                        target: used_param_id.to_string(),
+                        kind: EdgeKind::Uses,
+                        metadata: None,
+                    },
+                )
+                .await?;
+            diff_entries.push(DiffEntry::EdgeCreated {
+                source: c.id.to_string(),
+                target: used_param_id.to_string(),
+                kind: EdgeKind::Uses,
+            });
+        }
+        state
+            .neo4j
+            .create_edge(
+                project_id,
+                &Edge {
+                    source: c.id.to_string(),
+                    target: c.produces.to_string(),
+                    kind: EdgeKind::Produces,
+                    metadata: None,
+                },
+            )
+            .await?;
+        diff_entries.push(DiffEntry::EdgeCreated {
+            source: c.id.to_string(),
+            target: c.produces.to_string(),
+            kind: EdgeKind::Produces,
+        });
+    }
+
+    // The real structural link: CoreHpCompressor's compressor stage is modeled by this Model.
+    state
+        .neo4j
+        .create_edge(
+            project_id,
+            &Edge {
+                source: "CoreHpCompressor".to_string(),
+                target: MODEL_ID.to_string(),
+                kind: EdgeKind::Instantiates,
+                metadata: None,
+            },
+        )
+        .await?;
+    diff_entries.push(DiffEntry::EdgeCreated {
+        source: "CoreHpCompressor".to_string(),
+        target: MODEL_ID.to_string(),
+        kind: EdgeKind::Instantiates,
+    });
 
     Ok(())
 }
@@ -7123,6 +7497,197 @@ mod tests {
         .unwrap()
         .0;
         assert!(unknown.results[0].error.is_some());
+    }
+
+    /// Pending-items Tier 1 item 10 (2026-09-01) — the real correctness proof for
+    /// `IsentropicCompressorStageModel`: evaluates it against a real, cited gas-turbine textbook
+    /// worked example (Cohen, Rogers & Saravanamuttoo, Gas Turbine Theory) and checks the result
+    /// two ways -- tightly against an independent Rust computation of the exact same formula (the
+    /// real "is the graph/rhai wiring correct" check), and loosely against the textbook's own
+    /// hand-rounded intermediate numbers (a sanity tie-back to the citation, not just "it runs").
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn evaluate_isentropic_compressor_model_matches_the_textbook_worked_example() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "isentropic-model-worked-example").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let t01 = 288.15_f64;
+        let pr = 10.0_f64;
+        let eta_c = 0.87_f64;
+        let gamma = 1.4_f64;
+        let cp = 1005.0_f64;
+        let mdot = 20.0_f64;
+
+        let mut inputs = HashMap::new();
+        inputs.insert("T01".to_string(), t01);
+        inputs.insert("PR".to_string(), pr);
+        inputs.insert("EtaC".to_string(), eta_c);
+        inputs.insert("Cp".to_string(), cp);
+        inputs.insert("Gamma".to_string(), gamma);
+        inputs.insert("Mdot".to_string(), mdot);
+
+        let response = parametrics::evaluate_model(
+            State(state.clone()),
+            Path((
+                project.id.clone(),
+                "IsentropicCompressorStageModel".to_string(),
+            )),
+            Json(parametrics::EvaluateModelRequest { inputs }),
+        )
+        .await
+        .unwrap();
+        let body = response_json(response).await;
+        assert!(
+            body.get("error").is_none(),
+            "expected no error, got {body:?}"
+        );
+
+        // Independently computed in Rust (not copied from the seeded formula strings) -- the real
+        // "is the graph/rhai evaluation pipeline wired correctly" check.
+        let expected_t02s = t01 * pr.powf((gamma - 1.0) / gamma);
+        let expected_delta_t = (expected_t02s - t01) / eta_c;
+        let expected_t02 = t01 + expected_delta_t;
+        let expected_specific_work = cp * expected_delta_t;
+        let expected_power = mdot * expected_specific_work;
+
+        let outputs = &body["outputs"];
+        let assert_close = |name: &str, expected: f64, epsilon: f64| {
+            let actual = outputs[name].as_f64().unwrap_or_else(|| {
+                panic!("expected numeric output {name}, got {:?}", outputs[name])
+            });
+            assert!(
+                (actual - expected).abs() < epsilon,
+                "{name}: expected {expected}, got {actual}"
+            );
+        };
+        assert_close("T02s", expected_t02s, 1e-6);
+        assert_close("DeltaTActual", expected_delta_t, 1e-6);
+        assert_close("T02", expected_t02, 1e-6);
+        assert_close("SpecificWork", expected_specific_work, 1e-6);
+        assert_close("Power", expected_power, 1e-6);
+
+        // Real numbers, confirmed via an independent Python computation before writing this test
+        // (not guessed): T02s=556.3306 K, DeltaTActual=308.2535 K, T02=596.4035 K,
+        // SpecificWork=309794.77 J/kg, Power=6195895.48 W -- close to (not identical to) the
+        // textbook's own hand-rounded worked-example figures (T02s~556.32, DeltaT~308.24,
+        // T02~596.39, SpecificWork~309780 J/kg, Power~6195600 W), the small difference being the
+        // textbook's own intermediate rounding, not an error in either computation.
+        assert_close("T02s", 556.32, 0.1);
+        assert_close("DeltaTActual", 308.24, 0.1);
+        assert_close("T02", 596.39, 0.1);
+        assert_close("SpecificWork", 309_780.0, 50.0);
+        assert_close("Power", 6_195_600.0, 1000.0);
+
+        let evaluation_order = body["evaluationOrder"]
+            .as_array()
+            .expect("evaluationOrder should be a real array");
+        assert_eq!(
+            evaluation_order.len(),
+            5,
+            "expected all 5 Constraints evaluated in dependency order, got {evaluation_order:?}"
+        );
+    }
+
+    /// Same Model, evaluated with its own real seeded `designValue`s (CoreHpCompressor's real
+    /// design-point numbers, not the textbook example's) -- confirms the seeded demo instance
+    /// produces finite, physically-sane outputs, not just that the worked example does.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn evaluate_isentropic_compressor_model_with_its_own_seeded_design_values_is_physically_sane(
+    ) {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "isentropic-model-seeded-values").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        let detail = parametrics::model_detail(
+            State(state.clone()),
+            Path((
+                project.id.clone(),
+                "IsentropicCompressorStageModel".to_string(),
+            )),
+        )
+        .await
+        .unwrap();
+        let detail_body = response_json(detail).await;
+        let mut inputs = HashMap::new();
+        for input in detail_body["inputs"]
+            .as_array()
+            .expect("inputs should be a real array")
+        {
+            let symbol = input["symbol"].as_str().unwrap().to_string();
+            let design_value = input["designValue"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("expected a real designValue for {symbol}"));
+            inputs.insert(symbol, design_value);
+        }
+        assert_eq!(inputs.len(), 6, "expected all 6 declared input Parameters");
+
+        let response = parametrics::evaluate_model(
+            State(state.clone()),
+            Path((
+                project.id.clone(),
+                "IsentropicCompressorStageModel".to_string(),
+            )),
+            Json(parametrics::EvaluateModelRequest {
+                inputs: inputs.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response_json(response).await;
+        assert!(
+            body.get("error").is_none(),
+            "expected no error, got {body:?}"
+        );
+        let outputs = &body["outputs"];
+        let t01 = inputs["T01"];
+        let t02 = outputs["T02"].as_f64().unwrap();
+        let power = outputs["Power"].as_f64().unwrap();
+        assert!(
+            t02.is_finite() && t02 > t01,
+            "expected T02 > T01, got T02={t02} T01={t01}"
+        );
+        assert!(
+            power.is_finite() && power > 0.0,
+            "expected Power > 0, got {power}"
+        );
+    }
+
+    /// A formula referencing a genuinely-missing input surfaces the typed `error` field, never a
+    /// panic/500 -- matching this module's existing `/parametrics/evaluate` "typed, never silent"
+    /// convention.
+    #[tokio::test]
+    #[ignore = "requires `docker compose up -d` (including cem-archspace)"]
+    async fn evaluate_model_reports_a_typed_error_for_a_missing_input_rather_than_panicking() {
+        let state = test_app_state().await;
+        let project = test_project(&state.versioning, "isentropic-model-missing-input").await;
+        seed_turbofan_ref(&state, &project.id).await.unwrap();
+
+        // Deliberately omit PR -- IsentropicExitTempConstraint needs it and is evaluated first.
+        let mut inputs = HashMap::new();
+        inputs.insert("T01".to_string(), 288.15);
+        inputs.insert("EtaC".to_string(), 0.85);
+        inputs.insert("Cp".to_string(), 1005.0);
+        inputs.insert("Gamma".to_string(), 1.4);
+        inputs.insert("Mdot".to_string(), 49.9);
+
+        let response = parametrics::evaluate_model(
+            State(state.clone()),
+            Path((
+                project.id.clone(),
+                "IsentropicCompressorStageModel".to_string(),
+            )),
+            Json(parametrics::EvaluateModelRequest { inputs }),
+        )
+        .await
+        .unwrap();
+        let body = response_json(response).await;
+        assert!(
+            body["error"]["constraintId"] == "IsentropicExitTempConstraint",
+            "expected a typed error naming the failing Constraint, got {body:?}"
+        );
+        assert!(body["error"]["message"].as_str().is_some());
     }
 
     /// docs/IMPLEMENTATION_KICKOFF.md Phase 5 (FR-INFO-01/03) — a real `:InformationElement` with

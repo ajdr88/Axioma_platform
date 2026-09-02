@@ -69,13 +69,20 @@ High value for CEM specifically; Product 1 is unaffected either way.
 9. ~~**`ChoiceConstraint`'s "uses parameter" relationship is a JSON array, not a graph edge.**~~
    **Closed 2026-09-01 (impl v5 §24.4), per explicit user choice to build it despite zero current
    consumers.** A real `EdgeKind::Uses` (`Constraint -> Parameter`) replaces the JSON array.
-10. **FR-COMP-02 performance-map data is illustrative, not real.** The seeded
-    `sampledPointsAtDesignSpeed` carries `sourceNote: "illustrative shape only -- real constitutive
-    equations not yet sourced"` — reqs v5 §5.15 itself says the real off-design equations aren't
-    sourced yet. Impl v5 §11.1. A domain-correctness gap for any real trade study run against it.
-    **Still open — its own later batch, not yet started.** Per explicit user choice, this pass
-    attempts a real, cited 0D thermodynamic compressor model rather than external literature
-    sourcing alone — a bigger, physics-modeling undertaking than the rest of Tier 1.
+10. ~~**FR-COMP-02 performance-map data is illustrative, not real.**~~ **Closed 2026-09-02 (impl
+    v5 §26), per explicit user choice to attempt a real, cited 0D model as a reusable platform
+    pattern, not just external literature sourcing.** A real, cited, validated **design-point**
+    calculator (`IsentropicCompressorStageModel`, standard isentropic-compression/efficiency
+    relations — Cohen, Rogers & Saravanamuttoo, *Gas Turbine Theory*; Mattingly, *Elements of Gas
+    Turbine Propulsion*) is built as the first real instance of a new, reusable `NodeKind::Model`
+    schema concept (a definition distinct from its per-subsystem `Instantiates`), evaluated by a
+    real embedded `rhai` formula engine — general enough that a future rocket-engine or vehicle 0D
+    model is new formula strings against the same pattern, not new Rust code. Validated against a
+    real textbook worked example (tight Rust-computation check + loose textbook-figure sanity
+    check). **`CorePerformanceMapConstraint`'s own `sourceNote: "illustrative shape only..."`
+    stays untouched and still open** — this closes the design-point half of the gap, not the full
+    off-design stall-to-choke performance-map surface (needs real empirical/correlation map data,
+    a materially bigger, still-open effort).
 
 ## Tier 2 — Product 1 feature completeness
 

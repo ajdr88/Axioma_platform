@@ -56,6 +56,17 @@ pub enum NodeKind {
     /// execution (FR-CORE-04)." No `Activity` container `NodeKind` yet — nothing in the merged
     /// docs asks for one; only individual Actions and the `Flow` edges between them.
     Action,
+    /// Pending-items Tier 1 item 10 (2026-09-01) -- a reusable 0D physics-model *definition*
+    /// (e.g. a compressor stage's governing thermodynamic relations), distinct from any one
+    /// subsystem's *instantiation* of it (`EdgeKind::Instantiates`). Deliberately never
+    /// `Contains`-nested under a subsystem -- the whole point is that a future rocket-engine or
+    /// full-vehicle 0D model is the same kind of standalone, reusable definition, not a
+    /// one-off subgraph baked into a specific `Structure`. Reqs v5 §5.9's own "Model
+    /// Library-equivalent location" language (FR-PARAM-01) names this concept but never builds
+    /// it -- this is its first real instance. A `Model` `Contains`s its own `Parameter`
+    /// (role: input/output) and `Constraint` (a bare rhai-evaluable formula string) definition
+    /// subgraph; see `apps/api/src/parametrics.rs` for the real evaluator.
+    Model,
 }
 
 /// Provenance origin (FR-CORE-08, impl §6.3) — who/what created an element. Scaffolding only:
@@ -161,6 +172,7 @@ impl NodeKind {
             NodeKind::SelectionChoice => "SelectionChoice",
             NodeKind::ConnectionChoice => "ConnectionChoice",
             NodeKind::Action => "Action",
+            NodeKind::Model => "Model",
         }
     }
 
@@ -187,6 +199,7 @@ impl NodeKind {
             "SelectionChoice" => Some(NodeKind::SelectionChoice),
             "ConnectionChoice" => Some(NodeKind::ConnectionChoice),
             "Action" => Some(NodeKind::Action),
+            "Model" => Some(NodeKind::Model),
             _ => None,
         }
     }
@@ -279,6 +292,19 @@ pub enum EdgeKind {
     /// `Parameter -> structural element`; `Uses`: `Constraint -> Parameter`), a real, testable
     /// endpoint-legality rule, not left kind-unconstrained.
     Uses,
+    /// Pending-items Tier 1 item 10 (2026-09-01) -- a `Constraint`'s single computed output,
+    /// pairing with `Uses` above (`Uses`: the inputs a formula reads; `Produces`: the one
+    /// `Parameter` its result becomes). Kind-constrained, same discipline as `Uses`/`Flow`:
+    /// source must be `Constraint`, target must be `Parameter`.
+    Produces,
+    /// Pending-items Tier 1 item 10 (2026-09-01) -- records that some element (typically a
+    /// `Structure`/subsystem) is modeled by a reusable `NodeKind::Model` definition -- e.g.
+    /// "CoreHpCompressor's compressor stage is modeled by IsentropicCompressorStageModel."
+    /// Kind-constrained on the target only (`target` must be `Model`), the same asymmetric
+    /// shape as `Bound` (which constrains only its `Parameter` source) -- nothing in the docs
+    /// restricts which kind of element can instantiate a Model, so constraining the source
+    /// would be guessing ahead of the spec, matching the `ArchDerives`/`Allocate` discipline.
+    Instantiates,
 }
 
 impl EdgeKind {
@@ -310,6 +336,8 @@ impl EdgeKind {
             EdgeKind::Allocate => "ALLOCATE",
             EdgeKind::Flow => "FLOW",
             EdgeKind::Uses => "USES",
+            EdgeKind::Produces => "PRODUCES",
+            EdgeKind::Instantiates => "INSTANTIATES",
         }
     }
 
@@ -336,6 +364,8 @@ impl EdgeKind {
             "ALLOCATE" => Some(EdgeKind::Allocate),
             "FLOW" => Some(EdgeKind::Flow),
             "USES" => Some(EdgeKind::Uses),
+            "PRODUCES" => Some(EdgeKind::Produces),
+            "INSTANTIATES" => Some(EdgeKind::Instantiates),
             _ => None,
         }
     }
@@ -700,6 +730,15 @@ pub fn check_relationship_endpoints(
         // Tier 1 pass — mirror-image direction of `Bound`'s own rule just above (`Parameter ->
         // structural element` there, `Constraint -> Parameter` here).
         EdgeKind::Uses => source_kind == NodeKind::Constraint && target_kind == NodeKind::Parameter,
+        // Pending-items Tier 1 item 10 — pairs with `Uses` above: same endpoint shape, opposite
+        // semantic direction (a Constraint's one computed output, not its inputs).
+        EdgeKind::Produces => {
+            source_kind == NodeKind::Constraint && target_kind == NodeKind::Parameter
+        }
+        // Pending-items Tier 1 item 10 — only the target is constrained (must be a `Model`),
+        // the same asymmetric shape as `Bound` above; see `EdgeKind::Instantiates`'s own doc
+        // comment for why the source is deliberately left open.
+        EdgeKind::Instantiates => target_kind == NodeKind::Model,
         _ => true,
     };
     if legal {
@@ -1425,6 +1464,54 @@ mod tests {
             NodeKind::Parameter,
             "FanPerformanceMapConstraint",
             NodeKind::Constraint,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_legal_produces_endpoint_from_constraint_to_parameter() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Produces,
+            "IsentropicExitTempConstraint",
+            NodeKind::Constraint,
+            "T02sParam",
+            NodeKind::Parameter,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_illegal_produces_endpoint_wrong_direction() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Produces,
+            "T02sParam",
+            NodeKind::Parameter,
+            "IsentropicExitTempConstraint",
+            NodeKind::Constraint,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_legal_instantiates_endpoint_targeting_a_model() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Instantiates,
+            "CoreHpCompressor",
+            NodeKind::Structure,
+            "IsentropicCompressorStageModel",
+            NodeKind::Model,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_illegal_instantiates_endpoint_targeting_a_non_model() {
+        assert!(check_relationship_endpoints(
+            EdgeKind::Instantiates,
+            "CoreHpCompressor",
+            NodeKind::Structure,
+            "REQ-CORE-SPEC",
+            NodeKind::Requirement,
         )
         .is_err());
     }

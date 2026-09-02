@@ -343,6 +343,16 @@ range instead of returning a typed "not evaluable" reason.
 **Landed status:** built and covered —
 `parametrics_evaluate_interpolates_fan_performance_map_and_rejects_out_of_range` asserts a real
 interpolated value (`~1.325` at a known input) and the out-of-range typed-error path.
+**Updated 2026-09-02, impl v5 §26 (pending-items Tier 1 item 10):** the *interpolation mechanism*
+tested above was already real; what was illustrative was the underlying data
+(`CorePerformanceMapConstraint`'s own `sourceNote: "illustrative shape only..."`, still true and
+still open — off-design stall-to-choke map data needs real empirical/correlation sourcing, a
+materially bigger effort). This pass adds a real, cited, validated **design-point** calculator
+(`IsentropicCompressorStageModel`, a real `NodeKind::Model` instance, standard isentropic-
+compression/efficiency relations) alongside it — see the new `evaluate_isentropic_compressor_
+model_matches_the_textbook_worked_example` et al. Both halves of FR-COMP-02 (interpolation
+mechanism, and now a real design-point value) are real; the off-design map surface itself remains
+the one still-open piece.
 
 ### T-COMP-03 — Blade-loading & Mach validation
 **Verifies:** FR-COMP-03

@@ -154,6 +154,31 @@ scope; confirmed transient and unrelated to Batch B's own changes. `apps/api --i
 at 80/80. Item 10 (a real 0D thermodynamic compressor model) remains its own later, larger batch —
 not started yet.
 
+**Item 10 (2026-09-02, impl v5 §26)** closes out Tier 1's last item, reframed by the user beyond
+"add real numbers to one Constraint": a real 0D compressor model built **as an example of the
+platform's own modeling capability**, general enough for future rocket-engine/vehicle 0D models to
+reuse the same pattern. `packages/sysml-core` gains a first-class, reusable **`NodeKind::Model`**
+(a definition, deliberately never nested under a subsystem — reqs v5 §5.9's own "Model
+Library-equivalent location" language, named but never built before this) plus `EdgeKind::Produces`
+(a Constraint's one computed output, mirrors `Uses`) and `EdgeKind::Instantiates` (kind-constrained
+on target only — "this subsystem's compressor stage is modeled by this Model"). Governing relations
+are real, cited textbook content (Cohen, Rogers & Saravanamuttoo, *Gas Turbine Theory*; Mattingly,
+*Elements of Gas Turbine Propulsion* — isentropic-compression/efficiency relations), evaluated by a
+new `rhai = "1.26.0"` embedded formula engine (chosen over `evalexpr`, which relicensed AGPL-3.0-
+only as of v12 — disqualifying) — formula strings, not hardcoded Rust per-relation functions, so a
+future model is new formulas against the same pattern, not new code. `IsentropicCompressorStageModel`
+is the first real instance, instantiated on `CoreHpCompressor`, with input design values honestly
+sourced (reused from `CoreHpCompressor`'s own real seeded OPR/mass-flow where sensible, a separate
+explicitly-flagged isentropic-efficiency assumption kept distinct from the subsystem's own seeded
+*polytropic* efficiency to avoid a real domain-correctness error). Validated against a real textbook
+worked example two ways — tight (1e-6) against an independent Rust computation of the same formula,
+loose against the textbook's own hand-rounded figures. `CorePerformanceMapConstraint`'s own
+`sourceNote: "illustrative shape only..."` stays untouched and still open — this closes the
+design-point half of FR-COMP-02, not the full off-design stall-to-choke performance-map surface
+(needs real empirical/correlation map data, a materially bigger, still-open effort). `apps/api
+--ignored` now stands at 83/83, zero regressions. **This closes every item in
+`docs/pending_items_2026-09-01.md`'s Tier 1.**
+
 ## What this is
 Axioma is a cloud-native model-based systems engineering platform, built around a SysML v2
 model graph, shipped as **two independently-shippable products**:

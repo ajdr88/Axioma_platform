@@ -68,6 +68,17 @@ pdf-extract = "0.12"
 # optional `zlib` perf feature, which this workspace does not enable).
 rust_xlsxwriter = "0.99"
 
+# Pending-items Tier 1 item 10 (0D physics-model evaluator, apps/api/src/parametrics.rs) — a real
+# embedded arithmetic-expression engine so a Model's governing relations are formula strings, not
+# hardcoded Rust per-relation functions. Chosen over `evalexpr` (relicensed AGPL-3.0-only as of
+# v12, disqualifying for this workspace's MIT/BSD discipline) and `fasteval`/`meval` (both stale,
+# last released 2020/2018). MIT OR Apache-2.0, actively maintained, and its
+# `eval_expression_with_scope::<f64>()` mode plus `Engine::set_max_operations`/
+# `set_max_expr_depths` give real, first-party safety guards for a formula string that is
+# effectively untrusted seed/user-authored input — confirmed via research before adding, not
+# assumed.
+rhai = "1.26.0"
+
 # Scope-downs pass (FR-CORE-14, OCR) — real, `optional = true`, gated behind the `ocr` feature
 # (default off). `leptess` (Tesseract binding) needs `libtesseract-dev`/`libleptonica-dev`/
 # `clang` present at COMPILE time (a real `-sys` crate) — this dev machine is Windows, and the

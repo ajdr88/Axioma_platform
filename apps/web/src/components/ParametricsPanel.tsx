@@ -10,6 +10,31 @@ interface EvaluateResult {
   error?: string;
 }
 
+interface ModelParameterDto {
+  id: string;
+  name: string;
+  symbol: string;
+  unit?: string;
+  designValue?: number;
+}
+
+interface ModelConstraintDto {
+  id: string;
+  formula: string;
+}
+
+interface ModelDetailResponse {
+  inputs: ModelParameterDto[];
+  outputs: ModelParameterDto[];
+  constraints: ModelConstraintDto[];
+}
+
+interface EvaluateModelResponse {
+  outputs: Record<string, number>;
+  evaluationOrder: string[];
+  error?: { constraintId: string; message: string };
+}
+
 interface ParametricsPanelProps {
   projectId: string;
   /** Filtered locally to `kind === "Constraint"` — no dedicated list endpoint exists, the same
@@ -27,11 +52,20 @@ interface ParametricsPanelProps {
  */
 export function ParametricsPanel({ projectId, elements, onClose }: ParametricsPanelProps) {
   const constraints = elements.filter((e) => e.kind === "Constraint");
+  const models = elements.filter((e) => e.kind === "Model");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [inputValue, setInputValue] = useState(550);
   const [results, setResults] = useState<EvaluateResult[] | null>(null);
   const [evaluating, setEvaluating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const [selectedModelId, setSelectedModelId] = useState("");
+  const [modelDetail, setModelDetail] = useState<ModelDetailResponse | null>(null);
+  const [modelInputs, setModelInputs] = useState<Record<string, number>>({});
+  const [modelLoading, setModelLoading] = useState(false);
+  const [modelEvaluating, setModelEvaluating] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
+  const [modelResult, setModelResult] = useState<EvaluateModelResponse | null>(null);
 
   function toggle(id: string) {
     setSelectedIds((prev) => {
@@ -67,6 +101,65 @@ export function ParametricsPanel({ projectId, elements, onClose }: ParametricsPa
       setError(err instanceof Error ? err.message : "failed to evaluate");
     } finally {
       setEvaluating(false);
+    }
+  }
+
+  async function handleSelectModel(modelId: string) {
+    setSelectedModelId(modelId);
+    setModelResult(null);
+    setModelError(null);
+    setModelDetail(null);
+    if (!modelId) {
+      return;
+    }
+    setModelLoading(true);
+    try {
+      const res = await fetch(`/api/projects/${projectId}/parametrics/models/${modelId}`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.error ?? `request failed with status ${res.status}`);
+      }
+      const detail: ModelDetailResponse = await res.json();
+      setModelDetail(detail);
+      const defaults: Record<string, number> = {};
+      for (const input of detail.inputs) {
+        if (input.designValue !== undefined) {
+          defaults[input.symbol] = input.designValue;
+        }
+      }
+      setModelInputs(defaults);
+    } catch (err) {
+      setModelError(err instanceof Error ? err.message : "failed to load Model");
+    } finally {
+      setModelLoading(false);
+    }
+  }
+
+  async function handleEvaluateModel() {
+    if (!selectedModelId) {
+      return;
+    }
+    setModelEvaluating(true);
+    setModelError(null);
+    try {
+      const res = await fetch(
+        `/api/projects/${projectId}/parametrics/models/${selectedModelId}/evaluate`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ inputs: modelInputs }),
+        },
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.error ?? `request failed with status ${res.status}`);
+      }
+      const data: EvaluateModelResponse = await res.json();
+      setModelResult(data);
+    } catch (err) {
+      setModelError(err instanceof Error ? err.message : "failed to evaluate Model");
+    } finally {
+      setModelEvaluating(false);
     }
   }
 
@@ -143,6 +236,94 @@ export function ParametricsPanel({ projectId, elements, onClose }: ParametricsPa
                   )}
                 </div>
               ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {models.length > 0 && (
+        <>
+          <div className="my-3 border-t border-white/10" />
+          <p className="mb-1 text-[10px] uppercase tracking-widest text-white/40">Models</p>
+          <select
+            value={selectedModelId}
+            onChange={(event) => handleSelectModel(event.target.value)}
+            className="mb-2 w-full rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
+          >
+            <option value="">Select a Model…</option>
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+
+          {modelLoading && <p className="mb-2 text-xs text-white/40">Loading…</p>}
+
+          {modelDetail && (
+            <>
+              <div className="mb-2 space-y-1.5" data-model-inputs>
+                {modelDetail.inputs.map((input) => (
+                  <label key={input.symbol} className="block text-xs text-white/70">
+                    <span className="mb-0.5 block truncate">
+                      {input.name} ({input.symbol}
+                      {input.unit ? `, ${input.unit}` : ""})
+                    </span>
+                    <input
+                      type="number"
+                      data-model-input={input.symbol}
+                      value={modelInputs[input.symbol] ?? ""}
+                      onChange={(event) =>
+                        setModelInputs((prev) => ({
+                          ...prev,
+                          [input.symbol]: Number(event.target.value),
+                        }))
+                      }
+                      className="w-full rounded border border-white/10 bg-obsidian/60 px-1.5 py-1 text-xs text-white/80"
+                    />
+                  </label>
+                ))}
+              </div>
+
+              <Button
+                onClick={handleEvaluateModel}
+                disabled={modelEvaluating}
+                className="mb-3 w-full justify-center !py-1 text-xs"
+              >
+                {modelEvaluating ? "Running…" : "Run Model"}
+              </Button>
+            </>
+          )}
+
+          {modelError && <p className="mb-2 text-xs text-alert">{modelError}</p>}
+
+          {modelResult && (
+            <div className="space-y-1.5" data-model-result>
+              {modelResult.error ? (
+                <p className="text-[11px] text-alert">
+                  {modelResult.error.constraintId}: {modelResult.error.message}
+                </p>
+              ) : (
+                <>
+                  {Object.entries(modelResult.outputs).map(([symbol, value]) => (
+                    <div
+                      key={symbol}
+                      data-model-output={symbol}
+                      className="rounded border border-white/10 p-1.5"
+                    >
+                      <p className="font-mono text-[11px] text-cobalt-glow">
+                        {symbol} = {value}
+                      </p>
+                    </div>
+                  ))}
+                  <p
+                    className="truncate font-mono text-[10px] text-white/40"
+                    data-model-evaluation-order
+                  >
+                    order: {modelResult.evaluationOrder.join(" → ")}
+                  </p>
+                </>
+              )}
             </div>
           )}
         </>

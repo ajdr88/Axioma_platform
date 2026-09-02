@@ -2698,3 +2698,155 @@ infill gen 10 @ 1000 points evaluated (11 real unique, 11 eval)"`). Both algorit
 differ from each other, corroborating the sidecar-log evidence. Zero browser console/network errors
 throughout. This closes Tier 1 Batch B in full; the only remaining Tier 1 item is 10 (a real, cited
 0D thermodynamic compressor model), its own future, larger effort not started in this pass.
+
+## 26. Tier 1 Item 10 — A Real, Cited 0D Compressor Model, Built as the First Reusable `Model`
+
+Closes the last open item from `docs/pending_items_2026-09-01.md`. The user reframed the ask beyond
+"add real numbers to `CorePerformanceMapConstraint`'s own illustrative placeholder": a real 0D
+compressor model should be built **as an example of the platform's own modeling capability**, since
+"in the future other 0D models for rocket engines, full vehicles, and other systems will be
+computed" — a reusable pattern, not a one-off. Per two explicit scope choices: a real embedded
+expression engine (formula strings, not hardcoded Rust per-relation functions), and a first-class
+**`Model`** schema concept — a reusable definition distinct from its per-subsystem instantiation.
+
+### 26.1 Schema: `NodeKind::Model`, `EdgeKind::Produces`/`EdgeKind::Instantiates`
+
+`packages/sysml-core/src/lib.rs` gains `NodeKind::Model` — deliberately never `Contains`-nested
+under any one subsystem, the same "definition, not instance" shape a future rocket-engine or
+vehicle 0D model would also need. Reqs v5 §5.9's own "Model Library-equivalent location" language
+(FR-PARAM-01) names this concept but never built it — this is its first real instance. Two new
+kind-constrained edges: `EdgeKind::Produces` (`Constraint -> Parameter`, mirrors `Uses`'s existing
+rule exactly — the Constraint's one computed output) and `EdgeKind::Instantiates`
+(kind-constrained on the target only: must be `Model` — "this subsystem's compressor stage is
+modeled by this Model," the same asymmetric shape `Bound` already has). Confirmed real, not just
+aspirational: `check_relationship_endpoints` is genuinely invoked from the production `create_edge`
+path (`apps/api/src/store/neo4j.rs:332`), not just the in-memory test-only `Graph` type. 53/53
+`sysml-core` tests (51 prior + 2 new `Produces`/`Instantiates` endpoint-legality cases).
+
+### 26.2 Expression engine: `rhai`, not `evalexpr`
+
+Confirmed via research before adding: `evalexpr` (the other commonly-cited pure-arithmetic Rust
+crate) relicensed to **AGPL-3.0-only as of v12** (2024-10-17) — disqualifying for this workspace's
+MIT/BSD discipline. `fasteval`/`meval` are both stale (last released 2020/2018). `rhai = "1.26.0"`
+(MIT OR Apache-2.0, actively maintained) was chosen instead — its `eval_expression_with_scope::
+<f64>()` mode evaluates a single arithmetic expression against a `Scope` (no loops/assignment/
+statements reachable), and `Engine::set_max_operations`/`set_max_expr_depths` give real,
+first-party safety guards for a formula string that is effectively untrusted seed/user-authored
+input. **A real API-vs-assumption gap found during implementation**: neither `pow(f64, f64)` nor
+`.powf(f64)` are registered by rhai's default standard package for a float exponent (only integer-
+exponent overloads exist) — confirmed by the compiler-equivalent runtime error
+(`"Function not found: pow (f64, f64)"`, then `"Function not found: powf (f64, f64)"`), not
+guessed. Fixed by using rhai's `**` power operator instead (`PR ** ((Gamma - 1.0) / Gamma)`),
+which does resolve for two floats — the real, verified syntax, not the plan's own two originally-
+guessed candidates.
+
+### 26.3 A Model's real shape
+
+`IsentropicCompressorStageModel` `Contains`s 6 input `Parameter`s (`T01`, `PR`, `EtaC`, `Cp`,
+`Gamma`, `Mdot` — body: `{role: "input", symbol, unit, designValue}`) and 5 output `Parameter`s
+(`T02s`, `DeltaTActual`, `T02`, `SpecificWork`, `Power` — no `designValue`, computed), plus 5
+`Constraint`s, each a bare rhai expression (no assignment — the result becomes its `Produces`
+target's value), one `Uses` edge per referenced symbol, one `Produces` edge to its output:
+
+- `IsentropicExitTempConstraint`: `PR ** ((Gamma - 1.0) / Gamma) * T01` → `T02s`
+- `ActualTempRiseConstraint`: `(T02s - T01) / EtaC` → `DeltaTActual`
+- `ActualExitTempConstraint`: `T01 + DeltaTActual` → `T02`
+- `SpecificWorkConstraint`: `Cp * DeltaTActual` → `SpecificWork`
+- `PowerConstraint`: `Mdot * SpecificWork` → `Power`
+
+One `Instantiates` edge, `CoreHpCompressor -> IsentropicCompressorStageModel` — the real structural
+link. **Governing relations are standard textbook gas-turbine content** — Cohen, Rogers &
+Saravanamuttoo, *Gas Turbine Theory*, 6th ed. (the isentropic-compression/isentropic-efficiency
+chapters); Mattingly, *Elements of Gas Turbine Propulsion*, 2nd ed., gives the equivalent forms.
+Chapter-level citation confirmed by research before implementation; exact section numbers were not
+independently verified against a specific edition — stated honestly, not invented precisely.
+
+**Seeded input `designValue`s, honestly sourced, not fabricated**: `T01 = 288.15` (ISA sea-level
+static, a standard reference condition, not measured); `Cp = 1005.0`/`Gamma = 1.4` (standard air
+properties); `PR = 8.0` and `Mdot ≈ 49.895` — **reused from `CoreHpCompressor`'s own real seeded
+`designOverallPressureRatioContribution`/`designWeightFlowLbPerSec`** (110.0 lb/s × 0.45359237
+kg/lb), a manually-synced snapshot, not live-linked (flagged as a real, stated limitation, not
+hidden); `EtaC = 0.85`, **deliberately separate** from `CoreHpCompressor`'s own seeded
+`targetPolytropicEfficiency` (0.88) — that is a polytropic efficiency, a distinct quantity from the
+isentropic efficiency this model actually uses; conflating the two would have been a real,
+avoidable domain-correctness error. `CorePerformanceMapConstraint`'s own `sourceNote:
+"illustrative shape only..."` is left untouched — this is a real, cited, validated **design-point**
+calculator (one operating point's temperature rise/specific work/power), not a full off-design
+stall-to-choke performance-map surface (needs real empirical/correlation map data, a materially
+bigger effort, still explicitly open).
+
+### 26.4 HTTP surface
+
+`apps/api/src/parametrics.rs` gains a real graph-traversal-backed evaluator (the pre-existing
+`/parametrics/evaluate` never touched Neo4j at all — only read one Constraint's own Postgres body
+directly). Given a `model_id`: fetches its `Contains` children via the already-existing
+`Neo4jStore::edges_of_kind` (no new store method needed), their `Uses`/`Produces` edges, and each
+element's Postgres body; topologically sorts Constraints by real `Produces`/`Uses` dependency
+(Kahn's algorithm); builds one `rhai::Engine` with the safety caps above; evaluates each formula in
+dependency order via a shared `rhai::Scope`, seeded from the caller's explicit input map — the same
+"pure function of explicit caller-supplied input, never an implicit read from other graph elements"
+contract `/parametrics/evaluate` already has. A formula error aborts at that Constraint (never a
+panic) and returns a typed error alongside whatever was already computed.
+
+- `GET /api/v0/projects/:projectId/parametrics/models/:modelId` — `{inputs, outputs, constraints}`,
+  a real, minimal read convenience endpoint so the frontend doesn't need generic bulk-edge loading.
+- `POST /api/v0/projects/:projectId/parametrics/models/:modelId/evaluate` — `{inputs: {symbol:
+  number}}` → `{outputs: {symbol: number}, evaluationOrder: string[], error?: {constraintId,
+  message}}`.
+
+`ArchspacePanel.tsx`'s `[id]`-style Next.js proxy convention is reused:
+`apps/web/src/app/api/projects/[projectId]/parametrics/models/[id]/route.ts` (GET) and
+`.../[id]/evaluate/route.ts` (POST). `ParametricsPanel.tsx` gains a "Models" section — a `<select>`
+listing every `Model`-kind element, one labeled numeric input per declared input Parameter
+(pre-filled from its real `designValue`), a "Run Model" button, and a result display showing each
+output Parameter's computed value plus the real `evaluationOrder`.
+
+### 26.5 Verification
+
+**The real correctness proof**: `evaluate_isentropic_compressor_model_matches_the_textbook_worked_
+example` evaluates the Model against a real worked example (T01=288.15 K, PR=10.0, EtaC=0.87,
+Gamma=1.4, Cp=1005 J/(kg·K), Mdot=20 kg/s) two ways — tightly (1e-6) against an independent Rust
+computation of the exact same formula (confirms the graph/rhai evaluation pipeline is wired
+correctly), and loosely against the textbook's own hand-rounded worked-example figures (confirmed
+via a real, independent Python computation before writing the test, not guessed:
+T02s=556.3306 K, DeltaTActual=308.2535 K, T02=596.4035 K, SpecificWork=309794.77 J/kg,
+Power=6195895.48 W — close to, not identical to, the textbook's own rounded T02s≈556.32/
+DeltaT≈308.24/T02≈596.39/SpecificWork≈309780/Power≈6195600, the difference being the textbook's
+own intermediate rounding, confirmed not an error in either computation). A second test evaluates
+the Model with its own real seeded `designValue`s (via the real `GET .../models/:id` detail
+endpoint, not hardcoded) and asserts physically-sane results (`T02 > T01`, `Power > 0`, both
+finite). A third test confirms a genuinely-missing input surfaces the typed `error` naming the
+failing Constraint, never a panic.
+
+`cargo test -p cem-core`, `-p sysml-core`: unaffected/passing. `apps/api --ignored`: **83/83** (80
+prior + 3 new), zero regressions, run serially with no concurrently-starting dev server (the Batch
+B lesson applied deliberately this time). `cargo build/clippy/fmt --workspace` (default features),
+`pnpm biome check .`, `pnpm --filter @axioma/web build`: all clean.
+
+**A real, non-obvious rhai gap found only by running it, not guessed**: neither `pow(f64, f64)`
+nor `.powf(f64)` are registered by rhai's default standard package for a float exponent (only
+integer-exponent overloads exist) — confirmed via the real runtime error, `"Function not found:
+pow (f64, f64)"`, then `"Function not found: powf (f64, f64)"`, for the two plan-guessed candidate
+syntaxes in turn. The real, working syntax is rhai's `**` power operator
+(`PR ** ((Gamma - 1.0) / Gamma)`).
+
+**Live browser verification (Playwright, real running dev stack)** — required a genuine data-
+freshness step first: the long-running persisted `Turbofan Reference` project predates this
+Model's seed content (seeding only ever runs once, when `ensure_seeded` finds zero projects), so a
+`TRUNCATE audit_log, commits, branches, projects CASCADE` plus an api-server restart was needed to
+get a freshly-reseeded project — a destructive-looking action the auto-mode classifier correctly
+blocked by default; confirmed with the user via `AskUserQuestion` before running it (dev/test data
+only). Against the fresh project: the Parametrics panel's new "Models" section lists "Isentropic
+compressor stage (0D design-point model)"; selecting it pre-fills exactly 6 real inputs (PR=8,
+T01=288.15, Gamma=1.4, Mdot≈49.895, Cp=1005, EtaC=0.85 — the real seeded `designValue`s, confirmed
+matching what `GET .../models/:id` returns via a direct `curl` check beforehand); "Run Model"
+returns 5 real finite outputs (T02s≈521.97, DeltaTActual≈275.08, T02≈563.23, SpecificWork≈276456,
+Power≈13793819 at the seeded PR=8) plus the real evaluation order. Changing PR from 8 to 10 and
+re-running produced different real outputs (T02s≈556.33, DeltaTActual≈315.51, T02≈603.66,
+SpecificWork≈317084, Power≈15820960) — confirming a live rhai evaluation, not a cached/static
+value; the T02s figure at PR=10 lines up with this section's own independently-verified worked-
+example computation above (556.33 here vs. the worked example's precise 556.3306, the small
+difference coming from EtaC=0.85 here vs. the worked example's own EtaC=0.87). Zero browser
+console/network errors throughout. This closes item 10 in full — the only remaining Tier 1 item
+was closed in this same pass, so **this closes every item in `docs/pending_items_2026-09-01.md`'s
+Tier 1**.

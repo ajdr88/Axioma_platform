@@ -28,7 +28,9 @@ export type NodeKind =
   | "SelectionChoice"
   | "ConnectionChoice"
   // FR-CORE-13 real build-out — mirrors packages/sysml-core/src/lib.rs's NodeKind::Action exactly.
-  | "Action";
+  | "Action"
+  // Pending-items Tier 1 item 10 — mirrors packages/sysml-core/src/lib.rs's NodeKind::Model exactly.
+  | "Model";
 
 export type EdgeKind =
   | "Contains"
@@ -53,7 +55,11 @@ export type EdgeKind =
   // FR-CORE-13 real build-out — mirrors packages/sysml-core/src/lib.rs's EdgeKind::Flow exactly.
   | "Flow"
   // Tier 1 pass — mirrors packages/sysml-core/src/lib.rs's EdgeKind::Uses exactly.
-  | "Uses";
+  | "Uses"
+  // Pending-items Tier 1 item 10 — mirrors packages/sysml-core/src/lib.rs's EdgeKind::Produces
+  // and EdgeKind::Instantiates exactly.
+  | "Produces"
+  | "Instantiates";
 
 /** FR-CORE-08 provenance origin — who/what created an element. */
 export type Origin = "Human" | "AiSuggested" | "AiAutoMerged";
